@@ -9,8 +9,8 @@ Usage:
 
 Options:
     --features <SET>    Feature set (halfka-hm, halfka) (default: halfka-hm)
-    --l0 <SIZE>         L0 (Feature Transformer) size (default: 1024)
-    --l1 <SIZE>         L1 size (default: 16)
+    --l0 <SIZE>         L0 (Feature Transformer) size, must be even (default: 1024)
+    --l1 <SIZE>         L1 size, must be >= 2 (default: 16)
     --l2 <SIZE>         L2 size (default: 32)
     --data <PATH>       Training data path (comma-separated)
     --batch-size <N>    Batch size (default: 16384)
@@ -97,11 +97,11 @@ struct Args {
     #[arg(long, value_enum, default_value = "ranger")]
     optimizer: OptimizerType,
 
-    /// L0 (Feature Transformer) size
+    /// L0 (Feature Transformer) size (must be even for pairwise_mul)
     #[arg(long, default_value = "1024")]
     l0: usize,
 
-    /// L1 (LayerStack first layer) size
+    /// L1 (LayerStack first layer) size (must be >= 2 for skip connection)
     #[arg(long, default_value = "16")]
     l1: usize,
 
@@ -180,7 +180,25 @@ const NUM_BUCKETS: usize = 9;
 fn main() {
     let args = Args::parse();
 
+    // ==========================================================================
+    // CLI 引数バリデーション
+    // ==========================================================================
+
+    // L0 は偶数である必要がある (pairwise_mul が偶数行を要求)
+    if args.l0 % 2 != 0 {
+        eprintln!("Error: --l0 must be even (got {}). pairwise_mul requires even row count.", args.l0);
+        std::process::exit(1);
+    }
+
+    // L1 は 2 以上である必要がある (skip connection のため l1_effective = l1 - 1 >= 1)
+    if args.l1 < 2 {
+        eprintln!("Error: --l1 must be >= 2 (got {}). L1 includes +1 for skip connection.", args.l1);
+        std::process::exit(1);
+    }
+
+    // ==========================================================================
     // Architecture sizes (configurable via CLI)
+    // ==========================================================================
     let l0_size = args.l0;
     let l1_size = args.l1; // L1 output size (includes +1 for skip connection)
     let l1_effective = l1_size - 1; // L1 effective output (excluding skip)

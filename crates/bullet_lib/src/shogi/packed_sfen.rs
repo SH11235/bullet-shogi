@@ -188,6 +188,61 @@ impl PackedSfenValue {
     pub fn decode(&self) -> ShogiBoard {
         ShogiBoard::from_packed_sfen(self)
     }
+
+    /// PackedSfen から直接バケットインデックスを計算（高速版）
+    ///
+    /// フルボードデコードを回避し、最初の15ビットのみを読み出す:
+    /// - bit 0: 手番 (0=先手, 1=後手)
+    /// - bit 1-7: 先手玉位置 (0-80)
+    /// - bit 8-14: 後手玉位置 (0-80)
+    ///
+    /// これにより学習時のホットパスでの大幅な高速化が期待できる。
+    #[inline]
+    pub fn compute_bucket_fast(&self) -> u8 {
+        // 最初の2バイトから15ビットを抽出
+        let b0 = self.data[0] as u16;
+        let b1 = self.data[1] as u16;
+        let bits = b0 | (b1 << 8);
+
+        // bit 0: 手番
+        let stm_is_white = (bits & 1) != 0;
+
+        // bit 1-7: 先手玉位置 (7ビット)
+        let black_king_sq = ((bits >> 1) & 0x7F) as u8;
+
+        // bit 8-14: 後手玉位置 (7ビット)
+        let white_king_sq = ((bits >> 8) & 0x7F) as u8;
+
+        // 無効な玉位置チェック
+        if black_king_sq >= 81 || white_king_sq >= 81 {
+            return 0;
+        }
+
+        // 段 (rank) を計算: sq / 9
+        let black_king_rank = black_king_sq / 9;
+        let white_king_rank = white_king_sq / 9;
+
+        // 味方玉・敵玉の段を手番視点で計算
+        let (f_rank, e_rank) = if stm_is_white {
+            // 後手番: 後手玉が味方、先手玉が敵
+            // 後手視点: 9段目(rank=8)が自陣、1段目(rank=0)が敵陣
+            let f_rank = 8 - white_king_rank; // 後手視点で味方玉の段
+            let e_rank = black_king_rank; // 後手視点で敵玉の段
+            (f_rank, e_rank)
+        } else {
+            // 先手番: 先手玉が味方、後手玉が敵
+            // 先手視点: 1段目(rank=0)が自陣、9段目(rank=8)が敵陣
+            let f_rank = black_king_rank; // 先手視点で味方玉の段
+            let e_rank = 8 - white_king_rank; // 先手視点で敵玉の段
+            (f_rank, e_rank)
+        };
+
+        // バケット計算テーブル
+        const F_TO_INDEX: [u8; 9] = [0, 0, 0, 3, 3, 3, 6, 6, 6];
+        const E_TO_INDEX: [u8; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+
+        F_TO_INDEX[f_rank as usize] + E_TO_INDEX[e_rank as usize]
+    }
 }
 
 // =============================================================================
@@ -674,5 +729,98 @@ mod tests {
 
         // OOB アクセスしても panic しない
         assert!(!stream.read_bit());
+    }
+
+    // =========================================================================
+    // compute_bucket_fast テスト
+    // =========================================================================
+
+    /// 手番・玉位置からテスト用 PackedSfenValue を作成
+    fn make_test_psv(stm_is_white: bool, black_king_sq: u8, white_king_sq: u8) -> PackedSfenValue {
+        let mut psv = PackedSfenValue::default();
+
+        // bit 0: 手番
+        // bit 1-7: 先手玉位置
+        // bit 8-14: 後手玉位置
+        let bits: u16 = (stm_is_white as u16)
+            | ((black_king_sq as u16 & 0x7F) << 1)
+            | ((white_king_sq as u16 & 0x7F) << 8);
+
+        psv.data[0] = bits as u8;
+        psv.data[1] = (bits >> 8) as u8;
+
+        psv
+    }
+
+    #[test]
+    fn test_compute_bucket_fast_initial_position() {
+        // 初期配置: 先手玉5九(sq=76, rank=8)、後手玉5一(sq=4, rank=0)
+        // 先手番
+        let psv = make_test_psv(false, 76, 4);
+        let bucket = psv.compute_bucket_fast();
+
+        // 先手視点:
+        //   f_rank = 8 (自陣深部) → F_TO_INDEX[8] = 6
+        //   e_rank = 8 - 0 = 8 (相手から見て敵陣) → E_TO_INDEX[8] = 2
+        //   bucket = 6 + 2 = 8
+        assert_eq!(bucket, 8);
+    }
+
+    #[test]
+    fn test_compute_bucket_fast_white_turn() {
+        // 初期配置: 先手玉5九(sq=76, rank=8)、後手玉5一(sq=4, rank=0)
+        // 後手番
+        let psv = make_test_psv(true, 76, 4);
+        let bucket = psv.compute_bucket_fast();
+
+        // 後手視点:
+        //   f_king = 5一 → f_rank = 8 - 0 = 8 (後手視点で自陣深部)
+        //   e_king = 5九 → e_rank = 8 (後手視点で見ると rank=8)
+        //   bucket = 6 + 2 = 8
+        assert_eq!(bucket, 8);
+    }
+
+    #[test]
+    fn test_compute_bucket_fast_all_buckets() {
+        // 各バケット値をテスト
+        let test_cases = [
+            // (stm_is_white, black_king_sq, white_king_sq, expected_bucket)
+            // 先手番、先手玉1段目(sq=0-8)、後手玉9段目(sq=72-80)
+            (false, 4, 76, 0), // f_rank=0, e_rank=8-8=0 → bucket=0
+            // 先手番、先手玉1段目、後手玉4-6段目
+            (false, 4, 40, 1), // f_rank=0, e_rank=8-4=4 → F[0]+E[4]=0+1=1
+            // 先手番、先手玉1段目、後手玉1-3段目
+            (false, 4, 4, 2), // f_rank=0, e_rank=8-0=8 → F[0]+E[8]=0+2=2
+            // 先手番、先手玉4-6段目、後手玉9段目
+            (false, 40, 76, 3), // f_rank=4, e_rank=0 → F[4]+E[0]=3+0=3
+            // 先手番、先手玉4段目、後手玉5段目
+            (false, 36, 40, 4), // f_rank=4, e_rank=8-4=4 → F[4]+E[4]=3+1=4
+            // 先手番、先手玉7-9段目、後手玉9段目
+            (false, 72, 76, 6), // f_rank=8, e_rank=0 → F[8]+E[0]=6+0=6
+            // 先手番、先手玉9段目、後手玉5段目
+            (false, 76, 40, 7), // f_rank=8, e_rank=4 → F[8]+E[4]=6+1=7
+            // 先手番、先手玉9段目、後手玉1段目
+            (false, 76, 4, 8), // f_rank=8, e_rank=8 → F[8]+E[8]=6+2=8
+        ];
+
+        for (stm_is_white, bk_sq, wk_sq, expected) in test_cases {
+            let psv = make_test_psv(stm_is_white, bk_sq, wk_sq);
+            let bucket = psv.compute_bucket_fast();
+            assert_eq!(
+                bucket, expected,
+                "stm_white={}, bk_sq={}, wk_sq={}, expected={}, got={}",
+                stm_is_white, bk_sq, wk_sq, expected, bucket
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_bucket_fast_invalid_king() {
+        // 無効な玉位置 (81以上)
+        let psv = make_test_psv(false, 81, 4);
+        assert_eq!(psv.compute_bucket_fast(), 0);
+
+        let psv = make_test_psv(false, 4, 127);
+        assert_eq!(psv.compute_bucket_fast(), 0);
     }
 }

@@ -1,6 +1,8 @@
 use bulletformat::{ChessBoard, chess::MarlinFormat};
 
-use crate::shogi::{Color, PackedSfenValue, ShogiBoard};
+use crate::shogi::PackedSfenValue;
+#[cfg(test)]
+use crate::shogi::{Color, ShogiBoard};
 
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static {
     const BUCKETS: usize;
@@ -67,15 +69,19 @@ pub struct ShogiKingRankBucket;
 impl OutputBuckets<PackedSfenValue> for ShogiKingRankBucket {
     const BUCKETS: usize = 9;
 
+    #[inline]
     fn bucket(&self, pos: &PackedSfenValue) -> u8 {
-        let board = ShogiBoard::from_packed_sfen(pos);
-        compute_king_rank_bucket(&board)
+        // 高速版: PackedSfen の最初の15ビットから直接計算
+        // フルボードデコードを回避して学習時のオーバーヘッドを削減
+        pos.compute_bucket_fast()
     }
 }
 
-/// 将棋盤面から玉位置バケットを計算
+/// 将棋盤面から玉位置バケットを計算（テスト・検証用）
 ///
 /// 両玉の段に基づいて 0-8 のバケットインデックスを返す。
+/// 本番では `PackedSfenValue::compute_bucket_fast()` を使用。
+#[cfg(test)]
 #[inline]
 fn compute_king_rank_bucket(board: &ShogiBoard) -> u8 {
     let stm = board.side_to_move;

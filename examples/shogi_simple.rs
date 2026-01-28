@@ -371,13 +371,15 @@ fn main() {
     // Reckless/Stockfish: Pairwise uses QA=255 with CReLU
     // Traditional: CReLU uses QA=127, SCReLU uses QA=255
     let recommended_qa = match (args.activation, pairwise_enabled) {
-        (ActivationType::Screlu, _) => 255,      // SCReLU always uses QA=255
-        (ActivationType::Crelu, true) => 255,    // Pairwise + CReLU uses QA=255 (Reckless compatible)
-        (ActivationType::Crelu, false) => 127,   // Traditional CReLU uses QA=127
+        (ActivationType::Screlu, _) => 255,    // SCReLU always uses QA=255
+        (ActivationType::Crelu, true) => 255,  // Pairwise + CReLU uses QA=255 (Reckless compatible)
+        (ActivationType::Crelu, false) => 127, // Traditional CReLU uses QA=127
     };
     if qa != recommended_qa && !args.quantise_only {
-        eprintln!("WARNING: QA={} is not recommended for {} activation{}.",
-            qa, activation_name,
+        eprintln!(
+            "WARNING: QA={} is not recommended for {} activation{}.",
+            qa,
+            activation_name,
             if pairwise_enabled { " with pairwise" } else { "" }
         );
         eprintln!("         Recommended: --qa {}", recommended_qa);
@@ -409,8 +411,10 @@ fn main() {
     println!("Features: {} ({} dimensions)", feature_name, input_size);
     println!("Architecture: {} (L1={}, L2={}, L3={})", arch.display(), l1_size, l2_size, l3_size);
     if pairwise_enabled {
-        println!("Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
-            input_size, l1_size, l1_input_dim, l2_size, l3_size);
+        println!(
+            "Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
+            input_size, l1_size, l1_input_dim, l2_size, l3_size
+        );
     } else {
         println!("Network: {} -> {}x2 -> {} -> {} -> 1", input_size, l1_size, l2_size, l3_size);
     }
@@ -524,9 +528,9 @@ fn main() {
             // pairwise あり: 512 -> pairwise -> 256 -> concat -> 512 (表記: 512/2x2)
             // pairwise なし: 512 -> concat -> 1024 (表記: 512x2)
             let l0_suffix = if pairwise_enabled {
-                format!("{}/2x2", l1_size)  // 512/2x2 = 512
+                format!("{}/2x2", l1_size) // 512/2x2 = 512
             } else {
-                format!("{}x2", l1_size)    // 512x2 = 1024
+                format!("{}x2", l1_size) // 512x2 = 1024
             };
             let arch_str = format!(
                 "Features={}[{}->{}]{},fv_scale={},l1_input={},l2={},l3={},qa={},qb={},scale={},pairwise={}",
@@ -535,7 +539,7 @@ fn main() {
                 l0_suffix,
                 activation_suffix,
                 fv_scale,
-                l1_input_dim,  // 実際のL1入力次元 (pairwise時はl1_size, 通常時は2*l1_size)
+                l1_input_dim, // 実際のL1入力次元 (pairwise時はl1_size, 通常時は2*l1_size)
                 l2_size,
                 l3_size,
                 qa,
@@ -575,9 +579,7 @@ fn main() {
                     ((qa_i32 * qa_i32) >> shift) * i32::from(qb)
                 }
                 // SCReLU QA=255: x² >> 9 で 127 スケール
-                (ActivationType::Screlu, false, qa) if qa >= 255 => {
-                    127 * i32::from(qb)
-                }
+                (ActivationType::Screlu, false, qa) if qa >= 255 => 127 * i32::from(qb),
                 // CReLU / その他: qa スケール
                 _ => i32::from(qa) * i32::from(qb),
             };
@@ -604,29 +606,41 @@ fn main() {
                 // 入力次元: l1_input_dim → pad32(l1_input_dim)
                 // Pairwise時はl1_size、通常時は2*l1_size
                 SavedFormat::id("l1b").round().quantise::<i32>(l1_bias_scale),
-                SavedFormat::id("l1w").transpose().transform({
-                    let out_dim = l2_size;
-                    let in_dim = l1_input_dim;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l1w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l2_size;
+                        let in_dim = l1_input_dim;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // L2: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l2 → pad32(l2)
                 // L2入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("l2w").transpose().transform({
-                    let out_dim = l3_size;
-                    let in_dim = l2_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l2w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l3_size;
+                        let in_dim = l2_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // Output: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l3 → pad32(l3)
                 // Output入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("outb").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("outw").transpose().transform({
-                    let out_dim = 1;
-                    let in_dim = l3_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("outw")
+                    .transpose()
+                    .transform({
+                        let out_dim = 1;
+                        let in_dim = l3_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
             ]
         }
     };

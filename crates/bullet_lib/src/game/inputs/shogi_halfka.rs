@@ -442,11 +442,7 @@ fn map_halfka_nonmirror_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
 /// キングインデックス（Non-Mirror, 81マス直指定）
 #[inline]
 fn king_index_nonmirror(ksq: Square, perspective: Color) -> usize {
-    if perspective == Color::Black {
-        ksq.index()
-    } else {
-        ksq.inverse().index()
-    }
+    if perspective == Color::Black { ksq.index() } else { ksq.inverse().index() }
 }
 
 /// 王の BonaPiece インデックス（Non-Mirror）
@@ -659,7 +655,7 @@ mod tests {
     fn test_king_index_nonmirror_white() {
         // 後手視点: 180度回転
         let sq_59 = Square::new(4, 8); // 5九
-        let sq_51 = sq_59.inverse();   // 5一
+        let sq_51 = sq_59.inverse(); // 5一
         assert_eq!(king_index_nonmirror(sq_59, Color::White), sq_51.index());
     }
 

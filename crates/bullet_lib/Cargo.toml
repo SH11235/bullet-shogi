@@ -72,3 +72,7 @@ path = "../../examples/extra/relabel.rs"
 [[example]]
 name = "shogi_simple"
 path = "../../examples/shogi_simple.rs"
+
+[[example]]
+name = "shogi_layerstack"
+path = "../../examples/shogi_layerstack.rs"

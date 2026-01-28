@@ -275,9 +275,10 @@ fn main() {
     // NNUE version (YaneuraOu/Stockfish compatible)
     const NNUE_VERSION: u32 = 0x7AF32F16;
 
-    // Calculate FV_SCALE = (QA × QB) / scale (rounded)
-    let qa_qb = i32::from(qa) * i32::from(qb);
-    let fv_scale = (qa_qb + args.scale / 2) / args.scale;
+    // Calculate FV_SCALE = (127 × QB) / scale (rounded)
+    // bullet 流: L1/L2/L3 全て同じ量子化スケール (127 × QB) を使用
+    let bias_scale = 127 * i32::from(qb); // 8128
+    let fv_scale = (bias_scale + args.scale / 2) / args.scale;
 
     // Build architecture string with LayerStack metadata
     let arch_str = format!(
@@ -310,6 +311,8 @@ fn main() {
     let network_hash = 0u32.to_le_bytes().to_vec();
 
     println!("Architecture string: {}", arch_str);
+    println!("Bias scale (L1/L2/L3): {}", bias_scale);
+    println!("FV_SCALE: {}", fv_scale);
 
     let save_format: Vec<SavedFormat> = vec![
         // NNUE Header
@@ -329,13 +332,14 @@ fn main() {
             .quantise::<i16>(qa),
         // Network layer hash
         SavedFormat::custom(network_hash),
-        // L1-L3 (LayerStack layers)
+        // L1-L3 (LayerStack layers) - all use same quantization (bullet 流)
+        // bias: 127 × QB = 8128, weight: QB = 64
         // Order: biases first, then weights (transposed for row-major)
-        SavedFormat::id("l1b").round().quantise::<i32>(127 * i32::from(qb)),
+        SavedFormat::id("l1b").round().quantise::<i32>(bias_scale),
         SavedFormat::id("l1w").transpose().round().quantise::<i8>(qb),
-        SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
+        SavedFormat::id("l2b").round().quantise::<i32>(bias_scale),
         SavedFormat::id("l2w").transpose().round().quantise::<i8>(qb),
-        SavedFormat::id("l3b").round().quantise::<i32>(127 * i32::from(qb)),
+        SavedFormat::id("l3b").round().quantise::<i32>(bias_scale),
         SavedFormat::id("l3w").transpose().round().quantise::<i8>(qb),
     ];
 

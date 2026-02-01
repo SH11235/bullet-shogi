@@ -24,7 +24,7 @@ use crate::shogi::{
 // =============================================================================
 
 /// nnue-pytorch互換の特徴量hash値 (HalfKA_hm)
-pub const FEATURE_HASH_HM: u32 = 0x5f134cb8;
+pub const FEATURE_HASH_HM: u32 = 0x7f134cb8;
 
 /// キングバケット数 (Half-Mirror: 9段 × 5筋)
 pub const NUM_KING_BUCKETS: usize = 45;
@@ -307,7 +307,7 @@ fn halfka_index(kb: usize, packed_bp: usize) -> usize {
 // =============================================================================
 
 /// nnue-pytorch互換の特徴量hash値 (HalfKA Non-Mirror)
-pub const FEATURE_HASH_NONMIRROR: u32 = 0x7f134cb8;
+pub const FEATURE_HASH_NONMIRROR: u32 = 0x5f134cb8;
 
 /// キングバケット数 (Non-Mirror: 81マス)
 pub const NUM_KING_BUCKETS_NONMIRROR: usize = 81;

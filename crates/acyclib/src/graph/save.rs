@@ -77,6 +77,10 @@ impl SavedFormat {
         self.id.clone()
     }
 
+    pub fn is_custom(&self) -> bool {
+        self.custom.is_some()
+    }
+
     /// Create a `SavedFormat` that is initialised with the weights from `id`.
     pub fn id(id: &str) -> Self {
         let id = id.to_string();

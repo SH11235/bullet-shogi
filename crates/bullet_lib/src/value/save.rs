@@ -100,16 +100,22 @@ where
     let mut file = File::create(path).unwrap();
     let mut buf = Vec::new();
 
+    let mut has_custom_format = false;
     for fmt in &trainer.state.saved_format {
         buf.extend_from_slice(&fmt.write_to_byte_buffer(&weight_store)?);
+        if fmt.is_custom() {
+            has_custom_format = true;
+        }
     }
 
-    let bytes = buf.len() % 64;
-    if bytes > 0 {
-        let chs = [b'b', b'u', b'l', b'l', b'e', b't'];
+    if !has_custom_format {
+        let bytes = buf.len() % 64;
+        if bytes > 0 {
+            let chs = [b'b', b'u', b'l', b'l', b'e', b't'];
 
-        for i in 0..64 - bytes {
-            buf.push(chs[i % chs.len()]);
+            for i in 0..64 - bytes {
+                buf.push(chs[i % chs.len()]);
+            }
         }
     }
 

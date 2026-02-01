@@ -15,8 +15,8 @@ pub use ataxx147::{Ataxx98, Ataxx147};
 pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
-pub use shogi_halfka::{ShogiHalfKA, ShogiHalfKA_hm};
-pub use shogi_halfkp::ShogiHalfKP;
+pub use shogi_halfka::{ShogiHalfKA, ShogiHalfKA_hm, FEATURE_HASH_HM, FEATURE_HASH_NONMIRROR};
+pub use shogi_halfkp::{ShogiHalfKP, FEATURE_HASH};
 
 #[allow(deprecated)]
 pub use chess_buckets_mk::*;

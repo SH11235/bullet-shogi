@@ -278,6 +278,76 @@ fn pad32(size: usize) -> usize {
     size.div_ceil(32) * 32
 }
 
+// =============================================================================
+// NNUE-pytorch 互換ヘッダー計算
+// =============================================================================
+
+/// fc_hash計算
+///
+/// InputSlice hash: 0xEC42E90D
+/// Layer hash base: 0xCC03DAE4
+/// ClippedReLU hash: 0x538D24C7
+fn compute_fc_hash(l1_size: usize, l2_size: usize, l3_size: usize) -> u32 {
+    // InputSlice hash
+    let mut prev_hash: u32 = 0xEC42E90D;
+    prev_hash ^= (l1_size * 2) as u32;
+
+    // Fully connected layers: [l1, l2, output]
+    let layer_sizes = [l2_size, l3_size, 1usize];
+    for (i, &out_features) in layer_sizes.iter().enumerate() {
+        let mut layer_hash: u32 = 0xCC03DAE4;
+        layer_hash = layer_hash.wrapping_add(out_features as u32);
+        layer_hash ^= prev_hash >> 1;
+        layer_hash ^= (prev_hash << 31) & 0xFFFFFFFF;
+
+        // Clipped ReLU hash (not for output layer)
+        if i < 2 {
+            layer_hash = layer_hash.wrapping_add(0x538D24C7);
+        }
+        prev_hash = layer_hash;
+    }
+
+    prev_hash
+}
+
+/// 特徴量hash値を取得
+fn get_feature_hash(features: FeatureSet) -> u32 {
+    use bullet_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM, FEATURE_HASH_NONMIRROR};
+    match features {
+        FeatureSet::HalfKP => FEATURE_HASH,
+        FeatureSet::HalfkaHm => FEATURE_HASH_HM,
+        FeatureSet::Halfka => FEATURE_HASH_NONMIRROR,
+    }
+}
+
+/// nnue-pytorch形式のdescription文字列を生成
+fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usize, l3_size: usize) -> String {
+    let (feature_name, input_size) = match feature_set {
+        FeatureSet::HalfKP => ("HalfKP(Friend)", 125388usize),
+        FeatureSet::HalfkaHm => ("HalfKA(Friend)", 73305usize),
+        FeatureSet::Halfka => ("HalfKA(Friend)", 138510usize),
+    };
+
+    // Format: Features=HalfKP(Friend)[125388->256x2],Network=AffineTransform[1<-256](...)
+    let description = format!(
+        "Features={}[{}->{}x2],Network=AffineTransform[1<-{}](ClippedReLU[{}](AffineTransform[{}<-{}](ClippedReLU[{}](AffineTransform[{}<-{}](InputSlice[{}(0:{})])))))",
+        feature_name,
+        input_size,
+        l1_size,
+        l3_size,  // Output layer input
+        l3_size,  // L2 output / L3 input
+        l3_size,  // L2 output features
+        l2_size,  // L2 input features
+        l2_size,  // L1 output / L2 input
+        l2_size,  // L1 output features
+        l1_size * 2,  // L1 input (accumulator x2)
+        l1_size * 2,  // InputSlice size
+        l1_size * 2   // InputSlice range
+    );
+
+    description
+}
+
 /// rust-core 用に重みをパディング
 ///
 /// rust-core は SIMD 最適化のため、各層の入力次元を32の倍数にパディングする。
@@ -492,7 +562,7 @@ fn main() {
             // rust-core format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
             //
             // File layout:
-            // - Header: version (u32), hash (u32), arch_len (u32), arch_string
+            // - Header: version (u32), network_hash (u32), desc_len (u32), description
             // - FeatureTransformer layer hash (u32)
             // - L0: biases i16[L1], weights i16[INPUT×L1]
             // - Network layer hash (u32)
@@ -503,58 +573,27 @@ fn main() {
             // NNUE version (YaneuraOu/Stockfish compatible)
             const NNUE_VERSION: u32 = 0x7AF32F16;
 
-            // Build architecture string with features and activation info
-            // Include fv_scale metadata for rust-core inference
-            // FV_SCALE = (QA × QB) / scale (四捨五入)
-            //
-            // 重要: l2/l3 を明示的に含める（rust-core がパースできるようにするため）
-            // rust-core は AffineTransform[...] パターンがない場合、l2/l3 フィールドを使用
-            let qa_qb = i32::from(qa) * i32::from(qb);
-            let fv_scale = (qa_qb + args.scale / 2) / args.scale;
+            // Compute hashes (nnue-pytorch compatible)
+            let feature_hash = get_feature_hash(args.features);
+            let fc_hash = compute_fc_hash(l1_size, l2_size, l3_size);
+            // network_hash = fc_hash ^ feature_hash ^ (l1_size * 2)
+            let network_hash = fc_hash ^ feature_hash ^ ((l1_size * 2) as u32);
 
-            // Build activation suffix (e.g., "-SCReLU", "-CReLU-Pairwise")
-            let activation_suffix = match (args.activation, pairwise_enabled) {
-                (ActivationType::Screlu, false) => "-SCReLU",
-                (ActivationType::Screlu, true) => "-SCReLU-Pairwise",
-                (ActivationType::Crelu, false) => "",
-                (ActivationType::Crelu, true) => "-Pairwise",
-            };
+            // Build nnue-pytorch compatible description string
+            let description = build_nnue_description(args.features, l1_size, l2_size, l3_size);
+            let desc_bytes = description.as_bytes();
 
-            // l1_input: L1層への入力次元 (pairwise時は半分)
-            // pairwise あり: 512 -> pairwise -> 256 -> concat -> 512 (表記: 512/2x2)
-            // pairwise なし: 512 -> concat -> 1024 (表記: 512x2)
-            let l0_suffix = if pairwise_enabled {
-                format!("{}/2x2", l1_size)  // 512/2x2 = 512
-            } else {
-                format!("{}x2", l1_size)    // 512x2 = 1024
-            };
-            let arch_str = format!(
-                "Features={}[{}->{}]{},fv_scale={},l1_input={},l2={},l3={},qa={},qb={},scale={},pairwise={}",
-                feature_name,
-                input_size,
-                l0_suffix,
-                activation_suffix,
-                fv_scale,
-                l1_input_dim,  // 実際のL1入力次元 (pairwise時はl1_size, 通常時は2*l1_size)
-                l2_size,
-                l3_size,
-                qa,
-                qb,
-                args.scale,
-                pairwise_enabled
-            );
-            let arch_bytes = arch_str.as_bytes();
-
-            // Build header
+            // Build header (nnue-pytorch format)
             let mut header = Vec::new();
             header.extend_from_slice(&NNUE_VERSION.to_le_bytes());
-            header.extend_from_slice(&0u32.to_le_bytes()); // hash (dummy)
-            header.extend_from_slice(&(arch_bytes.len() as u32).to_le_bytes());
-            header.extend_from_slice(arch_bytes);
+            header.extend_from_slice(&network_hash.to_le_bytes());
+            header.extend_from_slice(&(desc_bytes.len() as u32).to_le_bytes());
+            header.extend_from_slice(desc_bytes);
 
-            // Layer hashes (dummy values, rust-core skips validation)
-            let ft_hash = 0u32.to_le_bytes().to_vec();
-            let network_hash = 0u32.to_le_bytes().to_vec();
+            // FeatureTransformer layer hash (nnue-pytorch format: feature_hash ^ (l1_size * 2))
+            let ft_hash = (feature_hash ^ ((l1_size * 2) as u32)).to_le_bytes().to_vec();
+            // Network layer hash (fc_hash)
+            let network_hash_bytes = fc_hash.to_le_bytes().to_vec();
 
             // L1バイアスのスケール:
             // L1層入力スケールは活性化関数の出力スケールに依存:
@@ -591,7 +630,7 @@ fn main() {
                 SavedFormat::id("l0b").round().quantise::<i16>(qa),
                 SavedFormat::id("l0w").round().quantise::<i16>(qa),
                 // Network layer hash
-                SavedFormat::custom(network_hash),
+                SavedFormat::custom(network_hash_bytes),
                 // L1-Output層の重みは .transpose() で row-major に変換
                 // 理由: Stockfish/nnue-pytorch は row-major で推論する
                 // bullet 内部は column-major だが、これは GPU (cuBLAS) 最適化のため

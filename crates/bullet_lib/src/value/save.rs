@@ -100,14 +100,13 @@ where
     let mut file = File::create(path).unwrap();
     let mut buf = Vec::new();
 
-    let mut has_custom_format = false;
+    // カスタムフォーマットの有無を判定（trueだとYaneuraOu形式）
+    let has_custom_format = trainer.state.saved_format.iter().any(|fmt| fmt.is_custom());
     for fmt in &trainer.state.saved_format {
         buf.extend_from_slice(&fmt.write_to_byte_buffer(&weight_store)?);
-        if fmt.is_custom() {
-            has_custom_format = true;
-        }
     }
-
+    
+    // YaneuraOu形式の場合、パディング不要
     if !has_custom_format {
         let bytes = buf.len() % 64;
         if bytes > 0 {

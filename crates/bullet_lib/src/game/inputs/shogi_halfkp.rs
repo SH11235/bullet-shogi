@@ -19,7 +19,7 @@ use crate::shogi::{
 // =============================================================================
 
 /// nnue-pytorch互換の特徴量hash値 (HalfKP)
-pub const FEATURE_HASH: u32 = 0x5D69D7B8;
+pub const FEATURE_HASH: u32 = 0x5D69D5B8;
 
 /// キングバケット数 (全81マス)
 pub const NUM_KING_SQ: usize = 81;

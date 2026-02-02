@@ -324,7 +324,7 @@ fn get_feature_hash(features: FeatureSet) -> u32 {
 fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usize, l3_size: usize) -> String {
     let (feature_name, input_size) = match feature_set {
         FeatureSet::HalfKP => ("HalfKP(Friend)", 125388usize),
-        FeatureSet::HalfkaHm => ("HalfKA(Friend)", 73305usize),
+        FeatureSet::HalfkaHm => ("HalfKA_hm(Friend)", 73305usize),
         FeatureSet::Halfka => ("HalfKA(Friend)", 138510usize),
     };
 

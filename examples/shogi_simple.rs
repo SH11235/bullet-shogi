@@ -68,10 +68,11 @@ enum FeatureSet {
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 enum OutputFormat {
     /// bullet format: all i16 (l0w, l0b, l1w, l1b, l2w, l2b, outw, outb)
-    #[default]
     Bullet,
-    /// rust-core format: L0 i16, L1-Out biases i32 + weights i8, with NNUE header
-    RustCore,
+    /// standard format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
+    /// Compatible with nnue-pytorch / YaneuraOu
+    #[default]
+    Standard,
 }
 
 /// Activation function selection
@@ -125,10 +126,10 @@ struct Args {
     #[arg(long, value_enum, default_value = "halfka-hm")]
     features: FeatureSet,
 
-    /// Output format (bullet or rust-core)
-    /// bullet: all i16, no header (default)
-    /// rust-core: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
-    #[arg(long, value_enum, default_value = "bullet")]
+    /// Output format (standard or bullet)
+    /// standard: NNUE header + L0 i16 + L1-Out biases i32 + weights i8 (default)
+    /// bullet: all i16, no header
+    #[arg(long, value_enum, default_value = "standard")]
     output_format: OutputFormat,
 
     /// Activation function (screlu or crelu)
@@ -349,9 +350,9 @@ fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usiz
     description
 }
 
-/// rust-core 用に重みをパディング
+/// standard 用に重みをパディング
 ///
-/// rust-core は SIMD 最適化のため、各層の入力次元を32の倍数にパディングする。
+/// standard は SIMD 最適化のため、各層の入力次元を32の倍数にパディングする。
 /// 例: 入力次元8 → パディング後32 (24個の0を追加)
 ///
 /// # Arguments
@@ -559,8 +560,8 @@ fn main() {
                 SavedFormat::id("outb").round().quantise::<i16>(qa * qb),
             ]
         }
-        OutputFormat::RustCore => {
-            // rust-core format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
+        OutputFormat::Standard => {
+            // standard format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
             //
             // File layout:
             // - Header: version (u32), network_hash (u32), desc_len (u32), description
@@ -627,7 +628,7 @@ fn main() {
                 SavedFormat::custom(header),
                 // FeatureTransformer layer hash
                 SavedFormat::custom(ft_hash),
-                // L0: biases first, then weights (rust-core order)
+                // L0: biases first, then weights (standard order)
                 SavedFormat::id("l0b").round().quantise::<i16>(qa),
                 SavedFormat::id("l0w").round().quantise::<i16>(qa),
                 // Network layer hash
@@ -637,7 +638,7 @@ fn main() {
                 // bullet 内部は column-major だが、これは GPU (cuBLAS) 最適化のため
                 // 変換コストは出力時の1回のみで、学習効率には影響しない
                 //
-                // 重要: rust-core は SIMD 最適化のため 32バイトアライメントを要求
+                // 重要: standard は SIMD 最適化のため 32バイトアライメントを要求
                 // 各層の入力次元を pad32() でパディングする必要がある
                 //
                 // L1: biases i32, weights i8 (row-major, padded)

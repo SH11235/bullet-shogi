@@ -15,12 +15,12 @@ Options:
     --superbatches <N>  Number of superbatches (default: 100)
     --lr <RATE>         Initial learning rate (default: 0.001)
     --wdl <LAMBDA>      WDL lambda (default: 0.75)
-    --scale <N>         Eval scale (default: 1020)
+    --scale <N>         Eval scale (default: 1016)
                         FV_SCALE = QA*QB/scale (rounded)
+                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32, 1016->8
                         QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
-                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32
-                        Note: Default (QA=255, scale=1020) -> FV_SCALE=16
-                        For FV_SCALE=32: --qa 255 --scale 510 or --qa 127 --scale 254
+                        Note: Default (QA=127, scale=1016) -> FV_SCALE=8
+                        For FV_SCALE=16: --qa 127 --scale 508 or --qa 255 --scale 1020
     --save-rate <N>     Save interval in superbatches (default: 10)
     --threads <N>       Number of threads (default: 4)
     --output <DIR>      Output directory (default: checkpoints)
@@ -80,10 +80,10 @@ enum OutputFormat {
 enum ActivationType {
     /// SCReLU - Squared Clipped ReLU: y = clamp(x, 0, qa)²
     /// Higher expressiveness, used in modern Stockfish
-    #[default]
     Screlu,
     /// CReLU - Clipped ReLU: y = clamp(x, 0, qa)
     /// Traditional activation, used in YaneuraOu/Suisho
+    #[default]
     Crelu,
 }
 
@@ -132,10 +132,10 @@ struct Args {
     #[arg(long, value_enum, default_value = "standard")]
     output_format: OutputFormat,
 
-    /// Activation function (screlu or crelu)
-    /// screlu: Squared Clipped ReLU - higher expressiveness (default)
-    /// crelu: Clipped ReLU - traditional, used in YaneuraOu/Suisho
-    #[arg(long, value_enum, default_value = "screlu")]
+    /// Activation function (crelu or screlu)
+    /// crelu: Clipped ReLU - traditional, used in YaneuraOu/Suisho (default)
+    /// screlu: Squared Clipped ReLU - higher expressiveness
+    #[arg(long, value_enum, default_value = "crelu")]
     activation: ActivationType,
 
     /// Pairwise multiplication mode (off or on)
@@ -190,12 +190,12 @@ struct Args {
     /// Eval scale for training target sigmoid(score / scale).
     /// FV_SCALE = QA*QB/scale (rounded).
     /// Recommended divisors for exact FV_SCALE:
-    ///   QA=255 (SCReLU): 510->32, 1020->16, 340->48
     ///   QA=127 (CReLU):  508->16, 254->32, 1016->8
-    /// Note: Default (QA=255, scale=1020) gives FV_SCALE=16.
-    /// For FV_SCALE=32: use --qa 255 --scale 510  (SCReLU)
-    ///                  or  --qa 127 --scale 254  (CReLU)
-    #[arg(long, default_value = "1020")]
+    ///   QA=255 (SCReLU): 510->32, 1020->16, 340->48
+    /// Note: Default (QA=127, scale=1016) gives FV_SCALE=8.
+    /// For FV_SCALE=16: use --qa 127 --scale 508  (CReLU)
+    ///                  or  --qa 255 --scale 1020 (SCReLU)
+    #[arg(long, default_value = "1016")]
     scale: i32,
 
     /// Save interval (superbatches)
@@ -215,7 +215,7 @@ struct Args {
     net_id: String,
 
     /// Quantization factor QA (for L0)
-    #[arg(long, default_value = "255")]
+    #[arg(long, default_value = "127")]
     qa: i16,
 
     /// Quantization factor QB (for later layers)

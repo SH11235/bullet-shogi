@@ -184,7 +184,7 @@ struct Args {
     lr: f32,
 
     /// WDL lambda (0.0=eval only, 1.0=game result only)
-    #[arg(long, default_value = "0.75")]
+    #[arg(long, default_value = "0.5")]
     wdl: f32,
 
     /// Eval scale for training target sigmoid(score / scale).

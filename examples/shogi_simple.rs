@@ -200,19 +200,19 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
-    /// WDL lambda (0.0=eval only, 1.0=game result only)
-    /// Cannot be used with --start-wdl and --end-wdl
-    #[arg(long, default_value = "0.5")]
-    wdl: f32,
+    /// WDL lambda (0.0=eval only, 1.0=game result only, default: 0.5)
+    /// Cannot be used with --start-wdl/--end-wdl
+    #[arg(long, conflicts_with_all = ["start_wdl", "end_wdl"])]
+    wdl: Option<f32>,
 
     /// Start WDL lambda for linear interpolation
     /// Must be used together with --end-wdl
-    #[arg(long)]
+    #[arg(long, requires = "end_wdl")]
     start_wdl: Option<f32>,
 
     /// End WDL lambda for linear interpolation
     /// Must be used together with --start-wdl
-    #[arg(long)]
+    #[arg(long, requires = "start_wdl")]
     end_wdl: Option<f32>,
 
     /// Eval scale for training target sigmoid(score / scale).
@@ -293,21 +293,36 @@ struct Args {
 }
 
 impl Args {
+    /// WDL lambda の値（デフォルト 0.5）
+    fn wdl_value(&self) -> f32 {
+        self.wdl.unwrap_or(0.5)
+    }
+
+    /// WDL値が [0.0, 1.0] の範囲内であることを検証
+    fn validate_wdl_range(name: &str, value: f32) -> Result<(), String> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(())
+        } else {
+            Err(format!("--{} must be between 0.0 and 1.0 (got {})", name, value))
+        }
+    }
+
     /// Validates WDL-related arguments and creates the appropriate scheduler.
     fn create_wdl_scheduler(&self) -> Result<wdl::WdlSchedulerEnum, String> {
         match (self.start_wdl, self.end_wdl) {
             (Some(start), Some(end)) => {
-                if self.wdl != 0.5 {
-                    return Err("Cannot use both --wdl and --start-wdl/--end-wdl\n\
-                         Use either --wdl <value> for constant WDL,\n\
-                         or --start-wdl <value> --end-wdl <value> for linear WDL"
-                        .to_string());
-                }
+                Self::validate_wdl_range("start-wdl", start)?;
+                Self::validate_wdl_range("end-wdl", end)?;
                 Ok(wdl::WdlSchedulerEnum::linear(start, end))
             }
+            // clap の requires で排他制御済みだが念のため
             (Some(_), None) => Err("--start-wdl requires --end-wdl".to_string()),
             (None, Some(_)) => Err("--end-wdl requires --start-wdl".to_string()),
-            (None, None) => Ok(wdl::WdlSchedulerEnum::constant(self.wdl)),
+            (None, None) => {
+                let wdl = self.wdl_value();
+                Self::validate_wdl_range("wdl", wdl)?;
+                Ok(wdl::WdlSchedulerEnum::constant(wdl))
+            }
         }
     }
 
@@ -315,7 +330,7 @@ impl Args {
     fn wdl_display(&self) -> String {
         match (self.start_wdl, self.end_wdl) {
             (Some(start), Some(end)) => format!("Linear ({} -> {})", start, end),
-            _ => format!("Constant ({})", self.wdl),
+            _ => format!("Constant ({})", self.wdl_value()),
         }
     }
 }
@@ -510,8 +525,12 @@ fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64)
 
     let checkpoints = collect_checkpoints(&ctx.output_dir, &ctx.net_id);
 
-    let total_positions =
-        ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * ctx.params.superbatches as u64;
+    let num_superbatches = if ctx.params.superbatches >= ctx.params.start_superbatch {
+        (ctx.params.superbatches - ctx.params.start_superbatch + 1) as u64
+    } else {
+        0
+    };
+    let total_positions = ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * num_superbatches;
 
     // データファイルの総局面数を計算 (ファイルサイズ / 40バイト)
     const PACKED_SFEN_VALUE_SIZE: u64 = 40;
@@ -859,7 +878,7 @@ fn main() {
         batches_per_superbatch: batches_per_superbatch_display,
         superbatches: args.superbatches,
         start_superbatch: args.start_superbatch,
-        wdl: args.wdl,
+        wdl: args.wdl_value(),
         start_wdl: args.start_wdl,
         end_wdl: args.end_wdl,
         scale: args.scale,

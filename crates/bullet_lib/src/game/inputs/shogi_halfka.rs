@@ -448,11 +448,7 @@ fn map_halfka_nonmirror_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
 /// キングインデックス（Non-Mirror, 81マス直指定）
 #[inline]
 fn king_index_nonmirror(ksq: Square, perspective: Color) -> usize {
-    if perspective == Color::Black {
-        ksq.index()
-    } else {
-        ksq.inverse().index()
-    }
+    if perspective == Color::Black { ksq.index() } else { ksq.inverse().index() }
 }
 
 /// 王の BonaPiece インデックス（Non-Mirror）
@@ -594,12 +590,12 @@ mod tests {
     #[test]
     fn test_map_features_count() {
         // ダミーの局面を作成（手動で設定）
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉を配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 
@@ -619,12 +615,12 @@ mod tests {
     #[test]
     fn test_map_features_sq_nb_guard() {
         // 片玉データ（玉位置が SQ_NB=81）のテスト
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 先手玉を正常位置、後手玉を SQ_NB(81) に設定
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::NONE; // SQ_NB (81)
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::NONE,      // SQ_NB (81)
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
 
         let mut count = 0;
@@ -665,7 +661,7 @@ mod tests {
     fn test_king_index_nonmirror_white() {
         // 後手視点: 180度回転
         let sq_59 = Square::new(4, 8); // 5九
-        let sq_51 = sq_59.inverse();   // 5一
+        let sq_51 = sq_59.inverse(); // 5一
         assert_eq!(king_index_nonmirror(sq_59, Color::White), sq_51.index());
     }
 
@@ -695,12 +691,12 @@ mod tests {
 
     #[test]
     fn test_map_halfka_nonmirror_features_count() {
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉を配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 

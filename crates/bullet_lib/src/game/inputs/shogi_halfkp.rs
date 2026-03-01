@@ -204,12 +204,12 @@ mod tests {
     #[test]
     fn test_map_features_count() {
         // ダミーの局面を作成（手動で設定）
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉を配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 
@@ -229,12 +229,12 @@ mod tests {
     #[test]
     fn test_map_features_no_kings() {
         // HalfKP では王は特徴量に含めないことを確認
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉のみを配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 
@@ -248,12 +248,12 @@ mod tests {
     #[test]
     fn test_map_features_sq_nb_guard() {
         // 片玉データ（玉位置が SQ_NB=81）のテスト
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 先手玉を正常位置、後手玉を SQ_NB(81) に設定
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::NONE; // SQ_NB (81)
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::NONE,      // SQ_NB (81)
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
 
         let mut count = 0;
@@ -266,12 +266,12 @@ mod tests {
     #[test]
     fn test_feature_indices_in_range() {
         // 特徴インデックスが範囲内であることを確認
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉を配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 

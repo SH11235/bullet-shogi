@@ -102,3 +102,40 @@ impl<First: WdlScheduler, Second: WdlScheduler> WdlScheduler for Sequence<First,
         )
     }
 }
+
+/// Enum wrapper for WDL schedulers to allow runtime selection.
+/// This is useful when the scheduler type is determined at runtime
+/// based on command-line arguments.
+#[derive(Clone, Debug)]
+pub enum WdlSchedulerEnum {
+    Constant(ConstantWDL),
+    Linear(LinearWDL),
+}
+
+impl WdlSchedulerEnum {
+    /// Creates a constant WDL scheduler with the given value.
+    pub fn constant(value: f32) -> Self {
+        Self::Constant(ConstantWDL { value })
+    }
+
+    /// Creates a linear WDL scheduler with start and end values.
+    pub fn linear(start: f32, end: f32) -> Self {
+        Self::Linear(LinearWDL { start, end })
+    }
+}
+
+impl WdlScheduler for WdlSchedulerEnum {
+    fn blend(&self, batch: usize, superbatch: usize, max: usize) -> f32 {
+        match self {
+            Self::Constant(s) => s.blend(batch, superbatch, max),
+            Self::Linear(s) => s.blend(batch, superbatch, max),
+        }
+    }
+
+    fn colourful(&self) -> String {
+        match self {
+            Self::Constant(s) => s.colourful(),
+            Self::Linear(s) => s.colourful(),
+        }
+    }
+}

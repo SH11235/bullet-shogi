@@ -23,8 +23,8 @@ use crate::shogi::{
 // 定数
 // =============================================================================
 
-/// nnue-pytorch互換の特徴量hash値 (HalfKA_hm)
-pub const FEATURE_HASH_HM: u32 = 0x7f134cb8;
+/// nnue-pytorch互換の特徴量hash値 (HalfKA_hm_v2)
+pub const FEATURE_HASH_HM_V2: u32 = 0x7f134cb8;
 
 /// キングバケット数 (Half-Mirror: 9段 × 5筋)
 pub const NUM_KING_BUCKETS: usize = 45;

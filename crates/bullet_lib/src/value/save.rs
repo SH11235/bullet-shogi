@@ -105,7 +105,7 @@ where
     for fmt in &trainer.state.saved_format {
         buf.extend_from_slice(&fmt.write_to_byte_buffer(&weight_store)?);
     }
-    
+
     // YaneuraOu形式の場合、パディング不要
     if !has_custom_format {
         let bytes = buf.len() % 64;

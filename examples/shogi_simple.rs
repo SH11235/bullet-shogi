@@ -513,6 +513,16 @@ fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64)
     let total_positions =
         ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * ctx.params.superbatches as u64;
 
+    // データファイルの総局面数を計算 (ファイルサイズ / 40バイト)
+    const PACKED_SFEN_VALUE_SIZE: u64 = 40;
+    let positions: u64 = ctx
+        .data_name
+        .split(',')
+        .filter_map(|path| std::fs::metadata(path.trim()).ok())
+        .map(|meta| meta.len() / PACKED_SFEN_VALUE_SIZE)
+        .sum();
+    let epochs = if positions > 0 { total_positions as f64 / positions as f64 } else { 0.0 };
+
     // best loss を history から計算
     let (best_loss, best_loss_superbatch) = history
         .iter()
@@ -527,7 +537,12 @@ fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64)
         commit,
         command: ctx.command.clone(),
         params: ctx.params.clone(),
-        data: ExperimentData { name: ctx.data_name.clone(), positions: None, total_positions, epochs: None },
+        data: ExperimentData {
+            name: ctx.data_name.clone(),
+            positions: Some(positions),
+            total_positions,
+            epochs: Some(epochs),
+        },
         results: ExperimentResults {
             training_time_seconds,
             fv_scale: ctx.fv_scale,
@@ -539,7 +554,9 @@ fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64)
     };
 
     let json = serde_json::to_string_pretty(&experiment).map_err(std::io::Error::other)?;
-    let json_path = ctx.output_dir.join("experiment.json");
+    let json_dir = ctx.output_dir.join(&ctx.net_id);
+    std::fs::create_dir_all(&json_dir)?;
+    let json_path = json_dir.join("experiment.json");
     std::fs::write(&json_path, json)?;
     println!("Experiment log saved to {}", json_path.display());
     Ok(())

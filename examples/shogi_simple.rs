@@ -333,8 +333,17 @@ struct ExperimentLog {
     command: String,
     params: ExperimentParams,
     data: ExperimentData,
+    results: ExperimentResults,
     history: Vec<LossEntry>,
     checkpoints: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentResults {
+    training_time_seconds: u64,
+    fv_scale: i32,
+    best_loss: Option<f64>,
+    best_loss_superbatch: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]
@@ -480,41 +489,57 @@ fn collect_checkpoints(output_dir: &std::path::Path, net_id: &str) -> Vec<String
     checkpoints
 }
 
-fn generate_experiment_json(
-    output_dir: &std::path::Path,
-    net_id: &str,
-    name: &str,
-    command: &str,
-    params: &ExperimentParams,
-    data_name: &str,
+struct ExperimentContext {
+    output_dir: std::path::PathBuf,
+    net_id: String,
+    command: String,
+    params: ExperimentParams,
+    data_name: String,
     superbatches: usize,
-) -> std::io::Result<()> {
+    fv_scale: i32,
+}
+
+fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64) -> std::io::Result<()> {
     let commit = get_git_commit();
     let (id_ts, date) = get_timestamp();
-    let id = format!("{}-{}", id_ts, net_id);
+    let id = format!("{}-{}", id_ts, ctx.net_id);
 
-    let final_checkpoint = format!("{}-{}", net_id, superbatches);
-    let log_path = output_dir.join(&final_checkpoint).join("log.txt");
+    let final_checkpoint = format!("{}-{}", ctx.net_id, ctx.superbatches);
+    let log_path = ctx.output_dir.join(&final_checkpoint).join("log.txt");
     let history = parse_loss_history(&log_path);
 
-    let checkpoints = collect_checkpoints(output_dir, net_id);
+    let checkpoints = collect_checkpoints(&ctx.output_dir, &ctx.net_id);
 
-    let total_positions = params.batch_size as u64 * params.batches_per_superbatch as u64 * params.superbatches as u64;
+    let total_positions =
+        ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * ctx.params.superbatches as u64;
+
+    // best loss を history から計算
+    let (best_loss, best_loss_superbatch) = history
+        .iter()
+        .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
+        .unwrap_or((None, None));
 
     let experiment = ExperimentLog {
         id,
-        name: name.to_string(),
+        name: ctx.net_id.clone(),
         date,
         commit,
-        command: command.to_string(),
-        params: params.clone(),
-        data: ExperimentData { name: data_name.to_string(), positions: None, total_positions, epochs: None },
+        command: ctx.command.clone(),
+        params: ctx.params.clone(),
+        data: ExperimentData { name: ctx.data_name.clone(), positions: None, total_positions, epochs: None },
+        results: ExperimentResults {
+            training_time_seconds,
+            fv_scale: ctx.fv_scale,
+            best_loss,
+            best_loss_superbatch,
+        },
         history,
         checkpoints,
     };
 
     let json = serde_json::to_string_pretty(&experiment).map_err(std::io::Error::other)?;
-    let json_path = output_dir.join("experiment.json");
+    let json_path = ctx.output_dir.join("experiment.json");
     std::fs::write(&json_path, json)?;
     println!("Experiment log saved to {}", json_path.display());
     Ok(())
@@ -802,8 +827,6 @@ fn main() {
     println!("===========================");
 
     // Capture data for experiment JSON before args.net_id is moved
-    let experiment_net_id = args.net_id.clone();
-    let experiment_command = std::env::args().collect::<Vec<_>>().join(" ");
     let output_format_name = match args.output_format {
         OutputFormat::Bullet => "bullet",
         OutputFormat::Standard => "standard",
@@ -833,10 +856,17 @@ fn main() {
         qa: args.qa,
         qb: args.qb,
     };
-    let experiment_data_name = args.data.clone();
-    let experiment_output_dir = args.output.clone();
-    let experiment_superbatches = args.superbatches;
     let experiment_quantise_only = args.quantise_only;
+    let experiment_fv_scale = (i32::from(args.qa) * i32::from(args.qb) + args.scale / 2) / args.scale;
+    let experiment_ctx = ExperimentContext {
+        output_dir: args.output.clone(),
+        net_id: args.net_id.clone(),
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        params: experiment_params,
+        data_name: args.data.clone(),
+        superbatches: args.superbatches,
+        fv_scale: experiment_fv_scale,
+    };
 
     // Create WDL scheduler
     let wdl_scheduler = args.create_wdl_scheduler().unwrap_or_else(|e| {
@@ -1269,6 +1299,7 @@ fn main() {
     }
 
     // Run training based on feature set, activation, and pairwise mode
+    let training_start = std::time::Instant::now();
     let use_win_rate_model = args.win_rate_model;
     match (args.features, args.activation, pairwise_enabled) {
         (FeatureSet::HalfkaHm, ActivationType::Screlu, false) => {
@@ -1310,16 +1341,9 @@ fn main() {
     }
 
     // Generate experiment JSON after training completes
+    let training_time_seconds = training_start.elapsed().as_secs();
     if !experiment_quantise_only {
-        if let Err(e) = generate_experiment_json(
-            &experiment_output_dir,
-            &experiment_net_id,
-            &experiment_net_id,
-            &experiment_command,
-            &experiment_params,
-            &experiment_data_name,
-            experiment_superbatches,
-        ) {
+        if let Err(e) = generate_experiment_json(&experiment_ctx, training_time_seconds) {
             eprintln!("Warning: Failed to generate experiment JSON: {}", e);
         }
     }

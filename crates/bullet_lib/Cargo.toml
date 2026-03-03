@@ -74,3 +74,15 @@ path = "../../examples/extra/relabel.rs"
 [[example]]
 name = "shogi_simple"
 path = "../../examples/shogi_simple.rs"
+
+[[example]]
+name = "shogi_layerstack"
+path = "../../examples/shogi_layerstack.rs"
+
+[[example]]
+name = "shogi_layerstack_eval"
+path = "../../examples/shogi_layerstack_eval.rs"
+
+[[example]]
+name = "shogi_bucket_survey"
+path = "../../examples/shogi_bucket_survey.rs"

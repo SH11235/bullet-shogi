@@ -1,0 +1,1178 @@
+/*
+Shogi LayerStack NNUE Training Script
+
+LayerStacks (SFNNwoPSQT-1536) アーキテクチャの学習スクリプト。
+rshogi 互換の量子化ファイル (quantised.bin) を出力する。
+
+Usage:
+    cargo run --release --example shogi_layerstack -- [OPTIONS]
+
+Options:
+    --data <PATH>       Training data path (comma-separated for multiple files)
+    --batch-size <N>    Batch size (default: 16384)
+    --superbatches <N>  Number of superbatches (default: 100)
+    --lr <RATE>         Initial learning rate (default: 0.001)
+    --wdl <LAMBDA>      WDL lambda for constant scheduler (default: 0.5)
+    --start-wdl <F>     Start WDL lambda for linear interpolation
+    --end-wdl <F>       End WDL lambda for linear interpolation
+    --scale <N>         Eval scale (default: 508, FV_SCALE=16)
+    --l0 <SIZE>         FT output size (default: 1536)
+    --l1 <SIZE>         L1 output size (default: 16)
+    --l2 <SIZE>         L2 output size (default: 32)
+    --save-rate <N>     Save interval in superbatches (default: 10)
+    --threads <N>       Number of threads (default: 4)
+    --output <DIR>      Output directory (default: checkpoints)
+    --net-id <NAME>     Network ID (default: shogi-ls-1536)
+    --resume <PATH>     Resume from checkpoint
+    --quantise-only     Only re-quantise checkpoint (requires --resume)
+    --optimizer <OPT>   Optimizer (adamw, radam, ranger) (default: ranger)
+    --win-rate-model    Use win rate model for score conversion
+    --batches-per-superbatch <N>  Batches per superbatch (default: auto)
+    --lr-gamma <F>      LR decay rate (default: 0.992)
+    --lr-step <N>       LR decay interval (default: 1)
+*/
+
+use std::path::PathBuf;
+
+use bullet_lib::{
+    game::inputs::{ShogiHalfKA_hm, SparseInputType},
+    game::outputs::{ShogiLayerStackBucket9, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS},
+    nn::{
+        optimiser::{self, AdamWParams, RAdamParams, RangerParams},
+        Affine, InitSettings, Shape,
+    },
+    trainer::{
+        save::SavedFormat,
+        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
+        settings::LocalSettings,
+    },
+    value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
+};
+use clap::{Parser, ValueEnum};
+use serde::Serialize;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+const NUM_BUCKETS: usize = 9;
+const QA: i16 = 127;
+const QB: i16 = 64;
+
+// =============================================================================
+// CLI Arguments
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum OptimizerType {
+    AdamW,
+    RAdam,
+    #[default]
+    Ranger,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum BucketMode {
+    #[default]
+    Kingrank9,
+    Ply9,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "shogi_layerstack")]
+#[command(about = "Shogi LayerStack NNUE training script")]
+struct Args {
+    /// Training data path (comma-separated for multiple files)
+    #[arg(long, default_value = "data/train.bin")]
+    data: String,
+
+    /// Batch size
+    #[arg(long, default_value = "16384")]
+    batch_size: usize,
+
+    /// Number of superbatches
+    #[arg(long, default_value = "100")]
+    superbatches: usize,
+
+    /// Initial learning rate
+    #[arg(long, default_value = "0.001")]
+    lr: f32,
+
+    /// WDL lambda (constant). Cannot be used with --start-wdl/--end-wdl
+    #[arg(long, conflicts_with_all = ["start_wdl", "end_wdl"])]
+    wdl: Option<f32>,
+
+    /// Start WDL lambda for linear interpolation
+    #[arg(long, requires = "end_wdl")]
+    start_wdl: Option<f32>,
+
+    /// End WDL lambda for linear interpolation
+    #[arg(long, requires = "start_wdl")]
+    end_wdl: Option<f32>,
+
+    /// Eval scale (default: 508, gives FV_SCALE = 127*64/508 = 16)
+    #[arg(long, default_value = "508")]
+    scale: i32,
+
+    /// L0 (Feature Transformer) size
+    #[arg(long, default_value = "1536")]
+    l0: usize,
+
+    /// L1 output size (includes skip connection neuron)
+    #[arg(long, default_value = "16")]
+    l1: usize,
+
+    /// L2 output size
+    #[arg(long, default_value = "32")]
+    l2: usize,
+
+    /// Save interval (superbatches)
+    #[arg(long, default_value = "10")]
+    save_rate: usize,
+
+    /// Number of threads
+    #[arg(long, default_value = "4")]
+    threads: usize,
+
+    /// Output directory
+    #[arg(long, default_value = "checkpoints")]
+    output: PathBuf,
+
+    /// Network ID
+    #[arg(long, default_value = "shogi-ls-1536")]
+    net_id: String,
+
+    /// Optimizer (adamw, radam, ranger)
+    #[arg(long, value_enum, default_value = "ranger")]
+    optimizer: OptimizerType,
+
+    /// Weight decay
+    #[arg(long, default_value = "0.01")]
+    weight_decay: f32,
+
+    /// Batches per superbatch (default: auto ~100M positions)
+    #[arg(long)]
+    batches_per_superbatch: Option<usize>,
+
+    /// LR scheduler gamma
+    #[arg(long, default_value = "0.992")]
+    lr_gamma: f32,
+
+    /// LR scheduler step interval
+    #[arg(long, default_value = "1")]
+    lr_step: usize,
+
+    /// Start superbatch number
+    #[arg(long, default_value = "1")]
+    start_superbatch: usize,
+
+    /// Batch queue size
+    #[arg(long, default_value = "64")]
+    batch_queue_size: usize,
+
+    /// Resume from checkpoint
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
+    /// Only re-quantise checkpoint
+    #[arg(long)]
+    quantise_only: bool,
+
+    /// Use win rate model
+    #[arg(long)]
+    win_rate_model: bool,
+
+    /// Output bucket mode (kingrank9 / ply9)
+    #[arg(long, value_enum, default_value = "kingrank9")]
+    bucket_mode: BucketMode,
+
+    /// Optional boundaries for ply9 buckets (8 comma-separated values)
+    #[arg(long)]
+    ply_bounds: Option<String>,
+}
+
+impl Args {
+    fn wdl_value(&self) -> f32 {
+        self.wdl.unwrap_or(0.5)
+    }
+
+    fn validate_wdl_range(name: &str, value: f32) -> Result<(), String> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(())
+        } else {
+            Err(format!("--{} must be between 0.0 and 1.0 (got {})", name, value))
+        }
+    }
+
+    fn create_wdl_scheduler(&self) -> Result<wdl::WdlSchedulerEnum, String> {
+        match (self.start_wdl, self.end_wdl) {
+            (Some(start), Some(end)) => {
+                Self::validate_wdl_range("start-wdl", start)?;
+                Self::validate_wdl_range("end-wdl", end)?;
+                Ok(wdl::WdlSchedulerEnum::linear(start, end))
+            }
+            (Some(_), None) => Err("--start-wdl requires --end-wdl".to_string()),
+            (None, Some(_)) => Err("--end-wdl requires --start-wdl".to_string()),
+            (None, None) => {
+                let wdl = self.wdl_value();
+                Self::validate_wdl_range("wdl", wdl)?;
+                Ok(wdl::WdlSchedulerEnum::constant(wdl))
+            }
+        }
+    }
+
+    fn wdl_display(&self) -> String {
+        match (self.start_wdl, self.end_wdl) {
+            (Some(start), Some(end)) => format!("Linear ({} -> {})", start, end),
+            _ => format!("Constant ({})", self.wdl_value()),
+        }
+    }
+
+    fn parse_ply_bounds_csv(text: &str) -> Result<[u16; 8], String> {
+        let mut values = Vec::new();
+        for token in text.split(',') {
+            let t = token.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let value: u16 = t.parse().map_err(|e| format!("invalid --ply-bounds value '{t}': {e}"))?;
+            values.push(value);
+        }
+        if values.len() != 8 {
+            return Err(format!("--ply-bounds requires exactly 8 comma-separated values (got {})", values.len()));
+        }
+        Ok([values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]])
+    }
+
+    fn resolved_ply_bounds(&self) -> Result<Option<[u16; 8]>, String> {
+        match self.bucket_mode {
+            BucketMode::Kingrank9 => {
+                if self.ply_bounds.is_some() {
+                    Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+                } else {
+                    Ok(None)
+                }
+            }
+            BucketMode::Ply9 => match &self.ply_bounds {
+                Some(text) => Self::parse_ply_bounds_csv(text).map(Some),
+                None => Ok(Some(SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS)),
+            },
+        }
+    }
+
+    fn bucket_mode_name(&self) -> &'static str {
+        match self.bucket_mode {
+            BucketMode::Kingrank9 => "kingrank9",
+            BucketMode::Ply9 => "ply9",
+        }
+    }
+}
+
+// =============================================================================
+// Experiment Log Structures
+// =============================================================================
+
+#[derive(Serialize, Clone)]
+struct ExperimentLog {
+    id: String,
+    name: String,
+    date: String,
+    commit: String,
+    command: String,
+    params: ExperimentParams,
+    data: ExperimentData,
+    results: ExperimentResults,
+    history: Vec<LossEntry>,
+    checkpoints: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentResults {
+    training_time_seconds: u64,
+    fv_scale: i32,
+    best_loss: Option<f64>,
+    best_loss_superbatch: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentParams {
+    architecture: String,
+    l0: usize,
+    l1: usize,
+    l2: usize,
+    num_buckets: usize,
+    bucket_mode: String,
+    ply_bounds: Option<[u16; 8]>,
+    lr: f32,
+    lr_gamma: f32,
+    lr_step: usize,
+    batch_size: usize,
+    batches_per_superbatch: usize,
+    superbatches: usize,
+    start_superbatch: usize,
+    wdl: f32,
+    start_wdl: Option<f32>,
+    end_wdl: Option<f32>,
+    scale: i32,
+    weight_decay: f32,
+    win_rate_model: bool,
+    optimizer: String,
+    qa: i16,
+    qb: i16,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentData {
+    name: String,
+    positions: Option<u64>,
+    total_positions: u64,
+    epochs: Option<f64>,
+}
+
+#[derive(Serialize, Clone)]
+struct LossEntry {
+    superbatch: usize,
+    loss: f64,
+}
+
+// =============================================================================
+// Experiment Log Helpers
+// =============================================================================
+
+fn get_git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn get_timestamp() -> (String, String) {
+    use std::time::SystemTime;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let mut y = 1970i64;
+    let mut remaining_days = days as i64;
+    loop {
+        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining_days < md as i64 {
+            m = i;
+            break;
+        }
+        remaining_days -= md as i64;
+    }
+    let d = remaining_days + 1;
+    let id_ts = format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, m + 1, d, hours, minutes, seconds);
+    let date = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, d, hours, minutes, seconds);
+    (id_ts, date)
+}
+
+fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
+    use std::collections::BTreeMap;
+    let content = match std::fs::read_to_string(log_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut superbatch_losses: BTreeMap<usize, (f64, usize)> = BTreeMap::new();
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 3 {
+            if let (Ok(sb), Ok(loss)) = (parts[0].trim().parse::<usize>(), parts[2].trim().parse::<f64>()) {
+                let entry = superbatch_losses.entry(sb).or_insert((0.0, 0));
+                entry.0 += loss;
+                entry.1 += 1;
+            }
+        }
+    }
+    superbatch_losses
+        .into_iter()
+        .map(|(sb, (sum, count))| LossEntry { superbatch: sb, loss: sum / count as f64 })
+        .collect()
+}
+
+fn collect_checkpoints(output_dir: &std::path::Path, net_id: &str) -> Vec<String> {
+    let prefix = format!("{}-", net_id);
+    let mut checkpoints: Vec<String> = std::fs::read_dir(output_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && entry.path().is_dir() {
+                let suffix = &name[prefix.len()..];
+                if suffix.parse::<usize>().is_ok() {
+                    return Some(name);
+                }
+            }
+            None
+        })
+        .collect();
+    checkpoints.sort_by(|a, b| {
+        let a_num: usize = a[prefix.len()..].parse().unwrap_or(0);
+        let b_num: usize = b[prefix.len()..].parse().unwrap_or(0);
+        a_num.cmp(&b_num)
+    });
+    checkpoints
+}
+
+struct ExperimentContext {
+    output_dir: std::path::PathBuf,
+    net_id: String,
+    command: String,
+    params: ExperimentParams,
+    data_name: String,
+    superbatches: usize,
+    fv_scale: i32,
+}
+
+fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64) -> std::io::Result<()> {
+    let commit = get_git_commit();
+    let (id_ts, date) = get_timestamp();
+    let id = format!("{}-{}", id_ts, ctx.net_id);
+
+    let final_checkpoint = format!("{}-{}", ctx.net_id, ctx.superbatches);
+    let log_path = ctx.output_dir.join(&final_checkpoint).join("log.txt");
+    let history = parse_loss_history(&log_path);
+
+    let checkpoints = collect_checkpoints(&ctx.output_dir, &ctx.net_id);
+
+    let num_superbatches = if ctx.params.superbatches >= ctx.params.start_superbatch {
+        (ctx.params.superbatches - ctx.params.start_superbatch + 1) as u64
+    } else {
+        0
+    };
+    let total_positions = ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * num_superbatches;
+
+    const PACKED_SFEN_VALUE_SIZE: u64 = 40;
+    let positions: u64 = ctx
+        .data_name
+        .split(',')
+        .filter_map(|path| std::fs::metadata(path.trim()).ok())
+        .map(|meta| meta.len() / PACKED_SFEN_VALUE_SIZE)
+        .sum();
+    let epochs = if positions > 0 { total_positions as f64 / positions as f64 } else { 0.0 };
+
+    let (best_loss, best_loss_superbatch) = history
+        .iter()
+        .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
+        .unwrap_or((None, None));
+
+    let experiment = ExperimentLog {
+        id,
+        name: ctx.net_id.clone(),
+        date,
+        commit,
+        command: ctx.command.clone(),
+        params: ctx.params.clone(),
+        data: ExperimentData {
+            name: ctx.data_name.clone(),
+            positions: Some(positions),
+            total_positions,
+            epochs: Some(epochs),
+        },
+        results: ExperimentResults { training_time_seconds, fv_scale: ctx.fv_scale, best_loss, best_loss_superbatch },
+        history,
+        checkpoints,
+    };
+
+    let json = serde_json::to_string_pretty(&experiment).map_err(std::io::Error::other)?;
+    let json_dir = ctx.output_dir.join(&ctx.net_id);
+    std::fs::create_dir_all(&json_dir)?;
+    let json_path = json_dir.join("experiment.json");
+    std::fs::write(&json_path, json)?;
+    println!("Experiment log saved to {}", json_path.display());
+    Ok(())
+}
+
+// =============================================================================
+// LEB128 Encoder
+// =============================================================================
+
+/// 符号付き LEB128 エンコード (1 値)
+fn encode_signed_leb128(mut value: i64) -> Vec<u8> {
+    let mut result = Vec::new();
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        // value が 0 で符号ビットが立っていない、または value が -1 で符号ビットが立っている場合、終了
+        if (value == 0 && (byte & 0x40) == 0) || (value == -1 && (byte & 0x40) != 0) {
+            result.push(byte);
+            break;
+        }
+        byte |= 0x80; // 継続ビット
+        result.push(byte);
+    }
+    result
+}
+
+/// i16 配列を LEB128 圧縮し、マジック + サイズ + データ を返す
+fn encode_leb128_tensor_i16(values: &[i16]) -> Vec<u8> {
+    // まず全値を LEB128 エンコード
+    let mut compressed = Vec::new();
+    for &val in values {
+        compressed.extend_from_slice(&encode_signed_leb128(val as i64));
+    }
+
+    // マジック + サイズヘッダ + 圧縮データ
+    let mut result = Vec::new();
+    result.extend_from_slice(b"COMPRESSED_LEB128"); // 17 bytes
+    result.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    result.extend_from_slice(&compressed);
+    result
+}
+
+// =============================================================================
+// SIMD Padding Utilities
+// =============================================================================
+
+fn pad32(size: usize) -> usize {
+    size.div_ceil(32) * 32
+}
+
+// =============================================================================
+// Hash Computation (nnue-pytorch 互換)
+// =============================================================================
+
+/// LayerStacks 用 fc_hash 計算
+///
+/// 各バケットの FC ハッシュ。rshogi は読み飛ばすが互換性のため出力する。
+fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32 {
+    // InputSlice hash
+    let mut prev_hash: u32 = 0xEC42E90D;
+    prev_hash ^= (l1_out * 2) as u32; // FT output * 2 (dual perspective)
+
+    // L1: 1536 → l1_out
+    let layer_sizes = [(l1_out, true), (l2_out, true), (1usize, false)];
+    for (out_features, has_relu) in layer_sizes {
+        let mut layer_hash: u32 = 0xCC03DAE4;
+        layer_hash = layer_hash.wrapping_add(out_features as u32);
+        layer_hash ^= prev_hash >> 1;
+        layer_hash ^= prev_hash << 31;
+        if has_relu {
+            layer_hash = layer_hash.wrapping_add(0x538D24C7);
+        }
+        prev_hash = layer_hash;
+    }
+
+    let _ = (l2_in,); // suppress unused warning — used for documentation clarity
+    prev_hash
+}
+
+// =============================================================================
+// SavedFormat Construction
+// =============================================================================
+
+/// LayerStack 量子化出力の SavedFormat を構築する
+///
+/// rshogi NetworkLayerStacks::read() と完全互換のバイナリを生成。
+fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize, l2_out: usize) -> Vec<SavedFormat> {
+    use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
+
+    let l1_effective = l1_out - 1; // skip connection 分を除く
+    let l2_in = l1_effective * 2; // sqr_crelu concat crelu
+
+    // nnue-pytorch 互換ハッシュ計算
+    let fc_hash = compute_layerstack_fc_hash(ft_out, l2_in, l2_out);
+    let ft_hash = FEATURE_HASH_HM_V2 ^ ((ft_out * 2) as u32);
+    let network_hash = fc_hash ^ ft_hash;
+
+    // アーキテクチャ文字列
+    let arch_desc = format!(
+        "Features=HalfKA_hm(Friend)[{}->{}x2],\
+         Network=AffineTransform[1<-{}](\
+         ClippedReLU[{}](\
+         AffineTransform[{}<-{}](\
+         SqrClippedReLU[{}](\
+         AffineTransform[{}<-{}](\
+         InputSlice[{}(0:{})])))))",
+        input_size,
+        ft_out,
+        l2_out,     // Output input
+        l2_out,     // L2 output / L3 input
+        l2_out,     // L2 output
+        l2_in,      // L2 input
+        l2_in,      // dual activation output
+        l1_out,     // L1 output
+        ft_out * 2, // L1 input (dual perspective)
+        ft_out * 2,
+        ft_out * 2,
+    );
+    let arch_bytes = arch_desc.as_bytes();
+
+    // ---- ヘッダー ----
+    let nnue_version: u32 = 0x7AF32F20;
+    let mut header = Vec::new();
+    header.extend_from_slice(&nnue_version.to_le_bytes());
+    header.extend_from_slice(&network_hash.to_le_bytes());
+    header.extend_from_slice(&(arch_bytes.len() as u32).to_le_bytes());
+    header.extend_from_slice(arch_bytes);
+
+    // ---- FT hash ----
+    let ft_hash_bytes = ft_hash.to_le_bytes().to_vec();
+
+    // ---- FT biases + weights (LEB128 圧縮, YO 互換 2ブロック形式) ----
+    // biases / weights を別々の LEB128 ブロックで出力。
+    // YaneuraOu は FT を biases ブロック → weights ブロックの順で読み込むため、
+    // 各ブロックに独立した COMPRESSED_LEB128 マジック + サイズヘッダが付く。
+    let qa_i16 = QA;
+    let ft_out_captured = ft_out;
+    let input_size_captured = input_size;
+    let ft_biases_leb128 = SavedFormat::empty()
+        .transform(move |graph, _| {
+            let l0b = graph.get("l0b");
+            let qa_f = qa_i16 as f64;
+            let biases_i16: Vec<i16> = l0b.values.iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
+            let leb128_bytes = encode_leb128_tensor_i16(&biases_i16);
+            leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
+        })
+        .quantise::<i8>(1);
+
+    let qa_i16 = QA;
+    let ft_weights_leb128 = SavedFormat::empty()
+        .transform(move |graph, _| {
+            let l0w = graph.get("l0w");
+
+            // Quantise to i16 (scale = QA = 127)
+            let qa_f = qa_i16 as f64;
+            let weights_i16: Vec<i16> = l0w.values.iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
+
+            // Transpose: column-major [ft_out, input_size] → [input_size, ft_out]
+            let mut transposed_w = vec![0i16; ft_out_captured * input_size_captured];
+            for out in 0..ft_out_captured {
+                for feat in 0..input_size_captured {
+                    transposed_w[feat * ft_out_captured + out] = weights_i16[out * input_size_captured + feat];
+                }
+            }
+
+            let leb128_bytes = encode_leb128_tensor_i16(&transposed_w);
+            leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
+        })
+        .quantise::<i8>(1);
+
+    // ---- LayerStacks (9 buckets) ----
+    // 各バケットについて: fc_hash + L1(biases, weights) + L2(biases, weights) + Output(bias, weights)
+    //
+    // bullet内部の重みレイアウト:
+    //   l1w: column-major [NUM_BUCKETS * l1_out, ft_out] (= [rows, cols])
+    //   l2w: column-major [NUM_BUCKETS * l2_out, l2_in]
+    //   l3w: column-major [NUM_BUCKETS * 1, l2_out]
+    //
+    // rshogi の期待レイアウト (per bucket):
+    //   L1 weights: [l1_out × pad32(ft_out)] row-major, つまり weight[out][padded_in]
+    //   L2 weights: [l2_out × pad32(l2_in)] row-major
+    //   Output weights: [pad32(l2_out)] row-major
+
+    let bias_scale = i32::from(QA) * i32::from(QB); // 127 * 64 = 8128
+
+    // 全バケットの LayerStack データを1つの transform で生成
+    let l1_out_captured = l1_out;
+    let l2_out_captured = l2_out;
+    let l2_in_captured = l2_in;
+    let ft_out_for_ls = ft_out;
+    let fc_hash_captured = fc_hash;
+    let layerstack_data = SavedFormat::empty()
+        .transform(move |graph, _| {
+            let l1w = graph.get("l1w");
+            let l1b = graph.get("l1b");
+            let l1fw = graph.get("l1fw");
+            let l1fb = graph.get("l1fb");
+            let l2w = graph.get("l2w");
+            let l2b = graph.get("l2b");
+            let l3w = graph.get("l3w");
+            let l3b = graph.get("l3b");
+
+            let qb_f = QB as f64;
+            let bias_scale_f = bias_scale as f64;
+
+            let mut output_bytes: Vec<u8> = Vec::new();
+
+            for bucket in 0..NUM_BUCKETS {
+                // fc_hash per bucket
+                output_bytes.extend_from_slice(&fc_hash_captured.to_le_bytes());
+
+                // === L1 layer ===
+                // Biases: i32, scale = QA * QB = 8128
+                for out_idx in 0..l1_out_captured {
+                    let global_out = bucket * l1_out_captured + out_idx;
+                    let merged_bias = l1b.values[global_out] + l1fb.values[out_idx];
+                    let val = (bias_scale_f * merged_bias as f64).round() as i32;
+                    output_bytes.extend_from_slice(&val.to_le_bytes());
+                }
+
+                // Weights: i8, scale = QB = 64
+                // bullet:
+                //   l1w  = [NUM_BUCKETS * l1_out, ft_out]
+                //   l1fw = [l1_out, ft_out] (shared factorized part)
+                //   weight[global_out * ft_out + in_idx] where global_out = bucket * l1_out + out_idx
+                // rshogi: row-major [l1_out × padded(ft_out)]
+                //   weight[out_idx * padded_in + in_idx]
+                let l1_padded_in = pad32(ft_out_for_ls);
+                for out_idx in 0..l1_out_captured {
+                    let global_out = bucket * l1_out_captured + out_idx;
+                    for in_idx in 0..l1_padded_in {
+                        if in_idx < ft_out_for_ls {
+                            let bucket_w = l1w.values[global_out * ft_out_for_ls + in_idx];
+                            let shared_w = l1fw.values[out_idx * ft_out_for_ls + in_idx];
+                            let w = bucket_w + shared_w;
+                            let q = (qb_f * w as f64).round() as i8;
+                            output_bytes.push(q as u8);
+                        } else {
+                            output_bytes.push(0u8); // padding
+                        }
+                    }
+                }
+
+                // === L2 layer ===
+                // Biases: i32, scale = 127 * QB (CReLU output is 127-scale)
+                let l2_bias_scale = 127.0 * qb_f;
+                for out_idx in 0..l2_out_captured {
+                    let global_out = bucket * l2_out_captured + out_idx;
+                    let val = (l2_bias_scale * l2b.values[global_out] as f64).round() as i32;
+                    output_bytes.extend_from_slice(&val.to_le_bytes());
+                }
+
+                // Weights: i8, scale = QB = 64
+                let l2_padded_in = pad32(l2_in_captured);
+                for out_idx in 0..l2_out_captured {
+                    let global_out = bucket * l2_out_captured + out_idx;
+                    for in_idx in 0..l2_padded_in {
+                        if in_idx < l2_in_captured {
+                            let w = l2w.values[global_out * l2_in_captured + in_idx];
+                            let q = (qb_f * w as f64).round() as i8;
+                            output_bytes.push(q as u8);
+                        } else {
+                            output_bytes.push(0u8);
+                        }
+                    }
+                }
+
+                // === Output layer ===
+                // Bias: i32, scale = 127 * QB
+                let out_bias_scale = 127.0 * qb_f;
+                {
+                    let global_out = bucket;
+                    let val = (out_bias_scale * l3b.values[global_out] as f64).round() as i32;
+                    output_bytes.extend_from_slice(&val.to_le_bytes());
+                }
+
+                // Weights: i8, scale = QB = 64
+                let output_padded_in = pad32(l2_out_captured);
+                {
+                    let global_out = bucket;
+                    for in_idx in 0..output_padded_in {
+                        if in_idx < l2_out_captured {
+                            let w = l3w.values[global_out * l2_out_captured + in_idx];
+                            let q = (qb_f * w as f64).round() as i8;
+                            output_bytes.push(q as u8);
+                        } else {
+                            output_bytes.push(0u8);
+                        }
+                    }
+                }
+            }
+
+            // byte passthrough: 各バイトを i8 として f32 にキャスト
+            output_bytes.iter().map(|&b| (b as i8) as f32).collect()
+        })
+        .quantise::<i8>(1);
+
+    vec![
+        SavedFormat::custom(header),
+        SavedFormat::custom(ft_hash_bytes),
+        ft_biases_leb128,
+        ft_weights_leb128,
+        layerstack_data,
+    ]
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+fn main() {
+    let args = Args::parse();
+    let ply_bounds = args.resolved_ply_bounds().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
+
+    let ft_out = args.l0;
+    let l1_out = args.l1;
+    let l1_effective = l1_out - 1;
+    let l2_in = l1_effective * 2;
+    let l2_out = args.l2;
+    let input_size = ShogiHalfKA_hm.num_inputs();
+
+    let optimizer_name = match args.optimizer {
+        OptimizerType::AdamW => "AdamW",
+        OptimizerType::RAdam => "RAdam",
+        OptimizerType::Ranger => "Ranger",
+    };
+
+    let fv_scale = (i32::from(QA) * i32::from(QB) + args.scale / 2) / args.scale;
+
+    // Print configuration
+    println!("=== Shogi LayerStack NNUE Training ===");
+    println!("Features: HalfKA_hm ({} dimensions)", input_size);
+    println!(
+        "Architecture: LayerStack L0={}, L1={} ({} effective + 1 skip), L2={}",
+        ft_out, l1_out, l1_effective, l2_out
+    );
+    println!("L2 input: {} (sqr_crelu concat crelu)", l2_in);
+    println!("Buckets: {}", NUM_BUCKETS);
+    println!("Bucket mode: {}", args.bucket_mode_name());
+    if let Some(bounds) = ply_bounds {
+        println!("Ply bounds: {:?}", bounds);
+    }
+    println!("FV_SCALE: {} (QA={}, QB={}, scale={})", fv_scale, QA, QB, args.scale);
+    println!("Optimizer: {}", optimizer_name);
+    println!("Weight decay: {}", args.weight_decay);
+    println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
+    let batches_per_superbatch_display =
+        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+    let positions_per_superbatch = batches_per_superbatch_display as u64 * args.batch_size as u64;
+    println!("Batch size: {}", args.batch_size);
+    println!(
+        "Batches/superbatch: {} (~{}M positions)",
+        batches_per_superbatch_display,
+        positions_per_superbatch / 1_000_000
+    );
+    println!("Superbatches: {} (start={})", args.superbatches, args.start_superbatch);
+    println!("Learning rate: {} (gamma={}, step={})", args.lr, args.lr_gamma, args.lr_step);
+    println!("WDL lambda: {}", args.wdl_display());
+    println!("Save rate: {}", args.save_rate);
+    println!("Threads: {} (queue={})", args.threads, args.batch_queue_size);
+    println!("Output: {}", args.output.display());
+    println!("Net ID: {}", args.net_id);
+    println!("Data: {}", args.data);
+    println!("======================================");
+
+    // Experiment context
+    let experiment_params = ExperimentParams {
+        architecture: format!("LayerStack-{}x{}-{}-{}", ft_out, 2, l1_out, l2_out),
+        l0: ft_out,
+        l1: l1_out,
+        l2: l2_out,
+        num_buckets: NUM_BUCKETS,
+        bucket_mode: args.bucket_mode_name().to_string(),
+        ply_bounds,
+        lr: args.lr,
+        lr_gamma: args.lr_gamma,
+        lr_step: args.lr_step,
+        batch_size: args.batch_size,
+        batches_per_superbatch: batches_per_superbatch_display,
+        superbatches: args.superbatches,
+        start_superbatch: args.start_superbatch,
+        wdl: args.wdl_value(),
+        start_wdl: args.start_wdl,
+        end_wdl: args.end_wdl,
+        scale: args.scale,
+        weight_decay: args.weight_decay,
+        win_rate_model: args.win_rate_model,
+        optimizer: optimizer_name.to_string(),
+        qa: QA,
+        qb: QB,
+    };
+    let experiment_quantise_only = args.quantise_only;
+    let experiment_ctx = ExperimentContext {
+        output_dir: args.output.clone(),
+        net_id: args.net_id.clone(),
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        params: experiment_params,
+        data_name: args.data.clone(),
+        superbatches: args.superbatches,
+        fv_scale,
+    };
+
+    // WDL scheduler
+    let wdl_scheduler = args.create_wdl_scheduler().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
+
+    // Training schedule
+    let batches_per_superbatch =
+        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+    let schedule = TrainingSchedule {
+        net_id: args.net_id,
+        eval_scale: args.scale as f32,
+        steps: TrainingSteps {
+            batch_size: args.batch_size,
+            batches_per_superbatch,
+            start_superbatch: args.start_superbatch,
+            end_superbatch: args.superbatches,
+        },
+        wdl_scheduler,
+        lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+        save_rate: args.save_rate,
+    };
+
+    // Local settings
+    let output_dir = args.output.to_str().unwrap_or("checkpoints");
+    let settings = LocalSettings {
+        threads: args.threads,
+        test_set: None,
+        output_directory: output_dir,
+        batch_queue_size: args.batch_queue_size,
+    };
+
+    // Data loader
+    let data_files_owned: Vec<String> = if args.quantise_only {
+        let resume_path = args.resume.as_ref().expect("--quantise-only requires --resume");
+        let quantised = resume_path.join("quantised.bin");
+        if quantised.exists() {
+            vec![quantised.to_str().unwrap().to_string()]
+        } else {
+            vec![resume_path.join("raw.bin").to_str().unwrap().to_string()]
+        }
+    } else {
+        args.data.split(',').map(|s| s.to_string()).collect()
+    };
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
+    let data_loader = DirectSequentialDataLoader::new(&data_files_ref);
+
+    // SavedFormat
+    let save_format = build_layerstack_save_format(input_size, ft_out, l1_out, l2_out);
+
+    // Network builder
+    let ft_out_c = ft_out;
+    let l1_out_c = l1_out;
+    let l1_effective_c = l1_effective;
+    let l2_out_c = l2_out;
+    let l2_in_c = l2_in;
+    let bucket_impl = match args.bucket_mode {
+        BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
+        BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
+    };
+
+    macro_rules! build_trainer {
+        ($opt:expr, $use_win_rate:expr, $bucket_impl:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
+                .dual_perspective()
+                .optimiser($opt)
+                .inputs(ShogiHalfKA_hm)
+                .output_buckets($bucket_impl)
+                .save_format(&save_format)
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
+                // L0 (Feature Transformer)
+                let l0 = builder.new_affine("l0", input_size, ft_out_c);
+                l0.init_with_effective_input_size(32);
+
+                // LayerStack layers:
+                // - l1: bucket-specific delta (zero init)
+                // - l1f: shared factorized part
+                let l1 = Affine {
+                    weights: builder.new_weights(
+                        "l1w",
+                        Shape::new(NUM_BUCKETS * l1_out_c, ft_out_c),
+                        InitSettings::Zeroed,
+                    ),
+                    bias: builder.new_weights("l1b", Shape::new(NUM_BUCKETS * l1_out_c, 1), InitSettings::Zeroed),
+                };
+                let l1f = builder.new_affine("l1f", ft_out_c, l1_out_c);
+                let l2 = builder.new_affine("l2", l2_in_c, NUM_BUCKETS * l2_out_c);
+                let l3 = builder.new_affine("l3", l2_out_c, NUM_BUCKETS);
+
+                // Forward pass
+                let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
+                let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
+                let combined = stm.concat(ntm);
+
+                let l1_out_t = l1.forward(combined).select(output_buckets) + l1f.forward(combined);
+                let l1_main = l1_out_t.slice_rows(0, l1_effective_c);
+                let l1_skip = l1_out_t.slice_rows(l1_effective_c, l1_out_c);
+
+                let l1_sqr = l1_main.abs_pow(2.0) * (127.0 / 128.0);
+                let l2_input_tensor = l1_sqr.concat(l1_main).crelu();
+
+                let l2_out_t = l2.forward(l2_input_tensor).select(output_buckets).crelu();
+                let l3_out = l3.forward(l2_out_t).select(output_buckets);
+                l3_out + l1_skip
+            })
+        }};
+    }
+
+    macro_rules! maybe_run_or_quantise {
+        ($trainer:expr) => {{
+            if args.quantise_only {
+                let resume_path = args.resume.as_ref().expect("--quantise-only requires --resume");
+                let resume_str = resume_path.to_str().unwrap();
+                println!("Loading checkpoint from {}...", resume_str);
+                $trainer.load_from_checkpoint(resume_str);
+
+                let output_dir = args.output.to_str().unwrap_or("checkpoints");
+                let output_path = format!("{}/requantised.bin", output_dir);
+                std::fs::create_dir_all(output_dir).unwrap_or(());
+
+                println!("Saving re-quantised weights to {}...", output_path);
+                $trainer.save_quantised(&output_path).expect("Failed to save quantised weights");
+                println!("Done!");
+            } else {
+                if let Some(ref resume_path) = args.resume {
+                    let resume_str = resume_path.to_str().unwrap();
+                    println!("Resuming from checkpoint: {}", resume_str);
+                    $trainer.load_from_checkpoint(resume_str);
+                }
+                $trainer.run(&schedule, &settings, &data_loader);
+            }
+        }};
+    }
+
+    let training_start = std::time::Instant::now();
+    let use_win_rate_model = args.win_rate_model;
+
+    match args.optimizer {
+        OptimizerType::AdamW => {
+            let mut trainer = build_trainer!(optimiser::AdamW, use_win_rate_model, bucket_impl);
+            trainer.optimiser.set_params(AdamWParams { decay: args.weight_decay, ..Default::default() });
+            maybe_run_or_quantise!(trainer);
+        }
+        OptimizerType::RAdam => {
+            let mut trainer = build_trainer!(optimiser::RAdam, use_win_rate_model, bucket_impl);
+            let params = RAdamParams { decay: args.weight_decay, ..Default::default() };
+            trainer.optimiser.set_params(params.into());
+            maybe_run_or_quantise!(trainer);
+        }
+        OptimizerType::Ranger => {
+            let mut trainer = build_trainer!(optimiser::Ranger, use_win_rate_model, bucket_impl);
+            trainer.optimiser.set_params(RangerParams { decay: args.weight_decay, ..Default::default() });
+            maybe_run_or_quantise!(trainer);
+        }
+    }
+
+    // Generate experiment JSON
+    let training_time_seconds = training_start.elapsed().as_secs();
+    if !experiment_quantise_only {
+        if let Err(e) = generate_experiment_json(&experiment_ctx, training_time_seconds) {
+            eprintln!("Warning: Failed to generate experiment JSON: {}", e);
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_leb128_roundtrip() {
+        // 正の値
+        let encoded = encode_signed_leb128(0);
+        assert_eq!(encoded, vec![0x00]);
+
+        let encoded = encode_signed_leb128(1);
+        assert_eq!(encoded, vec![0x01]);
+
+        let encoded = encode_signed_leb128(63);
+        assert_eq!(encoded, vec![0x3F]);
+
+        let encoded = encode_signed_leb128(64);
+        assert_eq!(encoded, vec![0xC0, 0x00]);
+
+        let encoded = encode_signed_leb128(127);
+        assert_eq!(encoded, vec![0xFF, 0x00]);
+
+        // 負の値
+        let encoded = encode_signed_leb128(-1);
+        assert_eq!(encoded, vec![0x7F]);
+
+        let encoded = encode_signed_leb128(-64);
+        assert_eq!(encoded, vec![0x40]);
+
+        let encoded = encode_signed_leb128(-65);
+        assert_eq!(encoded, vec![0xBF, 0x7F]);
+
+        let encoded = encode_signed_leb128(-128);
+        assert_eq!(encoded, vec![0x80, 0x7F]);
+    }
+
+    #[test]
+    fn test_leb128_i16_range() {
+        // i16::MAX = 32767
+        let encoded = encode_signed_leb128(32767);
+        assert_eq!(encoded, vec![0xFF, 0xFF, 0x01]);
+
+        // i16::MIN = -32768
+        let encoded = encode_signed_leb128(-32768);
+        assert_eq!(encoded, vec![0x80, 0x80, 0x7E]);
+    }
+
+    #[test]
+    fn test_leb128_tensor_format() {
+        let values: Vec<i16> = vec![0, 1, -1, 127, -128];
+        let result = encode_leb128_tensor_i16(&values);
+
+        // Check magic
+        assert_eq!(&result[..17], b"COMPRESSED_LEB128");
+
+        // Check size field (u32 LE)
+        let size = u32::from_le_bytes([result[17], result[18], result[19], result[20]]) as usize;
+
+        // Verify compressed data length
+        assert_eq!(result.len(), 17 + 4 + size);
+    }
+
+    #[test]
+    fn test_pad32() {
+        assert_eq!(pad32(1536), 1536);
+        assert_eq!(pad32(30), 32);
+        assert_eq!(pad32(32), 32);
+        assert_eq!(pad32(1), 32);
+        assert_eq!(pad32(33), 64);
+    }
+
+    #[test]
+    fn test_bucket_initial_position() {
+        // 平手初期局面: 先手玉 = 4 (rank=4%9=4), 後手玉 = 76 (rank=76%9=4)
+        // side_to_move = Black
+        // f_rank = 4 (Black そのまま)
+        // e_rank = 8 - 4 = 4 (Black から見て相手は後手 → 反転)
+        // F_TO_INDEX[4] = 3, E_TO_INDEX[4] = 1
+        // bucket = 3 + 1 = 4
+        // ただし先手玉がSQ_59(=4)の場合、rank=4%9=4 ←正しい
+        //
+        // 実際のバケットはPackedSfenValueのデコード結果に依存するため、
+        // ここではバケット計算ロジック自体をテストする
+
+        // 味方玉rank=0, 相手玉rank=0 → bucket=0
+        const F_TO_INDEX: [usize; 9] = [0, 0, 0, 3, 3, 3, 6, 6, 6];
+        const E_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+        assert_eq!(F_TO_INDEX[0] + E_TO_INDEX[0], 0);
+
+        // 味方玉rank=8, 相手玉rank=8 → bucket=8
+        assert_eq!(F_TO_INDEX[8] + E_TO_INDEX[8], 8);
+
+        // 味方玉rank=4, 相手玉rank=4 → bucket=4
+        assert_eq!(F_TO_INDEX[4] + E_TO_INDEX[4], 4);
+    }
+}

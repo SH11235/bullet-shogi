@@ -11,16 +11,20 @@ Usage:
 
 use std::{
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::size_of,
     path::PathBuf,
 };
 
 use bullet_lib::{
-    game::outputs::{OutputBuckets, ShogiKingRankBucket},
+    game::outputs::{
+        OutputBuckets, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES, ShogiKingRankBucket,
+        ShogiProgressBucket8,
+    },
     shogi::{Color, PackedSfenValue, ShogiBoard},
 };
 use clap::Parser;
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_bucket_survey")]
@@ -42,13 +46,55 @@ struct Args {
     #[arg(long, default_value = "1")]
     stride: u64,
 
+    /// Split --samples evenly across pack files instead of sequential fill
+    #[arg(long)]
+    balanced: bool,
+
     /// Optional fixed boundaries for 9 ply buckets, e.g. "30,44,58,72,86,100,116,138"
     #[arg(long)]
     fixed_ply_bounds: Option<String>,
+
+    /// Optional progress coeff JSON (coeff_v1) for progress8 histogram
+    #[arg(long)]
+    progress_coeff: Option<PathBuf>,
+
+    /// Optional CSV path to dump progress-feature training rows
+    #[arg(long)]
+    dump_progress_csv: Option<PathBuf>,
+
+    /// ply_max used in y_progress_target = clamp((game_ply-1)/(ply_max-1), 0, 1)
+    #[arg(long, default_value = "256")]
+    ply_max: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressCoeffV1 {
+    format: String,
+    model: String,
+    num_buckets: usize,
+    feature_order: Vec<String>,
+    standardization: ProgressStandardization,
+    weights: Vec<f32>,
+    bias: f32,
+    runtime: ProgressRuntime,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressStandardization {
+    mean: Vec<f32>,
+    std: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressRuntime {
+    z_clip: Vec<f32>,
 }
 
 #[derive(Clone, Copy)]
 struct SampleMeta {
+    psv: PackedSfenValue,
+    pack_index: usize,
+    record_index: u64,
     ply: u16,
     kingrank_bucket: u8,
     friend_zone3: u8,
@@ -100,6 +146,45 @@ fn bucket_by_boundaries(value: u16, boundaries: &[u16]) -> usize {
     boundaries.len()
 }
 
+fn csv_escape(text: &str) -> String {
+    text.replace('"', "\"\"")
+}
+
+fn progress_target_from_ply(game_ply: u16, ply_max: u16) -> f32 {
+    if ply_max <= 1 {
+        return 1.0;
+    }
+    let num = game_ply.saturating_sub(1) as f32;
+    let den = (ply_max - 1) as f32;
+    (num / den).clamp(0.0, 1.0)
+}
+
+fn dump_progress_feature_csv(path: &PathBuf, packs: &[PathBuf], samples: &[SampleMeta], ply_max: u16) -> io::Result<()> {
+    let mut out = io::BufWriter::new(File::create(path)?);
+    writeln!(
+        out,
+        "pack_path,record_index,game_ply,x_board_non_king,x_hand_total,x_major_board,x_promoted_board,x_stm_king_rank_rel,x_ntm_king_rank_rel,y_progress_target,sample_weight"
+    )?;
+
+    for s in samples {
+        let x = ShogiProgressBucket8::extract_features(&s.psv);
+        let y = progress_target_from_ply(s.ply, ply_max);
+        let pack_path = packs
+            .get(s.pack_index)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown-pack>".to_string());
+        let pack_path_escaped = csv_escape(&pack_path);
+
+        writeln!(
+            out,
+            "\"{}\",{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},1.0",
+            pack_path_escaped, s.record_index, s.ply, x[0], x[1], x[2], x[3], x[4], x[5], y
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 fn print_hist(name: &str, hist: &[usize]) {
     let total: usize = hist.iter().sum();
     println!("\n== {name} ==");
@@ -141,7 +226,64 @@ fn parse_bounds_csv(text: &str) -> Result<Vec<u16>, String> {
     Ok(out)
 }
 
-fn read_samples(path: &PathBuf, offset: u64, stride: u64, max_samples: usize) -> io::Result<Vec<SampleMeta>> {
+fn load_progress_bucket_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
+    let coeff: ProgressCoeffV1 = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse progress coeff JSON '{}': {e}", path.display()))?;
+
+    if coeff.format != "rshogi.progress_coeff.v1" {
+        return Err(format!("invalid progress coeff format '{}', expected 'rshogi.progress_coeff.v1'", coeff.format));
+    }
+    if coeff.model != "logistic_regression" {
+        return Err(format!("invalid progress coeff model '{}', expected 'logistic_regression'", coeff.model));
+    }
+    if coeff.num_buckets != 8 {
+        return Err(format!("invalid num_buckets {}, expected 8", coeff.num_buckets));
+    }
+    if coeff.feature_order.len() != SHOGI_PROGRESS8_NUM_FEATURES {
+        return Err(format!(
+            "invalid feature_order length {}, expected {}",
+            coeff.feature_order.len(),
+            SHOGI_PROGRESS8_NUM_FEATURES
+        ));
+    }
+    for (idx, expected) in SHOGI_PROGRESS8_FEATURE_ORDER.iter().enumerate() {
+        if coeff.feature_order[idx] != *expected {
+            return Err(format!(
+                "feature_order mismatch at index {}: got '{}', expected '{}'",
+                idx, coeff.feature_order[idx], expected
+            ));
+        }
+    }
+    if coeff.standardization.mean.len() != SHOGI_PROGRESS8_NUM_FEATURES
+        || coeff.standardization.std.len() != SHOGI_PROGRESS8_NUM_FEATURES
+        || coeff.weights.len() != SHOGI_PROGRESS8_NUM_FEATURES
+    {
+        return Err(format!(
+            "mean/std/weights lengths must all be {} (got mean={}, std={}, weights={})",
+            SHOGI_PROGRESS8_NUM_FEATURES,
+            coeff.standardization.mean.len(),
+            coeff.standardization.std.len(),
+            coeff.weights.len()
+        ));
+    }
+    if coeff.runtime.z_clip.len() != 2 {
+        return Err(format!("runtime.z_clip must have exactly 2 values (got {})", coeff.runtime.z_clip.len()));
+    }
+
+    let mean: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.standardization.mean.try_into().map_err(|_| "failed to convert mean to fixed array".to_string())?;
+    let std: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.standardization.std.try_into().map_err(|_| "failed to convert std to fixed array".to_string())?;
+    let weights: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.weights.try_into().map_err(|_| "failed to convert weights to fixed array".to_string())?;
+    let z_clip = [coeff.runtime.z_clip[0], coeff.runtime.z_clip[1]];
+
+    Ok(ShogiProgressBucket8::new(mean, std, weights, coeff.bias, z_clip))
+}
+
+fn read_samples(path: &PathBuf, pack_index: usize, offset: u64, stride: u64, max_samples: usize) -> io::Result<Vec<SampleMeta>> {
     let mut file = File::open(path)?;
     let record_size = size_of::<PackedSfenValue>() as u64;
     let file_records = file.metadata()?.len() / record_size;
@@ -156,6 +298,7 @@ fn read_samples(path: &PathBuf, offset: u64, stride: u64, max_samples: usize) ->
 
     file.seek(SeekFrom::Start(offset * record_size))?;
     let mut buf = [0u8; 40];
+    let mut record_index = offset;
 
     while out.len() < max_samples {
         if file.read_exact(&mut buf).is_err() {
@@ -167,17 +310,23 @@ fn read_samples(path: &PathBuf, offset: u64, stride: u64, max_samples: usize) ->
         let board = psv.decode();
         let kingrank_bucket = ShogiKingRankBucket::<9>.bucket(&psv);
         out.push(SampleMeta {
+            psv,
+            pack_index,
+            record_index,
             ply: psv.game_ply(),
             kingrank_bucket,
             friend_zone3: friend_zone3(&board),
             board_non_king_count: board_non_king_count(&board),
         });
 
+        record_index = record_index.saturating_add(1);
+
         if stride > 1 {
             let skip_bytes = (stride - 1) * record_size;
             if file.seek(SeekFrom::Current(skip_bytes as i64)).is_err() {
                 break;
             }
+            record_index = record_index.saturating_add(stride - 1);
         }
     }
 
@@ -195,19 +344,40 @@ fn main() {
     }
 
     let mut samples = Vec::with_capacity(args.samples);
-    let mut remaining = args.samples;
-    for path in &packs {
-        if remaining == 0 {
-            break;
-        }
-        match read_samples(path, args.offset, args.stride, remaining) {
-            Ok(mut chunk) => {
-                remaining = remaining.saturating_sub(chunk.len());
-                println!("Loaded {} samples from {}", chunk.len(), path.display());
-                samples.append(&mut chunk);
+    if args.balanced {
+        let pack_count = packs.len();
+        let per_pack = args.samples / pack_count;
+        let extra = args.samples % pack_count;
+        for (idx, path) in packs.iter().enumerate() {
+            let target = per_pack + usize::from(idx < extra);
+            if target == 0 {
+                continue;
             }
-            Err(err) => {
-                eprintln!("Failed to read {}: {}", path.display(), err);
+            match read_samples(path, idx, args.offset, args.stride, target) {
+                Ok(mut chunk) => {
+                    println!("Loaded {} samples from {}", chunk.len(), path.display());
+                    samples.append(&mut chunk);
+                }
+                Err(err) => {
+                    eprintln!("Failed to read {}: {}", path.display(), err);
+                }
+            }
+        }
+    } else {
+        let mut remaining = args.samples;
+        for (idx, path) in packs.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            match read_samples(path, idx, args.offset, args.stride, remaining) {
+                Ok(mut chunk) => {
+                    remaining = remaining.saturating_sub(chunk.len());
+                    println!("Loaded {} samples from {}", chunk.len(), path.display());
+                    samples.append(&mut chunk);
+                }
+                Err(err) => {
+                    eprintln!("Failed to read {}: {}", path.display(), err);
+                }
             }
         }
     }
@@ -215,6 +385,20 @@ fn main() {
     if samples.is_empty() {
         eprintln!("No samples loaded.");
         std::process::exit(1);
+    }
+
+    if let Some(path) = &args.dump_progress_csv {
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Failed to create parent dir for --dump-progress-csv '{}': {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+        if let Err(e) = dump_progress_feature_csv(path, &packs, &samples, args.ply_max) {
+            eprintln!("Failed to write --dump-progress-csv '{}': {e}", path.display());
+            std::process::exit(1);
+        }
+        println!("Dumped progress feature CSV: {}", path.display());
     }
 
     println!("\nTotal samples: {}", samples.len());
@@ -245,12 +429,24 @@ fn main() {
     if let Some(bounds) = &fixed_bounds {
         println!("Fixed ply boundaries (9 buckets): {:?}", bounds);
     }
+    let progress_bucket = if let Some(path) = &args.progress_coeff {
+        match load_progress_bucket_from_json(path) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("Failed to load --progress-coeff: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let mut hist_kingrank = vec![0usize; 9];
     let mut hist_ply_q9 = vec![0usize; 9];
     let mut hist_hybrid = vec![0usize; 9];
     let mut hist_ply_fixed = vec![0usize; 9];
     let mut hist_board_count_q9 = vec![0usize; 9];
+    let mut hist_progress8 = vec![0usize; 8];
 
     for s in &samples {
         hist_kingrank[s.kingrank_bucket as usize] += 1;
@@ -264,6 +460,10 @@ fn main() {
         if let Some(bounds) = &fixed_bounds {
             hist_ply_fixed[bucket_by_boundaries(s.ply, bounds)] += 1;
         }
+        if let Some(bucket) = progress_bucket {
+            let b = bucket.bucket(&s.psv) as usize;
+            hist_progress8[b] += 1;
+        }
     }
 
     print_hist("Current: KingRank 3x3", &hist_kingrank);
@@ -271,6 +471,9 @@ fn main() {
     print_hist("Candidate C: BoardNonKingCount Quantile 9", &hist_board_count_q9);
     if fixed_bounds.is_some() {
         print_hist("Candidate A2: Ply Fixed-Boundary 9", &hist_ply_fixed);
+    }
+    if progress_bucket.is_some() {
+        print_hist("Candidate D: Progress8 (logistic)", &hist_progress8);
     }
     print_hist("Candidate B: (Ply Quantile 3) x (FriendKingZone 3)", &hist_hybrid);
 }

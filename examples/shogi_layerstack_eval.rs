@@ -23,7 +23,7 @@ Options:
 
 use std::{
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 
@@ -31,12 +31,16 @@ use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::datalo
 use bullet_lib::{
     game::{
         inputs::{ShogiHalfKA_hm, SparseInputType},
-        outputs::{OutputBuckets, ShogiLayerStackBucket9, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS},
+        outputs::{
+            OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS8_FEATURE_ORDER,
+            SHOGI_PROGRESS8_NUM_FEATURES, ShogiLayerStackBucket9, ShogiProgressBucket8,
+        },
     },
     nn::optimiser,
     value::ValueTrainerBuilder,
 };
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 
 // =============================================================================
 // CLI Arguments
@@ -97,6 +101,14 @@ struct Args {
     /// Optional boundaries for ply9 buckets (8 comma-separated values)
     #[arg(long)]
     ply_bounds: Option<String>,
+
+    /// Coefficient JSON (coeff_v1) path for progress8 mode
+    #[arg(long)]
+    progress_coeff: Option<PathBuf>,
+
+    /// Optional output path to dump evaluated positions as SFEN (one per line)
+    #[arg(long)]
+    dump_sfens: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -104,6 +116,137 @@ enum BucketMode {
     #[default]
     Kingrank9,
     Ply9,
+    Progress8,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressCoeffV1 {
+    format: String,
+    model: String,
+    num_buckets: usize,
+    feature_order: Vec<String>,
+    standardization: ProgressStandardization,
+    weights: Vec<f32>,
+    bias: f32,
+    runtime: ProgressRuntime,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressStandardization {
+    mean: Vec<f32>,
+    std: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressRuntime {
+    z_clip: Vec<f32>,
+}
+
+fn piece_char(pt: bullet_lib::shogi::PieceType) -> Option<char> {
+    use bullet_lib::shogi::PieceType;
+    match pt {
+        PieceType::Pawn => Some('P'),
+        PieceType::Lance => Some('L'),
+        PieceType::Knight => Some('N'),
+        PieceType::Silver => Some('S'),
+        PieceType::Gold => Some('G'),
+        PieceType::Bishop => Some('B'),
+        PieceType::Rook => Some('R'),
+        PieceType::King => Some('K'),
+        PieceType::ProPawn => Some('P'),
+        PieceType::ProLance => Some('L'),
+        PieceType::ProKnight => Some('N'),
+        PieceType::ProSilver => Some('S'),
+        PieceType::Horse => Some('B'),
+        PieceType::Dragon => Some('R'),
+        PieceType::None => None,
+    }
+}
+
+fn is_promoted(pt: bullet_lib::shogi::PieceType) -> bool {
+    use bullet_lib::shogi::PieceType;
+    matches!(
+        pt,
+        PieceType::ProPawn
+            | PieceType::ProLance
+            | PieceType::ProKnight
+            | PieceType::ProSilver
+            | PieceType::Horse
+            | PieceType::Dragon
+    )
+}
+
+fn hand_to_sfen(black_hand: &bullet_lib::shogi::Hand, white_hand: &bullet_lib::shogi::Hand) -> String {
+    use bullet_lib::shogi::PieceType;
+
+    let order = [
+        (PieceType::Rook, 'R', 'r'),
+        (PieceType::Bishop, 'B', 'b'),
+        (PieceType::Gold, 'G', 'g'),
+        (PieceType::Silver, 'S', 's'),
+        (PieceType::Knight, 'N', 'n'),
+        (PieceType::Lance, 'L', 'l'),
+        (PieceType::Pawn, 'P', 'p'),
+    ];
+
+    let mut out = String::new();
+    for (pt, bch, wch) in order {
+        let bc = black_hand.count(pt) as usize;
+        let wc = white_hand.count(pt) as usize;
+        if bc > 0 {
+            if bc > 1 {
+                out.push_str(&bc.to_string());
+            }
+            out.push(bch);
+        }
+        if wc > 0 {
+            if wc > 1 {
+                out.push_str(&wc.to_string());
+            }
+            out.push(wch);
+        }
+    }
+    if out.is_empty() { "-".to_string() } else { out }
+}
+
+fn board_to_sfen(board: &bullet_lib::shogi::ShogiBoard, ply: u16) -> String {
+    let mut s = String::new();
+
+    for rank in 0..9 {
+        let mut empty = 0usize;
+        for file in (0..9).rev() {
+            let idx = file * 9 + rank;
+            let pc = board.board[idx];
+            if pc.piece_type == bullet_lib::shogi::PieceType::None {
+                empty += 1;
+                continue;
+            }
+            if empty > 0 {
+                s.push_str(&empty.to_string());
+                empty = 0;
+            }
+            if is_promoted(pc.piece_type) {
+                s.push('+');
+            }
+            if let Some(mut ch) = piece_char(pc.piece_type) {
+                if pc.color == bullet_lib::shogi::Color::White {
+                    ch = ch.to_ascii_lowercase();
+                }
+                s.push(ch);
+            }
+        }
+        if empty > 0 {
+            s.push_str(&empty.to_string());
+        }
+        if rank != 8 {
+            s.push('/');
+        }
+    }
+
+    let stm = if board.side_to_move == bullet_lib::shogi::Color::Black { 'b' } else { 'w' };
+    let hand = hand_to_sfen(&board.black_hand, &board.white_hand);
+    let move_no = if ply == 0 { 1 } else { ply };
+    format!("{s} {stm} {hand} {move_no}")
 }
 
 // =============================================================================
@@ -117,18 +260,67 @@ fn pad32(n: usize) -> usize {
     (n + 31) & !31
 }
 
-fn skip_leb128_i16_block<R: Read + Seek>(reader: &mut R) -> io::Result<()> {
+fn read_leb128_i16_block<R: Read>(reader: &mut R) -> io::Result<Vec<i16>> {
     let mut magic = [0u8; 17];
     reader.read_exact(&mut magic)?;
     if &magic != b"COMPRESSED_LEB128" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid LEB128 block magic in quantised.bin"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid LEB128 block magic in quantised.bin",
+        ));
     }
 
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
-    let payload_len = u32::from_le_bytes(len_buf) as i64;
-    reader.seek(SeekFrom::Current(payload_len))?;
-    Ok(())
+    let payload_len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload)?;
+
+    let mut values = Vec::new();
+    let mut i = 0usize;
+    while i < payload.len() {
+        let mut result = 0i64;
+        let mut shift = 0u32;
+        let last_byte = loop {
+            if i >= payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated signed LEB128 payload",
+                ));
+            }
+            let byte = payload[i];
+            i += 1;
+
+            result |= i64::from(byte & 0x7f) << shift;
+            shift += 7;
+
+            if (byte & 0x80) == 0 {
+                break byte;
+            }
+            if shift >= 64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "signed LEB128 value exceeds 64-bit range",
+                ));
+            }
+        };
+
+        // Sign-extend when sign bit is set.
+        if shift < 64 && (last_byte & 0x40) != 0 {
+            result |= !0i64 << shift;
+        }
+
+        if result < i64::from(i16::MIN) || result > i64::from(i16::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded LEB128 value out of i16 range",
+            ));
+        }
+
+        values.push(result as i16);
+    }
+
+    Ok(values)
 }
 
 fn parse_ply_bounds_csv(text: &str) -> Result<[u16; 8], String> {
@@ -147,21 +339,94 @@ fn parse_ply_bounds_csv(text: &str) -> Result<[u16; 8], String> {
     Ok([values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]])
 }
 
+fn load_progress_bucket_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
+    let coeff: ProgressCoeffV1 = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse progress coeff JSON '{}': {e}", path.display()))?;
+
+    if coeff.format != "rshogi.progress_coeff.v1" {
+        return Err(format!("invalid progress coeff format '{}', expected 'rshogi.progress_coeff.v1'", coeff.format));
+    }
+    if coeff.model != "logistic_regression" {
+        return Err(format!("invalid progress coeff model '{}', expected 'logistic_regression'", coeff.model));
+    }
+    if coeff.num_buckets != 8 {
+        return Err(format!("invalid num_buckets {}, expected 8", coeff.num_buckets));
+    }
+    if coeff.feature_order.len() != SHOGI_PROGRESS8_NUM_FEATURES {
+        return Err(format!(
+            "invalid feature_order length {}, expected {}",
+            coeff.feature_order.len(),
+            SHOGI_PROGRESS8_NUM_FEATURES
+        ));
+    }
+    for (idx, expected) in SHOGI_PROGRESS8_FEATURE_ORDER.iter().enumerate() {
+        if coeff.feature_order[idx] != *expected {
+            return Err(format!(
+                "feature_order mismatch at index {}: got '{}', expected '{}'",
+                idx, coeff.feature_order[idx], expected
+            ));
+        }
+    }
+    if coeff.standardization.mean.len() != SHOGI_PROGRESS8_NUM_FEATURES
+        || coeff.standardization.std.len() != SHOGI_PROGRESS8_NUM_FEATURES
+        || coeff.weights.len() != SHOGI_PROGRESS8_NUM_FEATURES
+    {
+        return Err(format!(
+            "mean/std/weights lengths must all be {} (got mean={}, std={}, weights={})",
+            SHOGI_PROGRESS8_NUM_FEATURES,
+            coeff.standardization.mean.len(),
+            coeff.standardization.std.len(),
+            coeff.weights.len()
+        ));
+    }
+    if coeff.runtime.z_clip.len() != 2 {
+        return Err(format!("runtime.z_clip must have exactly 2 values (got {})", coeff.runtime.z_clip.len()));
+    }
+
+    let mean: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.standardization.mean.try_into().map_err(|_| "failed to convert mean to fixed array".to_string())?;
+    let std: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.standardization.std.try_into().map_err(|_| "failed to convert std to fixed array".to_string())?;
+    let weights: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.weights.try_into().map_err(|_| "failed to convert weights to fixed array".to_string())?;
+    let z_clip = [coeff.runtime.z_clip[0], coeff.runtime.z_clip[1]];
+
+    Ok(ShogiProgressBucket8::new(mean, std, weights, coeff.bias, z_clip))
+}
+
 fn resolve_bucket_impl(args: &Args) -> Result<ShogiLayerStackBucket9, String> {
     match args.bucket_mode {
         BucketMode::Kingrank9 => {
             if args.ply_bounds.is_some() {
                 Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+            } else if args.progress_coeff.is_some() {
+                Err("--progress-coeff can only be used with --bucket-mode progress8".to_string())
             } else {
                 Ok(ShogiLayerStackBucket9::KingRank9)
             }
         }
         BucketMode::Ply9 => {
+            if args.progress_coeff.is_some() {
+                return Err("--progress-coeff can only be used with --bucket-mode progress8".to_string());
+            }
             let bounds = match &args.ply_bounds {
                 Some(text) => parse_ply_bounds_csv(text)?,
                 None => SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS,
             };
             Ok(ShogiLayerStackBucket9::Ply9(bounds))
+        }
+        BucketMode::Progress8 => {
+            if args.ply_bounds.is_some() {
+                return Err("--ply-bounds can only be used with --bucket-mode ply9".to_string());
+            }
+            let path = args
+                .progress_coeff
+                .as_ref()
+                .ok_or_else(|| "--bucket-mode progress8 requires --progress-coeff".to_string())?;
+            let bucket = load_progress_bucket_from_json(path)?;
+            Ok(ShogiLayerStackBucket9::Progress8(bucket))
         }
     }
 }
@@ -191,6 +456,12 @@ fn main() {
         ShogiLayerStackBucket9::Ply9(bounds) => {
             println!("Bucket mode: ply9");
             println!("Ply bounds: {:?}", bounds);
+        }
+        ShogiLayerStackBucket9::Progress8(_) => {
+            println!("Bucket mode: progress8");
+            if let Some(path) = &args.progress_coeff {
+                println!("Progress coeff: {}", path.display());
+            }
         }
     }
     println!();
@@ -249,9 +520,13 @@ fn main() {
     if args.debug {
         let weights = GraphWeights::from(trainer.optimiser.graph.primary());
         let l0 = weights.get("l0w");
+        let l0b = weights.get("l0b");
         let l1 = weights.get("l1w");
+        let l2 = weights.get("l2w");
+        let l2b = weights.get("l2b");
+        let l3 = weights.get("l3w");
+        let l3b = weights.get("l3b");
         let l1f = weights.get("l1fw");
-        let input_dim = input_size;
         let output_dim = l0_size;
 
         const PIECE_INPUTS: usize = 1629;
@@ -277,11 +552,13 @@ fn main() {
         ];
 
         println!("=== Feature weight sums (l0w) ===");
-        for (name, bp) in features {
+        for &(name, bp) in &features {
             let feature_idx = KB * PIECE_INPUTS + bp;
             let mut sum = 0.0f32;
             for out in 0..output_dim {
-                let idx = out * input_dim + feature_idx;
+                // l0w is column-major [rows=output_dim, cols=input_dim]:
+                // index = col * rows + row
+                let idx = feature_idx * output_dim + out;
                 sum += l0.values[idx];
             }
             println!("{name}: sum={sum:.4}");
@@ -309,20 +586,73 @@ fn main() {
                 let _ = f.read_exact(&mut buf4);
 
                 // FT biases / weights はそれぞれ LEB128 ブロック
-                if let Err(e) = skip_leb128_i16_block(&mut f) {
-                    eprintln!("Warning: failed to parse FT bias block: {e}");
+                let ft_biases_q = match read_leb128_i16_block(&mut f) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Warning: failed to parse FT bias block: {e}");
+                        return;
+                    }
+                };
+                let ft_weights_q = match read_leb128_i16_block(&mut f) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Warning: failed to parse FT weight block: {e}");
+                        return;
+                    }
+                };
+
+                if ft_biases_q.len() != l0_size {
+                    eprintln!(
+                        "Warning: FT bias length mismatch: got {}, expected {}",
+                        ft_biases_q.len(),
+                        l0_size
+                    );
                     return;
                 }
-                if let Err(e) = skip_leb128_i16_block(&mut f) {
-                    eprintln!("Warning: failed to parse FT weight block: {e}");
+                if ft_weights_q.len() != input_size * l0_size {
+                    eprintln!(
+                        "Warning: FT weight length mismatch: got {}, expected {}",
+                        ft_weights_q.len(),
+                        input_size * l0_size
+                    );
                     return;
                 }
+
+                println!("=== FT bias sample check (quantised.bin vs weights.bin) ===");
+                for idx in 0..4 {
+                    let q_expected = (l0b.values[idx] * 127.0f32).round() as i16;
+                    let q_file = ft_biases_q[idx];
+                    println!("ft_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}", l0b.values[idx]);
+                }
+                println!();
+
+                println!("=== FT weight sample check (quantised.bin vs weights.bin) ===");
+                for &(name, bp) in &features[..4] {
+                    let feature_idx = KB * PIECE_INPUTS + bp;
+                    for out_idx in 0..2 {
+                        let expected =
+                            (l0.values[feature_idx * output_dim + out_idx] * 127.0f32).round() as i16;
+                        let q_file = ft_weights_q[feature_idx * l0_size + out_idx];
+                        println!(
+                            "{name} out={out_idx}: float={:.6} q_expected={expected} q_file={q_file}",
+                            l0.values[feature_idx * output_dim + out_idx]
+                        );
+                    }
+                }
+                println!();
+
+                // FT ブロック消費後、LayerStack 本体を読む。
 
                 // LayerStack は bucket ごとに保存される:
                 // [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
                 let l1_bias_count = NUM_BUCKETS * l1_size;
                 let mut l1_biases = vec![0i32; l1_bias_count];
                 let mut l1_weights = vec![0i8; l1_bias_count * l1_input_dim];
+                let l2_bias_count = NUM_BUCKETS * l2_size;
+                let mut l2_biases = vec![0i32; l2_bias_count];
+                let mut l2_weights = vec![0i8; l2_bias_count * l2_input];
+                let mut l3_biases = vec![0i32; NUM_BUCKETS];
+                let mut l3_weights = vec![0i8; NUM_BUCKETS * l2_size];
 
                 let l1_padded_in = pad32(l1_input_dim);
                 let l2_padded_in = pad32(l2_input);
@@ -348,11 +678,32 @@ fn main() {
                         }
                     }
 
-                    // skip L2 / L3
-                    let _ = f.seek(SeekFrom::Current((l2_size * std::mem::size_of::<i32>()) as i64));
-                    let _ = f.seek(SeekFrom::Current((l2_size * l2_padded_in) as i64));
-                    let _ = f.seek(SeekFrom::Current(std::mem::size_of::<i32>() as i64));
-                    let _ = f.seek(SeekFrom::Current(out_padded_in as i64));
+                    // l2 biases
+                    for out_idx in 0..l2_size {
+                        let _ = f.read_exact(&mut buf4);
+                        l2_biases[bucket * l2_size + out_idx] = i32::from_le_bytes(buf4);
+                    }
+
+                    // l2 weights (row-major with padded input)
+                    let mut l2_row = vec![0u8; l2_padded_in];
+                    for out_idx in 0..l2_size {
+                        let _ = f.read_exact(&mut l2_row);
+                        let global_out = bucket * l2_size + out_idx;
+                        for in_idx in 0..l2_input {
+                            l2_weights[global_out * l2_input + in_idx] = l2_row[in_idx] as i8;
+                        }
+                    }
+
+                    // l3 bias
+                    let _ = f.read_exact(&mut buf4);
+                    l3_biases[bucket] = i32::from_le_bytes(buf4);
+
+                    // l3 weights (padded)
+                    let mut out_row = vec![0u8; out_padded_in];
+                    let _ = f.read_exact(&mut out_row);
+                    for in_idx in 0..l2_size {
+                        l3_weights[bucket * l2_size + in_idx] = out_row[in_idx] as i8;
+                    }
                 }
 
                 println!("=== L1 bias sample check (quantised.bin vs weights.bin) ===");
@@ -374,13 +725,58 @@ fn main() {
                 for out_in_bucket in 0..2 {
                     let out_idx = out_base + out_in_bucket;
                     for in_idx in 0..4 {
-                        let bucket_w = l1.values[out_idx * l1_input_dim + in_idx];
-                        let shared_w = l1f.values[out_in_bucket * l1_input_dim + in_idx];
+                        let bucket_w = l1.values[in_idx * (NUM_BUCKETS * l1_size) + out_idx];
+                        let shared_w = l1f.values[in_idx * l1_size + out_in_bucket];
                         let float_w = bucket_w + shared_w;
                         let q_expected = (float_w * qb).round() as i8;
                         let q_file = l1_weights[out_idx * l1_input_dim + in_idx];
                         println!(
                             "bucket={bucket} out={out_in_bucket} in={in_idx}: merged_float={float_w:.6} q_expected={q_expected} q_file={q_file}"
+                        );
+                    }
+                }
+                println!();
+
+                println!("=== L2 bias sample check (quantised.bin vs weights.bin) ===");
+                let bias_scale = 127.0f32 * 64.0f32;
+                for idx in 0..4 {
+                    let b_expected = (l2b.values[idx] * bias_scale).round() as i32;
+                    let b_file = l2_biases[idx];
+                    println!("l2_bias[{idx}]: float={:.6} q_expected={b_expected} q_file={b_file}", l2b.values[idx]);
+                }
+                println!();
+
+                println!("=== L2 weight sample check (quantised.bin vs weights.bin) ===");
+                let qb = 64.0f32;
+                let bucket = 8usize;
+                let out_base = bucket * l2_size;
+                for out_in_bucket in 0..2 {
+                    let out_idx = out_base + out_in_bucket;
+                    for in_idx in 0..4 {
+                        let w = l2.values[in_idx * (NUM_BUCKETS * l2_size) + out_idx];
+                        let q_expected = (w * qb).round() as i8;
+                        let q_file = l2_weights[out_idx * l2_input + in_idx];
+                        println!(
+                            "bucket={bucket} out={out_in_bucket} in={in_idx}: float={w:.6} q_expected={q_expected} q_file={q_file}"
+                        );
+                    }
+                }
+                println!();
+
+                println!("=== L3 bias/weight sample check (quantised.bin vs weights.bin) ===");
+                for bucket in 0..2 {
+                    let b_expected = (l3b.values[bucket] * bias_scale).round() as i32;
+                    let b_file = l3_biases[bucket];
+                    println!(
+                        "l3_bias[bucket={bucket}]: float={:.6} q_expected={b_expected} q_file={b_file}",
+                        l3b.values[bucket]
+                    );
+                    for in_idx in 0..4 {
+                        let w = l3.values[in_idx * NUM_BUCKETS + bucket];
+                        let q_expected = (w * qb).round() as i8;
+                        let q_file = l3_weights[bucket * l2_size + in_idx];
+                        println!(
+                            "l3_w[bucket={bucket} in={in_idx}]: float={w:.6} q_expected={q_expected} q_file={q_file}"
                         );
                     }
                 }
@@ -405,6 +801,16 @@ fn main() {
     println!("=== Evaluation Results ===");
     println!("{:>5} {:>6} {:>8} {:>12} {:>12} {:>10}", "Index", "Bucket", "Score", "Raw", "Centipawn", "Diff");
     println!("{}", "-".repeat(50));
+
+    let mut sfen_writer = if let Some(path) = &args.dump_sfens {
+        let file = File::create(path).unwrap_or_else(|e| {
+            eprintln!("Error: Failed to create --dump-sfens file '{}': {e}", path.display());
+            std::process::exit(1);
+        });
+        Some(io::BufWriter::new(file))
+    } else {
+        None
+    };
 
     for idx in 0..args.samples {
         let mut buf = [0u8; 40];
@@ -448,6 +854,15 @@ fn main() {
         let target = psv.score() as f32;
         let diff = cp - target;
         let bucket = bucket_impl.bucket(&psv);
+        let decoded = psv.decode();
+        let sfen_line = board_to_sfen(&decoded, psv.game_ply());
+
+        if let Some(writer) = sfen_writer.as_mut() {
+            if let Err(e) = writeln!(writer, "{sfen_line}") {
+                eprintln!("Error: Failed to write SFEN: {e}");
+                std::process::exit(1);
+            }
+        }
 
         println!(
             "{:>5} {:>6} {:>8} {:>12.4} {:>12.1} {:>10.1}",
@@ -463,6 +878,9 @@ fn main() {
     println!();
     println!("Note: Raw output is the network output before sigmoid (or winrate if WDL).");
     println!("      Centipawn = scale * raw_output");
+    if let Some(path) = &args.dump_sfens {
+        println!("Dumped SFENs: {}", path.display());
+    }
     println!();
     println!("Compare these values with rshogi evaluation on the same records!");
 
@@ -563,7 +981,7 @@ fn dump_float_intermediates(
     l0_size: usize,
     l1_size: usize,
     l2_size: usize,
-    input_size: usize,
+    _input_size: usize,
     pack_path: &PathBuf,
     offset: u64,
     bucket_impl: ShogiLayerStackBucket9,
@@ -605,8 +1023,8 @@ fn dump_float_intermediates(
     }
     for &feat_idx in &stm_features {
         for i in 0..l0_size {
-            // l0w: [l0_size, input_size] row-major
-            let w_idx = i * input_size + feat_idx;
+            // l0w: column-major [rows=l0_size, cols=input_size]
+            let w_idx = feat_idx * l0_size + i;
             ft_stm[i] += l0w.values[w_idx];
         }
     }
@@ -618,7 +1036,7 @@ fn dump_float_intermediates(
     }
     for &feat_idx in &nstm_features {
         for i in 0..l0_size {
-            let w_idx = i * input_size + feat_idx;
+            let w_idx = feat_idx * l0_size + i;
             ft_nstm[i] += l0w.values[w_idx];
         }
     }
@@ -650,10 +1068,11 @@ fn dump_float_intermediates(
         let out_idx = bucket * l1_size + i;
         l1_out[i] = l1b.values[out_idx] + l1fb.values[i];
         for j in 0..l0_size {
-            // l1w:  [NUM_BUCKETS * l1_size, l0_size] row-major
-            // l1fw: [l1_size, l0_size] shared factorized part
-            let w_idx = out_idx * l0_size + j;
-            let wf_idx = i * l0_size + j;
+            // column-major:
+            // l1w:  shape [NUM_BUCKETS*l1_size, l0_size], idx = in * rows + out
+            // l1fw: shape [l1_size, l0_size],            idx = in * rows + out
+            let w_idx = j * (NUM_BUCKETS * l1_size) + out_idx;
+            let wf_idx = j * l1_size + i;
             l1_out[i] += pp_out[j] * (l1w.values[w_idx] + l1fw.values[wf_idx]);
         }
     }
@@ -677,7 +1096,7 @@ fn dump_float_intermediates(
         let out_idx = bucket * l2_size + i;
         l2_out[i] = l2b.values[out_idx];
         for j in 0..(l1_effective * 2) {
-            let w_idx = out_idx * (l1_effective * 2) + j;
+            let w_idx = j * (NUM_BUCKETS * l2_size) + out_idx;
             l2_out[i] += dual_act[j] * l2w.values[w_idx];
         }
     }
@@ -689,7 +1108,7 @@ fn dump_float_intermediates(
     // Output: [NUM_BUCKETS, l2_size]
     let mut out_before_bypass = l3b.values[bucket];
     for i in 0..l2_size {
-        let w_idx = bucket * l2_size + i;
+        let w_idx = i * NUM_BUCKETS + bucket;
         out_before_bypass += l2_out[i] * l3w.values[w_idx];
     }
 
@@ -738,13 +1157,11 @@ fn get_active_features(psv: &bullet_lib::shogi::PackedSfenValue) -> (Vec<usize>,
     let mut stm_features = Vec::new();
     let mut nstm_features = Vec::new();
 
-    ShogiHalfKA_hm.map_features(psv, |perspective, feat_idx| {
-        if perspective == 0 {
-            stm_features.push(feat_idx);
-        } else {
-            nstm_features.push(feat_idx);
-        }
+    ShogiHalfKA_hm.map_features(psv, |stm_idx, nstm_idx| {
+        stm_features.push(stm_idx);
+        nstm_features.push(nstm_idx);
     });
 
+    debug_assert_eq!(stm_features.len(), nstm_features.len());
     (stm_features, nstm_features)
 }

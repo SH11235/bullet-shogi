@@ -36,20 +36,23 @@ use std::path::PathBuf;
 
 use bullet_lib::{
     game::inputs::{ShogiHalfKA_hm, SparseInputType},
-    game::outputs::{ShogiLayerStackBucket9, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS},
+    game::outputs::{
+        SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
+        ShogiLayerStackBucket9, ShogiProgressBucket8,
+    },
     nn::{
-        optimiser::{self, AdamWParams, RAdamParams, RangerParams},
         Affine, InitSettings, Shape,
+        optimiser::{self, AdamWParams, RAdamParams, RangerParams},
     },
     trainer::{
         save::SavedFormat,
-        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
+        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
         settings::LocalSettings,
     },
-    value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
+    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // =============================================================================
 // Constants
@@ -76,6 +79,7 @@ enum BucketMode {
     #[default]
     Kingrank9,
     Ply9,
+    Progress8,
 }
 
 #[derive(Parser, Debug)]
@@ -189,6 +193,33 @@ struct Args {
     /// Optional boundaries for ply9 buckets (8 comma-separated values)
     #[arg(long)]
     ply_bounds: Option<String>,
+
+    /// Coefficient JSON (coeff_v1) path for progress8 mode
+    #[arg(long)]
+    progress_coeff: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressCoeffV1 {
+    format: String,
+    model: String,
+    num_buckets: usize,
+    feature_order: Vec<String>,
+    standardization: ProgressStandardization,
+    weights: Vec<f32>,
+    bias: f32,
+    runtime: ProgressRuntime,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressStandardization {
+    mean: Vec<f32>,
+    std: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressRuntime {
+    z_clip: Vec<f32>,
 }
 
 impl Args {
@@ -249,6 +280,8 @@ impl Args {
             BucketMode::Kingrank9 => {
                 if self.ply_bounds.is_some() {
                     Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+                } else if self.progress_coeff.is_some() {
+                    Err("--progress-coeff can only be used with --bucket-mode progress8".to_string())
                 } else {
                     Ok(None)
                 }
@@ -257,6 +290,13 @@ impl Args {
                 Some(text) => Self::parse_ply_bounds_csv(text).map(Some),
                 None => Ok(Some(SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS)),
             },
+            BucketMode::Progress8 => {
+                if self.ply_bounds.is_some() {
+                    Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -264,8 +304,85 @@ impl Args {
         match self.bucket_mode {
             BucketMode::Kingrank9 => "kingrank9",
             BucketMode::Ply9 => "ply9",
+            BucketMode::Progress8 => "progress8",
         }
     }
+
+    fn load_progress_bucket(&self) -> Result<Option<ShogiProgressBucket8>, String> {
+        match self.bucket_mode {
+            BucketMode::Progress8 => {
+                let path = self
+                    .progress_coeff
+                    .as_ref()
+                    .ok_or_else(|| "--bucket-mode progress8 requires --progress-coeff".to_string())?;
+                load_progress_bucket_from_json(path).map(Some)
+            }
+            _ => {
+                if self.progress_coeff.is_some() {
+                    Err("--progress-coeff can only be used with --bucket-mode progress8".to_string())
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn load_progress_bucket_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
+    let coeff: ProgressCoeffV1 = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse progress coeff JSON '{}': {e}", path.display()))?;
+
+    if coeff.format != "rshogi.progress_coeff.v1" {
+        return Err(format!("invalid progress coeff format '{}', expected 'rshogi.progress_coeff.v1'", coeff.format));
+    }
+    if coeff.model != "logistic_regression" {
+        return Err(format!("invalid progress coeff model '{}', expected 'logistic_regression'", coeff.model));
+    }
+    if coeff.num_buckets != 8 {
+        return Err(format!("invalid num_buckets {}, expected 8", coeff.num_buckets));
+    }
+    if coeff.feature_order.len() != SHOGI_PROGRESS8_NUM_FEATURES {
+        return Err(format!(
+            "invalid feature_order length {}, expected {}",
+            coeff.feature_order.len(),
+            SHOGI_PROGRESS8_NUM_FEATURES
+        ));
+    }
+    for (idx, expected) in SHOGI_PROGRESS8_FEATURE_ORDER.iter().enumerate() {
+        if coeff.feature_order[idx] != *expected {
+            return Err(format!(
+                "feature_order mismatch at index {}: got '{}', expected '{}'",
+                idx, coeff.feature_order[idx], expected
+            ));
+        }
+    }
+    if coeff.standardization.mean.len() != SHOGI_PROGRESS8_NUM_FEATURES
+        || coeff.standardization.std.len() != SHOGI_PROGRESS8_NUM_FEATURES
+        || coeff.weights.len() != SHOGI_PROGRESS8_NUM_FEATURES
+    {
+        return Err(format!(
+            "mean/std/weights lengths must all be {} (got mean={}, std={}, weights={})",
+            SHOGI_PROGRESS8_NUM_FEATURES,
+            coeff.standardization.mean.len(),
+            coeff.standardization.std.len(),
+            coeff.weights.len()
+        ));
+    }
+    if coeff.runtime.z_clip.len() != 2 {
+        return Err(format!("runtime.z_clip must have exactly 2 values (got {})", coeff.runtime.z_clip.len()));
+    }
+
+    let mean: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.standardization.mean.try_into().map_err(|_| "failed to convert mean to fixed array".to_string())?;
+    let std: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.standardization.std.try_into().map_err(|_| "failed to convert std to fixed array".to_string())?;
+    let weights: [f32; SHOGI_PROGRESS8_NUM_FEATURES] =
+        coeff.weights.try_into().map_err(|_| "failed to convert weights to fixed array".to_string())?;
+    let z_clip = [coeff.runtime.z_clip[0], coeff.runtime.z_clip[1]];
+
+    Ok(ShogiProgressBucket8::new(mean, std, weights, coeff.bias, z_clip))
 }
 
 // =============================================================================
@@ -303,6 +420,7 @@ struct ExperimentParams {
     num_buckets: usize,
     bucket_mode: String,
     ply_bounds: Option<[u16; 8]>,
+    progress_coeff: Option<String>,
     lr: f32,
     lr_gamma: f32,
     lr_step: usize,
@@ -658,16 +776,12 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
             // Quantise to i16 (scale = QA = 127)
             let qa_f = qa_i16 as f64;
             let weights_i16: Vec<i16> = l0w.values.iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
-
-            // Transpose: column-major [ft_out, input_size] → [input_size, ft_out]
-            let mut transposed_w = vec![0i16; ft_out_captured * input_size_captured];
-            for out in 0..ft_out_captured {
-                for feat in 0..input_size_captured {
-                    transposed_w[feat * ft_out_captured + out] = weights_i16[out * input_size_captured + feat];
-                }
-            }
-
-            let leb128_bytes = encode_leb128_tensor_i16(&transposed_w);
+            // acyclib dense weights are column-major [rows, cols].
+            // l0w shape is [ft_out, input_size], so storage index is:
+            //   idx = feat * ft_out + out
+            // This already matches NNUE FT layout [input][output], so no transpose is required.
+            let _ = (ft_out_captured, input_size_captured);
+            let leb128_bytes = encode_leb128_tensor_i16(&weights_i16);
             leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
         })
         .quantise::<i8>(1);
@@ -730,12 +844,16 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
                 // rshogi: row-major [l1_out × padded(ft_out)]
                 //   weight[out_idx * padded_in + in_idx]
                 let l1_padded_in = pad32(ft_out_for_ls);
+                let l1_rows_total = NUM_BUCKETS * l1_out_captured;
                 for out_idx in 0..l1_out_captured {
                     let global_out = bucket * l1_out_captured + out_idx;
                     for in_idx in 0..l1_padded_in {
                         if in_idx < ft_out_for_ls {
-                            let bucket_w = l1w.values[global_out * ft_out_for_ls + in_idx];
-                            let shared_w = l1fw.values[out_idx * ft_out_for_ls + in_idx];
+                            // column-major indexing:
+                            // l1w  shape [NUM_BUCKETS*l1_out, ft_out]  -> in * rows + out
+                            // l1fw shape [l1_out, ft_out]              -> in * rows + out
+                            let bucket_w = l1w.values[in_idx * l1_rows_total + global_out];
+                            let shared_w = l1fw.values[in_idx * l1_out_captured + out_idx];
                             let w = bucket_w + shared_w;
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
@@ -756,11 +874,13 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
 
                 // Weights: i8, scale = QB = 64
                 let l2_padded_in = pad32(l2_in_captured);
+                let l2_rows_total = NUM_BUCKETS * l2_out_captured;
                 for out_idx in 0..l2_out_captured {
                     let global_out = bucket * l2_out_captured + out_idx;
                     for in_idx in 0..l2_padded_in {
                         if in_idx < l2_in_captured {
-                            let w = l2w.values[global_out * l2_in_captured + in_idx];
+                            // l2w shape [NUM_BUCKETS*l2_out, l2_in], column-major
+                            let w = l2w.values[in_idx * l2_rows_total + global_out];
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
@@ -784,7 +904,8 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
                     let global_out = bucket;
                     for in_idx in 0..output_padded_in {
                         if in_idx < l2_out_captured {
-                            let w = l3w.values[global_out * l2_out_captured + in_idx];
+                            // l3w shape [NUM_BUCKETS, l2_out], column-major
+                            let w = l3w.values[in_idx * NUM_BUCKETS + global_out];
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
@@ -818,6 +939,10 @@ fn main() {
         eprintln!("ERROR: {}", e);
         std::process::exit(1);
     });
+    let progress_bucket = args.load_progress_bucket().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
 
     let ft_out = args.l0;
     let l1_out = args.l1;
@@ -846,6 +971,9 @@ fn main() {
     println!("Bucket mode: {}", args.bucket_mode_name());
     if let Some(bounds) = ply_bounds {
         println!("Ply bounds: {:?}", bounds);
+    }
+    if let Some(coeff) = &args.progress_coeff {
+        println!("Progress coeff: {}", coeff.display());
     }
     println!("FV_SCALE: {} (QA={}, QB={}, scale={})", fv_scale, QA, QB, args.scale);
     println!("Optimizer: {}", optimizer_name);
@@ -879,6 +1007,7 @@ fn main() {
         num_buckets: NUM_BUCKETS,
         bucket_mode: args.bucket_mode_name().to_string(),
         ply_bounds,
+        progress_coeff: args.progress_coeff.as_ref().map(|p| p.display().to_string()),
         lr: args.lr,
         lr_gamma: args.lr_gamma,
         lr_step: args.lr_step,
@@ -966,6 +1095,9 @@ fn main() {
     let bucket_impl = match args.bucket_mode {
         BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
         BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
+        BucketMode::Progress8 => {
+            ShogiLayerStackBucket9::Progress8(progress_bucket.expect("progress coeff must exist in progress8 mode"))
+        }
     };
 
     macro_rules! build_trainer {
@@ -977,6 +1109,10 @@ fn main() {
                 .output_buckets($bucket_impl)
                 .save_format(&save_format)
                 .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            #[cfg(feature = "cpu")]
+            {
+                builder = builder.use_threads(1);
+            }
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }

@@ -562,12 +562,7 @@ fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64)
             total_positions,
             epochs: Some(epochs),
         },
-        results: ExperimentResults {
-            training_time_seconds,
-            fv_scale: ctx.fv_scale,
-            best_loss,
-            best_loss_superbatch,
-        },
+        results: ExperimentResults { training_time_seconds, fv_scale: ctx.fv_scale, best_loss, best_loss_superbatch },
         history,
         checkpoints,
     };

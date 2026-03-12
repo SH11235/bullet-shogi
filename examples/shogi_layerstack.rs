@@ -42,7 +42,7 @@ use bullet_lib::{
     game::outputs::{
         SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
         SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
-        ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite,
+        ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
     },
     nn::{
         Affine, InitSettings, Shape,
@@ -86,6 +86,8 @@ enum BucketMode {
     Progress8,
     #[value(name = "progress8gikou")]
     Progress8Gikou,
+    #[value(name = "progress8kpabs")]
+    Progress8KPAbs,
 }
 
 #[derive(Parser, Debug)]
@@ -204,7 +206,7 @@ struct Args {
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Output bucket mode (kingrank9 / ply9)
+    /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
     bucket_mode: BucketMode,
 
@@ -212,7 +214,7 @@ struct Args {
     #[arg(long)]
     ply_bounds: Option<String>,
 
-    /// Coefficient JSON path for progress8/progress8gikou mode (v1 for progress8, v2 for progress8gikou)
+    /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 }
@@ -253,10 +255,13 @@ struct ProgressCoeffV2 {
     runtime: ProgressRuntime,
 }
 
+// `OutputBuckets` implementations stay `Copy`, so boxing the large variants is not an option.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 enum LoadedProgressBucket {
     V1(ShogiProgressBucket8),
     Gikou(ShogiProgressBucket8GikouLite),
+    KPAbs(ShogiProgressKPAbs),
 }
 
 impl Args {
@@ -322,14 +327,16 @@ impl Args {
                 if self.ply_bounds.is_some() {
                     Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
                 } else if self.progress_coeff.is_some() {
-                    Err("--progress-coeff can only be used with --bucket-mode progress8".to_string())
+                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
+                        .to_string())
                 } else {
                     Ok(None)
                 }
             }
             BucketMode::Ply9 => {
                 if self.progress_coeff.is_some() {
-                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string())
+                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
+                        .to_string())
                 } else {
                     match &self.ply_bounds {
                         Some(text) => Self::parse_ply_bounds_csv(text).map(Some),
@@ -337,7 +344,7 @@ impl Args {
                     }
                 }
             }
-            BucketMode::Progress8 | BucketMode::Progress8Gikou => {
+            BucketMode::Progress8 | BucketMode::Progress8Gikou | BucketMode::Progress8KPAbs => {
                 if self.ply_bounds.is_some() {
                     Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
                 } else {
@@ -353,6 +360,7 @@ impl Args {
             BucketMode::Ply9 => "ply9",
             BucketMode::Progress8 => "progress8",
             BucketMode::Progress8Gikou => "progress8gikou",
+            BucketMode::Progress8KPAbs => "progress8kpabs",
         }
     }
 
@@ -372,9 +380,17 @@ impl Args {
                     .ok_or_else(|| "--bucket-mode progress8gikou requires --progress-coeff".to_string())?;
                 load_progress_bucket_v2_from_json(path).map(|v| Some(LoadedProgressBucket::Gikou(v)))
             }
+            BucketMode::Progress8KPAbs => {
+                let path = self
+                    .progress_coeff
+                    .as_ref()
+                    .ok_or_else(|| "--bucket-mode progress8kpabs requires --progress-coeff".to_string())?;
+                ShogiProgressKPAbs::load_from_bin(path).map(|v| Some(LoadedProgressBucket::KPAbs(v)))
+            }
             _ => {
                 if self.progress_coeff.is_some() {
-                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string())
+                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
+                        .to_string())
                 } else {
                     Ok(None)
                 }
@@ -1238,6 +1254,10 @@ fn main() {
         BucketMode::Progress8Gikou => match progress_bucket {
             Some(LoadedProgressBucket::Gikou(bucket)) => ShogiLayerStackBucket9::Progress8GikouLite(bucket),
             _ => panic!("progress coeff v2 must exist in progress8gikou mode"),
+        },
+        BucketMode::Progress8KPAbs => match progress_bucket {
+            Some(LoadedProgressBucket::KPAbs(bucket)) => ShogiLayerStackBucket9::Progress8KPAbs(bucket),
+            _ => panic!("progress.bin must exist in progress8kpabs mode"),
         },
     };
 

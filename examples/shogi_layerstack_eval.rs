@@ -34,7 +34,7 @@ use bullet_lib::{
         outputs::{
             OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
             SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
-            ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite,
+            ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
         },
     },
     nn::optimiser,
@@ -95,7 +95,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     dump_intermediates: bool,
 
-    /// Output bucket mode (kingrank9 / ply9)
+    /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
     bucket_mode: BucketMode,
 
@@ -103,7 +103,7 @@ struct Args {
     #[arg(long)]
     ply_bounds: Option<String>,
 
-    /// Coefficient JSON path for progress8/progress8gikou mode (v1 for progress8, v2 for progress8gikou)
+    /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 
@@ -120,6 +120,8 @@ enum BucketMode {
     Progress8,
     #[value(name = "progress8gikou")]
     Progress8Gikou,
+    #[value(name = "progress8kpabs")]
+    Progress8KPAbs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,14 +468,18 @@ fn resolve_bucket_impl(args: &Args) -> Result<ShogiLayerStackBucket9, String> {
             if args.ply_bounds.is_some() {
                 Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
             } else if args.progress_coeff.is_some() {
-                Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string())
+                Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
+                    .to_string())
             } else {
                 Ok(ShogiLayerStackBucket9::KingRank9)
             }
         }
         BucketMode::Ply9 => {
             if args.progress_coeff.is_some() {
-                return Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string());
+                return Err(
+                    "--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
+                        .to_string(),
+                );
             }
             let bounds = match &args.ply_bounds {
                 Some(text) => parse_ply_bounds_csv(text)?,
@@ -502,6 +508,17 @@ fn resolve_bucket_impl(args: &Args) -> Result<ShogiLayerStackBucket9, String> {
                 .ok_or_else(|| "--bucket-mode progress8gikou requires --progress-coeff".to_string())?;
             let bucket = load_progress_bucket_v2_from_json(path)?;
             Ok(ShogiLayerStackBucket9::Progress8GikouLite(bucket))
+        }
+        BucketMode::Progress8KPAbs => {
+            if args.ply_bounds.is_some() {
+                return Err("--ply-bounds can only be used with --bucket-mode ply9".to_string());
+            }
+            let path = args
+                .progress_coeff
+                .as_ref()
+                .ok_or_else(|| "--bucket-mode progress8kpabs requires --progress-coeff".to_string())?;
+            let bucket = ShogiProgressKPAbs::load_from_bin(path)?;
+            Ok(ShogiLayerStackBucket9::Progress8KPAbs(bucket))
         }
     }
 }
@@ -540,6 +557,12 @@ fn main() {
         }
         ShogiLayerStackBucket9::Progress8GikouLite(_) => {
             println!("Bucket mode: progress8gikou");
+            if let Some(path) = &args.progress_coeff {
+                println!("Progress coeff: {}", path.display());
+            }
+        }
+        ShogiLayerStackBucket9::Progress8KPAbs(_) => {
+            println!("Bucket mode: progress8kpabs");
             if let Some(path) = &args.progress_coeff {
                 println!("Progress coeff: {}", path.display());
             }
@@ -696,9 +719,8 @@ fn main() {
                 }
 
                 println!("=== FT bias sample check (quantised.bin vs weights.bin) ===");
-                for idx in 0..4 {
+                for (idx, &q_file) in ft_biases_q.iter().enumerate().take(4) {
                     let q_expected = (l0b.values[idx] * 127.0f32).round() as i16;
-                    let q_file = ft_biases_q[idx];
                     println!("ft_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}", l0b.values[idx]);
                 }
                 println!();
@@ -727,7 +749,7 @@ fn main() {
                 let l2_bias_count = NUM_BUCKETS * l2_size;
                 let mut l2_biases = vec![0i32; l2_bias_count];
                 let mut l2_weights = vec![0i8; l2_bias_count * l2_input];
-                let mut l3_biases = vec![0i32; NUM_BUCKETS];
+                let mut l3_biases = [0i32; NUM_BUCKETS];
                 let mut l3_weights = vec![0i8; NUM_BUCKETS * l2_size];
 
                 let l1_padded_in = pad32(l1_input_dim);
@@ -786,10 +808,9 @@ fn main() {
                 let l1b = weights.get("l1b");
                 let l1fb = weights.get("l1fb");
                 let bias_scale = 127.0f32 * 64.0f32; // QA * QB
-                for idx in 0..4 {
+                for (idx, &q_file) in l1_biases.iter().enumerate().take(4) {
                     let merged_b = l1b.values[idx] + l1fb.values[idx % l1_size];
                     let q_expected = (merged_b * bias_scale).round() as i32;
-                    let q_file = l1_biases[idx];
                     println!("bias[{idx}]: merged_float={merged_b:.6} q_expected={q_expected} q_file={q_file}");
                 }
                 println!();
@@ -815,9 +836,8 @@ fn main() {
 
                 println!("=== L2 bias sample check (quantised.bin vs weights.bin) ===");
                 let bias_scale = 127.0f32 * 64.0f32;
-                for idx in 0..4 {
+                for (idx, &b_file) in l2_biases.iter().enumerate().take(4) {
                     let b_expected = (l2b.values[idx] * bias_scale).round() as i32;
-                    let b_file = l2_biases[idx];
                     println!("l2_bias[{idx}]: float={:.6} q_expected={b_expected} q_file={b_file}", l2b.values[idx]);
                 }
                 println!();
@@ -1051,7 +1071,7 @@ impl FloatIntermediates {
 }
 
 /// Float forward pass with intermediate dump
-#[allow(clippy::needless_range_loop, clippy::manual_memcpy)]
+#[allow(clippy::needless_range_loop, clippy::manual_memcpy, clippy::too_many_arguments)]
 fn dump_float_intermediates(
     weights: &GraphWeights,
     l0_size: usize,

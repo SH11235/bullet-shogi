@@ -1,6 +1,12 @@
+use std::{path::Path, sync::OnceLock};
+
 use bulletformat::{ChessBoard, chess::MarlinFormat};
 
-use crate::shogi::PackedSfenValue;
+use crate::shogi::{
+    BonaPiece, Color, PackedSfenValue, Piece,
+    bona_piece::FE_OLD_END,
+    types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
+};
 
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static {
     const BUCKETS: usize;
@@ -107,6 +113,13 @@ pub const SHOGI_PROGRESS8_FEATURE_ORDER: [&str; SHOGI_PROGRESS8_NUM_FEATURES] = 
 /// Number of buckets for progress8.
 pub const SHOGI_PROGRESS8_NUM_BUCKETS: usize = 8;
 
+/// Number of KP-absolute weights: `81 * FE_OLD_END`.
+pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
+
+static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
+static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
+    [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+
 /// Progress-based 8 bucket assignment (logistic regression).
 ///
 /// `p = sigmoid(bias + Σ(w_i * ((x_i - mean_i) / std_i)))`
@@ -181,9 +194,9 @@ impl ShogiProgressBucket8 {
         let x = Self::extract_features(pos);
 
         let mut z = self.bias;
-        for i in 0..SHOGI_PROGRESS8_NUM_FEATURES {
+        for (i, &x_i) in x.iter().enumerate() {
             let std = if self.std[i] > 0.0 { self.std[i] } else { 1.0 };
-            let x_norm = (x[i] - self.mean[i]) / std;
+            let x_norm = (x_i - self.mean[i]) / std;
             z += self.weights[i] * x_norm;
         }
 
@@ -209,6 +222,103 @@ impl Default for ShogiProgressBucket8 {
 }
 
 impl OutputBuckets<PackedSfenValue> for ShogiProgressBucket8 {
+    const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+        let p = self.progress(pos);
+        let raw = (p * 8.0).floor() as i32;
+        raw.clamp(0, 7) as u8
+    }
+}
+
+/// Progress-based 8 bucket assignment using YaneuraOu/tanuki- style KP-absolute features.
+///
+/// Weights are process-global so this type stays `Copy` and can be embedded in `OutputBuckets`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiProgressKPAbs;
+
+impl ShogiProgressKPAbs {
+    fn weights() -> &'static [f32] {
+        SHOGI_PROGRESS_KP_ABS_WEIGHTS.get().map_or(&SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS, |weights| weights.as_ref())
+    }
+
+    /// Loads KP-absolute weights from a YaneuraOu-compatible `progress.bin`.
+    ///
+    /// Only one KP-absolute model can be loaded per process.
+    pub fn load_from_bin(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+        let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
+        if bytes.len() != expected {
+            return Err(format!("progress.bin size mismatch: got {} bytes, expected {}", bytes.len(), expected));
+        }
+
+        let weights: Vec<f32> = bytes
+            .chunks_exact(std::mem::size_of::<f64>())
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
+            .collect();
+
+        SHOGI_PROGRESS_KP_ABS_WEIGHTS
+            .set(weights.into_boxed_slice())
+            .map_err(|_| "KP-absolute progress weights are already loaded in this process".to_string())?;
+
+        Ok(Self)
+    }
+
+    /// Estimates progress in `0.0..=1.0`.
+    pub fn progress(&self, pos: &PackedSfenValue) -> f32 {
+        let board = pos.decode();
+        if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
+            return 0.5;
+        }
+
+        let weights = Self::weights();
+        let sq_bk = board.black_king_sq.index();
+        let sq_wk = board.white_king_sq.inverse().index();
+
+        let mut sum = 0.0f32;
+
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in board.pieces(color, pt) {
+                    let piece = Piece::new(color, pt);
+
+                    let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
+                    if bp_b != BonaPiece::ZERO {
+                        sum += weights[sq_bk * FE_OLD_END + bp_b.value() as usize];
+                    }
+
+                    let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
+                    if bp_w != BonaPiece::ZERO {
+                        sum += weights[sq_wk * FE_OLD_END + bp_w.value() as usize];
+                    }
+                }
+            }
+        }
+
+        for owner in [Color::Black, Color::White] {
+            let hand = if owner == Color::Black { board.black_hand } else { board.white_hand };
+            for &pt in &HAND_PIECE_TYPES {
+                let count = hand.count(pt);
+                for c in 1..=count {
+                    let bp_b = BonaPiece::from_hand_piece(Color::Black, owner, pt, c);
+                    if bp_b != BonaPiece::ZERO {
+                        sum += weights[sq_bk * FE_OLD_END + bp_b.value() as usize];
+                    }
+
+                    let bp_w = BonaPiece::from_hand_piece(Color::White, owner, pt, c);
+                    if bp_w != BonaPiece::ZERO {
+                        sum += weights[sq_wk * FE_OLD_END + bp_w.value() as usize];
+                    }
+                }
+            }
+        }
+
+        let p = 1.0 / (1.0 + (-sum).exp());
+        p.clamp(0.0, 1.0)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiProgressKPAbs {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
     fn bucket(&self, pos: &PackedSfenValue) -> u8 {
@@ -365,9 +475,9 @@ impl ShogiProgressBucket8GikouLite {
         let x = Self::extract_features(pos);
 
         let mut z = self.bias;
-        for i in 0..SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES {
+        for (i, &x_i) in x.iter().enumerate() {
             let std = if self.std[i] > 0.0 { self.std[i] } else { 1.0 };
-            let x_norm = (x[i] - self.mean[i]) / std;
+            let x_norm = (x_i - self.mean[i]) / std;
             z += self.weights[i] * x_norm;
         }
 
@@ -435,18 +545,18 @@ impl OutputBuckets<PackedSfenValue> for ShogiPlyBucket9 {
 }
 
 /// Runtime-selectable 9-bucket mode for shogi LayerStacks.
-#[derive(Clone, Copy)]
+///
+/// This enum stays `Copy` because `OutputBuckets` requires it, so boxing the
+/// larger progress variants is not an option here.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Default)]
 pub enum ShogiLayerStackBucket9 {
+    #[default]
     KingRank9,
     Ply9([u16; 8]),
     Progress8(ShogiProgressBucket8),
     Progress8GikouLite(ShogiProgressBucket8GikouLite),
-}
-
-impl Default for ShogiLayerStackBucket9 {
-    fn default() -> Self {
-        Self::KingRank9
-    }
+    Progress8KPAbs(ShogiProgressKPAbs),
 }
 
 impl OutputBuckets<PackedSfenValue> for ShogiLayerStackBucket9 {
@@ -470,6 +580,9 @@ impl OutputBuckets<PackedSfenValue> for ShogiLayerStackBucket9 {
             // 9bucket互換モード:
             // progress8-gikou-lite も bucket 0..7 を使用し、bucket 8 は未使用となる。
             Self::Progress8GikouLite(progress) => progress.bucket(pos),
+            // 9bucket互換モード:
+            // KP-absolute も bucket 0..7 を使用し、bucket 8 は未使用となる。
+            Self::Progress8KPAbs(progress) => progress.bucket(pos),
         }
     }
 }
@@ -548,6 +661,23 @@ mod tests {
         for ply in [1u16, 40, 80, 120, 200, 400] {
             let b = bucket.bucket(&psv_with_ply(ply));
             assert!(b <= 7, "progress8-gikou-lite-in-9 bucket must be in 0..=7, got {}", b);
+        }
+    }
+
+    #[test]
+    fn test_shogi_progress_kp_abs_default_is_neutral_on_invalid_position() {
+        let bucket = ShogiProgressKPAbs;
+        let psv = psv_with_ply(60);
+        assert_eq!(bucket.progress(&psv), 0.5);
+        assert_eq!(bucket.bucket(&psv), 4);
+    }
+
+    #[test]
+    fn test_shogi_layerstack_bucket9_progress_kp_abs_mode_range() {
+        let bucket = ShogiLayerStackBucket9::Progress8KPAbs(ShogiProgressKPAbs);
+        for ply in [1u16, 40, 80, 120, 200, 400] {
+            let b = bucket.bucket(&psv_with_ply(ply));
+            assert!(b <= 7, "progress8-kpabs-in-9 bucket must be in 0..=7, got {}", b);
         }
     }
 }

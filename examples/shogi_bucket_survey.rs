@@ -20,7 +20,7 @@ use bullet_lib::{
     game::outputs::{
         OutputBuckets, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER, SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES,
         SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES, ShogiKingRankBucket, ShogiProgressBucket8,
-        ShogiProgressBucket8GikouLite,
+        ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
     },
     shogi::{Color, PackedSfenValue, ShogiBoard},
 };
@@ -66,6 +66,10 @@ struct Args {
     /// Optional progress coeff JSON (coeff_v2) for progress8gikou histogram
     #[arg(long)]
     progress_coeff_v2: Option<PathBuf>,
+
+    /// Optional progress.bin path for progress8kpabs histogram
+    #[arg(long)]
+    progress_kpabs: Option<PathBuf>,
 
     /// Optional CSV path to dump progress-feature training rows
     #[arg(long)]
@@ -606,6 +610,17 @@ fn main() {
     } else {
         None
     };
+    let progress_bucket_kpabs = if let Some(path) = &args.progress_kpabs {
+        match ShogiProgressKPAbs::load_from_bin(path) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("Failed to load --progress-kpabs: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let mut hist_kingrank = vec![0usize; 9];
     let mut hist_ply_q9 = vec![0usize; 9];
@@ -614,10 +629,12 @@ fn main() {
     let mut hist_board_count_q9 = vec![0usize; 9];
     let mut hist_progress8 = vec![0usize; 8];
     let mut hist_progress8_gikou = vec![0usize; 8];
+    let mut hist_progress8_kpabs = vec![0usize; 8];
     let mut per_pack_samples = vec![0usize; packs.len()];
     let mut per_pack_kingrank = vec![vec![0usize; 9]; packs.len()];
     let mut per_pack_progress8 = progress_bucket.map(|_| vec![vec![0usize; 8]; packs.len()]);
     let mut per_pack_progress8_gikou = progress_bucket_v2.map(|_| vec![vec![0usize; 8]; packs.len()]);
+    let mut per_pack_progress8_kpabs = progress_bucket_kpabs.map(|_| vec![vec![0usize; 8]; packs.len()]);
 
     for s in &samples {
         let pack_idx = s.pack_index;
@@ -649,6 +666,13 @@ fn main() {
                 per_pack[pack_idx][b] += 1;
             }
         }
+        if let Some(bucket) = progress_bucket_kpabs {
+            let b = bucket.bucket(&s.psv) as usize;
+            hist_progress8_kpabs[b] += 1;
+            if let Some(per_pack) = per_pack_progress8_kpabs.as_mut() {
+                per_pack[pack_idx][b] += 1;
+            }
+        }
     }
 
     print_hist("Current: KingRank 3x3", &hist_kingrank);
@@ -663,19 +687,39 @@ fn main() {
     if progress_bucket_v2.is_some() {
         print_hist("Candidate E: Progress8 Gikou-lite (logistic)", &hist_progress8_gikou);
     }
+    if progress_bucket_kpabs.is_some() {
+        print_hist("Candidate F: Progress8 KPAbs (logistic)", &hist_progress8_kpabs);
+    }
     print_hist("Candidate B: (Ply Quantile 3) x (FriendKingZone 3)", &hist_hybrid);
 
     if args.per_pack {
         println!("\n== Per-Pack Top-Bucket Summary ==");
-        if progress_bucket.is_some() && progress_bucket_v2.is_some() {
+        if progress_bucket.is_some() && progress_bucket_v2.is_some() && progress_bucket_kpabs.is_some() {
+            println!(
+                "{:>3} {:>8} {:>16} {:>16} {:>18} {:>18}  pack",
+                "idx", "samples", "kingrank_top", "progress8_top", "progress8gikou_top", "progress8kpabs_top"
+            );
+        } else if progress_bucket.is_some() && progress_bucket_v2.is_some() {
             println!(
                 "{:>3} {:>8} {:>16} {:>16} {:>18}  pack",
                 "idx", "samples", "kingrank_top", "progress8_top", "progress8gikou_top"
+            );
+        } else if progress_bucket.is_some() && progress_bucket_kpabs.is_some() {
+            println!(
+                "{:>3} {:>8} {:>16} {:>16} {:>18}  pack",
+                "idx", "samples", "kingrank_top", "progress8_top", "progress8kpabs_top"
+            );
+        } else if progress_bucket_v2.is_some() && progress_bucket_kpabs.is_some() {
+            println!(
+                "{:>3} {:>8} {:>16} {:>18} {:>18}  pack",
+                "idx", "samples", "kingrank_top", "progress8gikou_top", "progress8kpabs_top"
             );
         } else if progress_bucket.is_some() {
             println!("{:>3} {:>8} {:>16} {:>16}  pack", "idx", "samples", "kingrank_top", "progress8_top");
         } else if progress_bucket_v2.is_some() {
             println!("{:>3} {:>8} {:>16} {:>18}  pack", "idx", "samples", "kingrank_top", "progress8gikou_top");
+        } else if progress_bucket_kpabs.is_some() {
+            println!("{:>3} {:>8} {:>16} {:>18}  pack", "idx", "samples", "kingrank_top", "progress8kpabs_top");
         } else {
             println!("{:>3} {:>8} {:>16}  pack", "idx", "samples", "kingrank_top");
         }
@@ -687,7 +731,29 @@ fn main() {
             }
 
             let (kr_bucket, kr_share) = top_bucket_info(&per_pack_kingrank[idx]);
-            if let (Some(progress_hist), Some(progress_hist_gikou)) = (&per_pack_progress8, &per_pack_progress8_gikou) {
+            if let (Some(progress_hist), Some(progress_hist_gikou), Some(progress_hist_kpabs)) =
+                (&per_pack_progress8, &per_pack_progress8_gikou, &per_pack_progress8_kpabs)
+            {
+                let (pr_bucket, pr_share) = top_bucket_info(&progress_hist[idx]);
+                let (pg_bucket, pg_share) = top_bucket_info(&progress_hist_gikou[idx]);
+                let (pk_bucket, pk_share) = top_bucket_info(&progress_hist_kpabs[idx]);
+                println!(
+                    "{:>3} {:>8} {:>5} ({:>6.2}%) {:>5} ({:>6.2}%) {:>7} ({:>6.2}%) {:>7} ({:>6.2}%)  {}",
+                    idx,
+                    samples,
+                    kr_bucket,
+                    kr_share,
+                    pr_bucket,
+                    pr_share,
+                    pg_bucket,
+                    pg_share,
+                    pk_bucket,
+                    pk_share,
+                    path.display()
+                );
+            } else if let (Some(progress_hist), Some(progress_hist_gikou)) =
+                (&per_pack_progress8, &per_pack_progress8_gikou)
+            {
                 let (pr_bucket, pr_share) = top_bucket_info(&progress_hist[idx]);
                 let (pg_bucket, pg_share) = top_bucket_info(&progress_hist_gikou[idx]);
                 println!(
@@ -700,6 +766,40 @@ fn main() {
                     pr_share,
                     pg_bucket,
                     pg_share,
+                    path.display()
+                );
+            } else if let (Some(progress_hist), Some(progress_hist_kpabs)) =
+                (&per_pack_progress8, &per_pack_progress8_kpabs)
+            {
+                let (pr_bucket, pr_share) = top_bucket_info(&progress_hist[idx]);
+                let (pk_bucket, pk_share) = top_bucket_info(&progress_hist_kpabs[idx]);
+                println!(
+                    "{:>3} {:>8} {:>5} ({:>6.2}%) {:>5} ({:>6.2}%) {:>7} ({:>6.2}%)  {}",
+                    idx,
+                    samples,
+                    kr_bucket,
+                    kr_share,
+                    pr_bucket,
+                    pr_share,
+                    pk_bucket,
+                    pk_share,
+                    path.display()
+                );
+            } else if let (Some(progress_hist_gikou), Some(progress_hist_kpabs)) =
+                (&per_pack_progress8_gikou, &per_pack_progress8_kpabs)
+            {
+                let (pg_bucket, pg_share) = top_bucket_info(&progress_hist_gikou[idx]);
+                let (pk_bucket, pk_share) = top_bucket_info(&progress_hist_kpabs[idx]);
+                println!(
+                    "{:>3} {:>8} {:>5} ({:>6.2}%) {:>7} ({:>6.2}%) {:>7} ({:>6.2}%)  {}",
+                    idx,
+                    samples,
+                    kr_bucket,
+                    kr_share,
+                    pg_bucket,
+                    pg_share,
+                    pk_bucket,
+                    pk_share,
                     path.display()
                 );
             } else if let Some(progress_hist) = &per_pack_progress8 {
@@ -724,6 +824,18 @@ fn main() {
                     kr_share,
                     pg_bucket,
                     pg_share,
+                    path.display()
+                );
+            } else if let Some(progress_hist_kpabs) = &per_pack_progress8_kpabs {
+                let (pk_bucket, pk_share) = top_bucket_info(&progress_hist_kpabs[idx]);
+                println!(
+                    "{:>3} {:>8} {:>5} ({:>6.2}%) {:>7} ({:>6.2}%)  {}",
+                    idx,
+                    samples,
+                    kr_bucket,
+                    kr_share,
+                    pk_bucket,
+                    pk_share,
                     path.display()
                 );
             } else {

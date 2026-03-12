@@ -32,8 +32,9 @@ use bullet_lib::{
     game::{
         inputs::{ShogiHalfKA_hm, SparseInputType},
         outputs::{
-            OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS8_FEATURE_ORDER,
-            SHOGI_PROGRESS8_NUM_FEATURES, ShogiLayerStackBucket9, ShogiProgressBucket8,
+            OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
+            SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
+            ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite,
         },
     },
     nn::optimiser,
@@ -102,7 +103,7 @@ struct Args {
     #[arg(long)]
     ply_bounds: Option<String>,
 
-    /// Coefficient JSON (coeff_v1) path for progress8 mode
+    /// Coefficient JSON path for progress8/progress8gikou mode (v1 for progress8, v2 for progress8gikou)
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 
@@ -117,6 +118,8 @@ enum BucketMode {
     Kingrank9,
     Ply9,
     Progress8,
+    #[value(name = "progress8gikou")]
+    Progress8Gikou,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +143,19 @@ struct ProgressStandardization {
 #[derive(Debug, Deserialize)]
 struct ProgressRuntime {
     z_clip: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressCoeffV2 {
+    format: String,
+    model: String,
+    feature_set: String,
+    num_buckets: usize,
+    feature_order: Vec<String>,
+    standardization: ProgressStandardization,
+    weights: Vec<f32>,
+    bias: f32,
+    runtime: ProgressRuntime,
 }
 
 fn piece_char(pt: bullet_lib::shogi::PieceType) -> Option<char> {
@@ -264,10 +280,7 @@ fn read_leb128_i16_block<R: Read>(reader: &mut R) -> io::Result<Vec<i16>> {
     let mut magic = [0u8; 17];
     reader.read_exact(&mut magic)?;
     if &magic != b"COMPRESSED_LEB128" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid LEB128 block magic in quantised.bin",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid LEB128 block magic in quantised.bin"));
     }
 
     let mut len_buf = [0u8; 4];
@@ -283,10 +296,7 @@ fn read_leb128_i16_block<R: Read>(reader: &mut R) -> io::Result<Vec<i16>> {
         let mut shift = 0u32;
         let last_byte = loop {
             if i >= payload.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated signed LEB128 payload",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated signed LEB128 payload"));
             }
             let byte = payload[i];
             i += 1;
@@ -298,10 +308,7 @@ fn read_leb128_i16_block<R: Read>(reader: &mut R) -> io::Result<Vec<i16>> {
                 break byte;
             }
             if shift >= 64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "signed LEB128 value exceeds 64-bit range",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "signed LEB128 value exceeds 64-bit range"));
             }
         };
 
@@ -311,10 +318,7 @@ fn read_leb128_i16_block<R: Read>(reader: &mut R) -> io::Result<Vec<i16>> {
         }
 
         if result < i64::from(i16::MIN) || result > i64::from(i16::MAX) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decoded LEB128 value out of i16 range",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "decoded LEB128 value out of i16 range"));
         }
 
         values.push(result as i16);
@@ -396,20 +400,80 @@ fn load_progress_bucket_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8
     Ok(ShogiProgressBucket8::new(mean, std, weights, coeff.bias, z_clip))
 }
 
+fn load_progress_bucket_v2_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8GikouLite, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
+    let coeff: ProgressCoeffV2 = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse progress coeff JSON '{}': {e}", path.display()))?;
+
+    if coeff.format != "rshogi.progress_coeff.v2" {
+        return Err(format!("invalid progress coeff format '{}', expected 'rshogi.progress_coeff.v2'", coeff.format));
+    }
+    if coeff.model != "logistic_regression" {
+        return Err(format!("invalid progress coeff model '{}', expected 'logistic_regression'", coeff.model));
+    }
+    if coeff.feature_set != "gikou_lite_34" {
+        return Err(format!("invalid feature_set '{}', expected 'gikou_lite_34'", coeff.feature_set));
+    }
+    if coeff.num_buckets != 8 {
+        return Err(format!("invalid num_buckets {}, expected 8", coeff.num_buckets));
+    }
+    if coeff.feature_order.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES {
+        return Err(format!(
+            "invalid feature_order length {}, expected {}",
+            coeff.feature_order.len(),
+            SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+        ));
+    }
+    for (idx, expected) in SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER.iter().enumerate() {
+        if coeff.feature_order[idx] != *expected {
+            return Err(format!(
+                "feature_order mismatch at index {}: got '{}', expected '{}'",
+                idx, coeff.feature_order[idx], expected
+            ));
+        }
+    }
+    if coeff.standardization.mean.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+        || coeff.standardization.std.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+        || coeff.weights.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+    {
+        return Err(format!(
+            "mean/std/weights lengths must all be {} (got mean={}, std={}, weights={})",
+            SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES,
+            coeff.standardization.mean.len(),
+            coeff.standardization.std.len(),
+            coeff.weights.len()
+        ));
+    }
+    if coeff.runtime.z_clip.len() != 2 {
+        return Err(format!("runtime.z_clip must have exactly 2 values (got {})", coeff.runtime.z_clip.len()));
+    }
+
+    let mean: [f32; SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES] =
+        coeff.standardization.mean.try_into().map_err(|_| "failed to convert mean to fixed array".to_string())?;
+    let std: [f32; SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES] =
+        coeff.standardization.std.try_into().map_err(|_| "failed to convert std to fixed array".to_string())?;
+    let weights: [f32; SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES] =
+        coeff.weights.try_into().map_err(|_| "failed to convert weights to fixed array".to_string())?;
+    let z_clip = [coeff.runtime.z_clip[0], coeff.runtime.z_clip[1]];
+
+    Ok(ShogiProgressBucket8GikouLite::new(mean, std, weights, coeff.bias, z_clip))
+}
+
 fn resolve_bucket_impl(args: &Args) -> Result<ShogiLayerStackBucket9, String> {
     match args.bucket_mode {
         BucketMode::Kingrank9 => {
             if args.ply_bounds.is_some() {
                 Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
             } else if args.progress_coeff.is_some() {
-                Err("--progress-coeff can only be used with --bucket-mode progress8".to_string())
+                Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string())
             } else {
                 Ok(ShogiLayerStackBucket9::KingRank9)
             }
         }
         BucketMode::Ply9 => {
             if args.progress_coeff.is_some() {
-                return Err("--progress-coeff can only be used with --bucket-mode progress8".to_string());
+                return Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string());
             }
             let bounds = match &args.ply_bounds {
                 Some(text) => parse_ply_bounds_csv(text)?,
@@ -427,6 +491,17 @@ fn resolve_bucket_impl(args: &Args) -> Result<ShogiLayerStackBucket9, String> {
                 .ok_or_else(|| "--bucket-mode progress8 requires --progress-coeff".to_string())?;
             let bucket = load_progress_bucket_from_json(path)?;
             Ok(ShogiLayerStackBucket9::Progress8(bucket))
+        }
+        BucketMode::Progress8Gikou => {
+            if args.ply_bounds.is_some() {
+                return Err("--ply-bounds can only be used with --bucket-mode ply9".to_string());
+            }
+            let path = args
+                .progress_coeff
+                .as_ref()
+                .ok_or_else(|| "--bucket-mode progress8gikou requires --progress-coeff".to_string())?;
+            let bucket = load_progress_bucket_v2_from_json(path)?;
+            Ok(ShogiLayerStackBucket9::Progress8GikouLite(bucket))
         }
     }
 }
@@ -459,6 +534,12 @@ fn main() {
         }
         ShogiLayerStackBucket9::Progress8(_) => {
             println!("Bucket mode: progress8");
+            if let Some(path) = &args.progress_coeff {
+                println!("Progress coeff: {}", path.display());
+            }
+        }
+        ShogiLayerStackBucket9::Progress8GikouLite(_) => {
+            println!("Bucket mode: progress8gikou");
             if let Some(path) = &args.progress_coeff {
                 println!("Progress coeff: {}", path.display());
             }
@@ -602,11 +683,7 @@ fn main() {
                 };
 
                 if ft_biases_q.len() != l0_size {
-                    eprintln!(
-                        "Warning: FT bias length mismatch: got {}, expected {}",
-                        ft_biases_q.len(),
-                        l0_size
-                    );
+                    eprintln!("Warning: FT bias length mismatch: got {}, expected {}", ft_biases_q.len(), l0_size);
                     return;
                 }
                 if ft_weights_q.len() != input_size * l0_size {
@@ -630,8 +707,7 @@ fn main() {
                 for &(name, bp) in &features[..4] {
                     let feature_idx = KB * PIECE_INPUTS + bp;
                     for out_idx in 0..2 {
-                        let expected =
-                            (l0.values[feature_idx * output_dim + out_idx] * 127.0f32).round() as i16;
+                        let expected = (l0.values[feature_idx * output_dim + out_idx] * 127.0f32).round() as i16;
                         let q_file = ft_weights_q[feature_idx * l0_size + out_idx];
                         println!(
                             "{name} out={out_idx}: float={:.6} q_expected={expected} q_file={q_file}",

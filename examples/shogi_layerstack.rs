@@ -30,6 +30,9 @@ Options:
     --batches-per-superbatch <N>  Batches per superbatch (default: auto)
     --lr-gamma <F>      LR decay rate (default: 0.992)
     --lr-step <N>       LR decay interval (default: 1)
+    --interleave-file-batches <N> File mix granularity (0=sequential, 1=round-robin)
+    --epoch-file-shuffle Shuffle file order every epoch
+    --file-shuffle-seed <SEED> Seed for epoch file shuffle
 */
 
 use std::path::PathBuf;
@@ -37,8 +40,9 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::{ShogiHalfKA_hm, SparseInputType},
     game::outputs::{
-        SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
-        ShogiLayerStackBucket9, ShogiProgressBucket8,
+        SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
+        SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
+        ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite,
     },
     nn::{
         Affine, InitSettings, Shape,
@@ -80,6 +84,8 @@ enum BucketMode {
     Kingrank9,
     Ply9,
     Progress8,
+    #[value(name = "progress8gikou")]
+    Progress8Gikou,
 }
 
 #[derive(Parser, Debug)]
@@ -174,6 +180,18 @@ struct Args {
     #[arg(long, default_value = "64")]
     batch_queue_size: usize,
 
+    /// Read this many batches from one file before switching files (0 = sequential by file)
+    #[arg(long, default_value = "0")]
+    interleave_file_batches: usize,
+
+    /// Shuffle file order at every epoch boundary
+    #[arg(long)]
+    epoch_file_shuffle: bool,
+
+    /// Seed for --epoch-file-shuffle
+    #[arg(long, default_value = "0")]
+    file_shuffle_seed: u64,
+
     /// Resume from checkpoint
     #[arg(long)]
     resume: Option<PathBuf>,
@@ -194,7 +212,7 @@ struct Args {
     #[arg(long)]
     ply_bounds: Option<String>,
 
-    /// Coefficient JSON (coeff_v1) path for progress8 mode
+    /// Coefficient JSON path for progress8/progress8gikou mode (v1 for progress8, v2 for progress8gikou)
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 }
@@ -220,6 +238,25 @@ struct ProgressStandardization {
 #[derive(Debug, Deserialize)]
 struct ProgressRuntime {
     z_clip: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressCoeffV2 {
+    format: String,
+    model: String,
+    feature_set: String,
+    num_buckets: usize,
+    feature_order: Vec<String>,
+    standardization: ProgressStandardization,
+    weights: Vec<f32>,
+    bias: f32,
+    runtime: ProgressRuntime,
+}
+
+#[derive(Clone, Copy)]
+enum LoadedProgressBucket {
+    V1(ShogiProgressBucket8),
+    Gikou(ShogiProgressBucket8GikouLite),
 }
 
 impl Args {
@@ -259,6 +296,10 @@ impl Args {
         }
     }
 
+    fn interleave_batches_value(&self) -> Option<usize> {
+        if self.interleave_file_batches == 0 { None } else { Some(self.interleave_file_batches) }
+    }
+
     fn parse_ply_bounds_csv(text: &str) -> Result<[u16; 8], String> {
         let mut values = Vec::new();
         for token in text.split(',') {
@@ -286,11 +327,17 @@ impl Args {
                     Ok(None)
                 }
             }
-            BucketMode::Ply9 => match &self.ply_bounds {
-                Some(text) => Self::parse_ply_bounds_csv(text).map(Some),
-                None => Ok(Some(SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS)),
-            },
-            BucketMode::Progress8 => {
+            BucketMode::Ply9 => {
+                if self.progress_coeff.is_some() {
+                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string())
+                } else {
+                    match &self.ply_bounds {
+                        Some(text) => Self::parse_ply_bounds_csv(text).map(Some),
+                        None => Ok(Some(SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS)),
+                    }
+                }
+            }
+            BucketMode::Progress8 | BucketMode::Progress8Gikou => {
                 if self.ply_bounds.is_some() {
                     Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
                 } else {
@@ -305,21 +352,29 @@ impl Args {
             BucketMode::Kingrank9 => "kingrank9",
             BucketMode::Ply9 => "ply9",
             BucketMode::Progress8 => "progress8",
+            BucketMode::Progress8Gikou => "progress8gikou",
         }
     }
 
-    fn load_progress_bucket(&self) -> Result<Option<ShogiProgressBucket8>, String> {
+    fn load_progress_bucket(&self) -> Result<Option<LoadedProgressBucket>, String> {
         match self.bucket_mode {
             BucketMode::Progress8 => {
                 let path = self
                     .progress_coeff
                     .as_ref()
                     .ok_or_else(|| "--bucket-mode progress8 requires --progress-coeff".to_string())?;
-                load_progress_bucket_from_json(path).map(Some)
+                load_progress_bucket_v1_from_json(path).map(|v| Some(LoadedProgressBucket::V1(v)))
+            }
+            BucketMode::Progress8Gikou => {
+                let path = self
+                    .progress_coeff
+                    .as_ref()
+                    .ok_or_else(|| "--bucket-mode progress8gikou requires --progress-coeff".to_string())?;
+                load_progress_bucket_v2_from_json(path).map(|v| Some(LoadedProgressBucket::Gikou(v)))
             }
             _ => {
                 if self.progress_coeff.is_some() {
-                    Err("--progress-coeff can only be used with --bucket-mode progress8".to_string())
+                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou".to_string())
                 } else {
                     Ok(None)
                 }
@@ -328,7 +383,7 @@ impl Args {
     }
 }
 
-fn load_progress_bucket_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8, String> {
+fn load_progress_bucket_v1_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
     let coeff: ProgressCoeffV1 = serde_json::from_str(&text)
@@ -385,6 +440,66 @@ fn load_progress_bucket_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8
     Ok(ShogiProgressBucket8::new(mean, std, weights, coeff.bias, z_clip))
 }
 
+fn load_progress_bucket_v2_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8GikouLite, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
+    let coeff: ProgressCoeffV2 = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse progress coeff JSON '{}': {e}", path.display()))?;
+
+    if coeff.format != "rshogi.progress_coeff.v2" {
+        return Err(format!("invalid progress coeff format '{}', expected 'rshogi.progress_coeff.v2'", coeff.format));
+    }
+    if coeff.model != "logistic_regression" {
+        return Err(format!("invalid progress coeff model '{}', expected 'logistic_regression'", coeff.model));
+    }
+    if coeff.feature_set != "gikou_lite_34" {
+        return Err(format!("invalid feature_set '{}', expected 'gikou_lite_34'", coeff.feature_set));
+    }
+    if coeff.num_buckets != 8 {
+        return Err(format!("invalid num_buckets {}, expected 8", coeff.num_buckets));
+    }
+    if coeff.feature_order.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES {
+        return Err(format!(
+            "invalid feature_order length {}, expected {}",
+            coeff.feature_order.len(),
+            SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+        ));
+    }
+    for (idx, expected) in SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER.iter().enumerate() {
+        if coeff.feature_order[idx] != *expected {
+            return Err(format!(
+                "feature_order mismatch at index {}: got '{}', expected '{}'",
+                idx, coeff.feature_order[idx], expected
+            ));
+        }
+    }
+    if coeff.standardization.mean.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+        || coeff.standardization.std.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+        || coeff.weights.len() != SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES
+    {
+        return Err(format!(
+            "mean/std/weights lengths must all be {} (got mean={}, std={}, weights={})",
+            SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES,
+            coeff.standardization.mean.len(),
+            coeff.standardization.std.len(),
+            coeff.weights.len()
+        ));
+    }
+    if coeff.runtime.z_clip.len() != 2 {
+        return Err(format!("runtime.z_clip must have exactly 2 values (got {})", coeff.runtime.z_clip.len()));
+    }
+
+    let mean: [f32; SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES] =
+        coeff.standardization.mean.try_into().map_err(|_| "failed to convert mean to fixed array".to_string())?;
+    let std: [f32; SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES] =
+        coeff.standardization.std.try_into().map_err(|_| "failed to convert std to fixed array".to_string())?;
+    let weights: [f32; SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES] =
+        coeff.weights.try_into().map_err(|_| "failed to convert weights to fixed array".to_string())?;
+    let z_clip = [coeff.runtime.z_clip[0], coeff.runtime.z_clip[1]];
+
+    Ok(ShogiProgressBucket8GikouLite::new(mean, std, weights, coeff.bias, z_clip))
+}
+
 // =============================================================================
 // Experiment Log Structures
 // =============================================================================
@@ -426,6 +541,9 @@ struct ExperimentParams {
     lr_step: usize,
     batch_size: usize,
     batches_per_superbatch: usize,
+    interleave_file_batches: Option<usize>,
+    epoch_file_shuffle: bool,
+    file_shuffle_seed: Option<u64>,
     superbatches: usize,
     start_superbatch: usize,
     wdl: f32,
@@ -993,6 +1111,15 @@ fn main() {
     println!("WDL lambda: {}", args.wdl_display());
     println!("Save rate: {}", args.save_rate);
     println!("Threads: {} (queue={})", args.threads, args.batch_queue_size);
+    match args.interleave_batches_value() {
+        Some(v) => println!("File mix: round-robin every {} batch(es)", v),
+        None => println!("File mix: sequential by file"),
+    }
+    if args.epoch_file_shuffle {
+        println!("Epoch file shuffle: enabled (seed={})", args.file_shuffle_seed);
+    } else {
+        println!("Epoch file shuffle: disabled");
+    }
     println!("Output: {}", args.output.display());
     println!("Net ID: {}", args.net_id);
     println!("Data: {}", args.data);
@@ -1013,6 +1140,9 @@ fn main() {
         lr_step: args.lr_step,
         batch_size: args.batch_size,
         batches_per_superbatch: batches_per_superbatch_display,
+        interleave_file_batches: args.interleave_batches_value(),
+        epoch_file_shuffle: args.epoch_file_shuffle,
+        file_shuffle_seed: args.epoch_file_shuffle.then_some(args.file_shuffle_seed),
         superbatches: args.superbatches,
         start_superbatch: args.start_superbatch,
         wdl: args.wdl_value(),
@@ -1046,7 +1176,7 @@ fn main() {
     let batches_per_superbatch =
         args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
     let schedule = TrainingSchedule {
-        net_id: args.net_id,
+        net_id: args.net_id.clone(),
         eval_scale: args.scale as f32,
         steps: TrainingSteps {
             batch_size: args.batch_size,
@@ -1081,7 +1211,13 @@ fn main() {
         args.data.split(',').map(|s| s.to_string()).collect()
     };
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-    let data_loader = DirectSequentialDataLoader::new(&data_files_ref);
+    let mut data_loader = DirectSequentialDataLoader::new(&data_files_ref);
+    if let Some(interleave_batches) = args.interleave_batches_value() {
+        data_loader = data_loader.with_interleave_batches(interleave_batches);
+    }
+    if args.epoch_file_shuffle {
+        data_loader = data_loader.with_epoch_file_shuffle(true, args.file_shuffle_seed);
+    }
 
     // SavedFormat
     let save_format = build_layerstack_save_format(input_size, ft_out, l1_out, l2_out);
@@ -1095,9 +1231,14 @@ fn main() {
     let bucket_impl = match args.bucket_mode {
         BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
         BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
-        BucketMode::Progress8 => {
-            ShogiLayerStackBucket9::Progress8(progress_bucket.expect("progress coeff must exist in progress8 mode"))
-        }
+        BucketMode::Progress8 => match progress_bucket {
+            Some(LoadedProgressBucket::V1(bucket)) => ShogiLayerStackBucket9::Progress8(bucket),
+            _ => panic!("progress coeff v1 must exist in progress8 mode"),
+        },
+        BucketMode::Progress8Gikou => match progress_bucket {
+            Some(LoadedProgressBucket::Gikou(bucket)) => ShogiLayerStackBucket9::Progress8GikouLite(bucket),
+            _ => panic!("progress coeff v2 must exist in progress8gikou mode"),
+        },
     };
 
     macro_rules! build_trainer {

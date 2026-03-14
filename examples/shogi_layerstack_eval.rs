@@ -18,7 +18,7 @@ Options:
     --l0 <SIZE>          L0 サイズ (default: 1536)
     --l1 <SIZE>          L1 サイズ (default: 16)
     --l2 <SIZE>          L2 サイズ (default: 32)
-    --scale <N>          学習時の scale (default: 508)
+    --scale <N>          学習時の scale (default: 600)
 */
 
 use std::{
@@ -71,8 +71,8 @@ struct Args {
     #[arg(long, default_value = "32")]
     l2: usize,
 
-    /// Training scale (for centipawn conversion)
-    #[arg(long, default_value = "508")]
+    /// Training scale (for centipawn conversion, match Eval_Coef of teacher)
+    #[arg(long, default_value = "600")]
     scale: i32,
 
     /// Number of samples to evaluate

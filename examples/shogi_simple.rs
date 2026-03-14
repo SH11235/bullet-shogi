@@ -20,12 +20,10 @@ Options:
     --end-wdl <F>       End WDL lambda for linear interpolation
                         Must use both --start-wdl and --end-wdl together
     --win-rate-model    Use win rate model for score conversion
-    --scale <N>         Eval scale (default: 1016)
+    --scale <N>         Eval scale (default: 600)
                         FV_SCALE = QA*QB/scale (rounded)
-                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32, 1016->8
-                        QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
-                        Note: Default (QA=127, scale=1016) -> FV_SCALE=8
-                        For FV_SCALE=16: --qa 127 --scale 508 or --qa 255 --scale 1020
+                        QA=127 (CReLU):  8128/scale  -> 600->13, 508->16, 254->32, 1016->8
+                        QA=255 (SCReLU): 16320/scale -> 600->27, 510->32, 1020->16
     --batches-per-superbatch <N>  Batches per superbatch (default: auto ~100M positions)
     --lr-gamma <F>      LR decay rate per step (default: 0.992)
     --lr-step <N>       LR decay interval in superbatches (default: 1)
@@ -216,14 +214,11 @@ struct Args {
     end_wdl: Option<f32>,
 
     /// Eval scale for training target sigmoid(score / scale).
+    /// Eval_Coef=600 のDL教師データと整合させるため、デフォルト600。
     /// FV_SCALE = QA*QB/scale (rounded).
-    /// Recommended divisors for exact FV_SCALE:
-    ///   QA=127 (CReLU):  508->16, 254->32, 1016->8
-    ///   QA=255 (SCReLU): 510->32, 1020->16, 340->48
-    /// Note: Default (QA=127, scale=1016) gives FV_SCALE=8.
-    /// For FV_SCALE=16: use --qa 127 --scale 508  (CReLU)
-    ///                  or  --qa 255 --scale 1020 (SCReLU)
-    #[arg(long, default_value = "1016")]
+    ///   QA=127 (CReLU):  600->13, 508->16, 254->32, 1016->8
+    ///   QA=255 (SCReLU): 600->27, 510->32, 1020->16
+    #[arg(long, default_value = "600")]
     scale: i32,
 
     /// Save interval (superbatches)

@@ -15,7 +15,7 @@ Options:
     --wdl <LAMBDA>      WDL lambda for constant scheduler (default: 0.5)
     --start-wdl <F>     Start WDL lambda for linear interpolation
     --end-wdl <F>       End WDL lambda for linear interpolation
-    --scale <N>         Eval scale (default: 508, FV_SCALE=16)
+    --scale <N>         Eval scale (default: 600)
     --l0 <SIZE>         FT output size (default: 1536)
     --l1 <SIZE>         L1 output size (default: 16)
     --l2 <SIZE>         L2 output size (default: 32)
@@ -122,8 +122,8 @@ struct Args {
     #[arg(long, requires = "start_wdl")]
     end_wdl: Option<f32>,
 
-    /// Eval scale (default: 508, gives FV_SCALE = 127*64/508 = 16)
-    #[arg(long, default_value = "508")]
+    /// Eval scale (default: 600, Eval_Coef=600 のDL教師データと整合)
+    #[arg(long, default_value = "600")]
     scale: i32,
 
     /// L0 (Feature Transformer) size
@@ -840,7 +840,7 @@ fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32
 /// LayerStack 量子化出力の SavedFormat を構築する
 ///
 /// rshogi NetworkLayerStacks::read() と完全互換のバイナリを生成。
-fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize, l2_out: usize) -> Vec<SavedFormat> {
+fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize, l2_out: usize, fv_scale: i32) -> Vec<SavedFormat> {
     use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
 
     let l1_effective = l1_out - 1; // skip connection 分を除く
@@ -851,7 +851,7 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
     let ft_hash = FEATURE_HASH_HM_V2 ^ ((ft_out * 2) as u32);
     let network_hash = fc_hash ^ ft_hash;
 
-    // アーキテクチャ文字列
+    // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
          Network=AffineTransform[1<-{}](\
@@ -859,7 +859,8 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
          AffineTransform[{}<-{}](\
          SqrClippedReLU[{}](\
          AffineTransform[{}<-{}](\
-         InputSlice[{}(0:{})])))))",
+         InputSlice[{}(0:{})]))))),\
+         fv_scale={}",
         input_size,
         ft_out,
         l2_out,     // Output input
@@ -871,6 +872,7 @@ fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize,
         ft_out * 2, // L1 input (dual perspective)
         ft_out * 2,
         ft_out * 2,
+        fv_scale,
     );
     let arch_bytes = arch_desc.as_bytes();
 
@@ -1236,7 +1238,7 @@ fn main() {
     }
 
     // SavedFormat
-    let save_format = build_layerstack_save_format(input_size, ft_out, l1_out, l2_out);
+    let save_format = build_layerstack_save_format(input_size, ft_out, l1_out, l2_out, fv_scale);
 
     // Network builder
     let ft_out_c = ft_out;

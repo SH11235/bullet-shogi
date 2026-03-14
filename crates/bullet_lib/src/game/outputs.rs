@@ -242,6 +242,61 @@ impl ShogiProgressKPAbs {
         SHOGI_PROGRESS_KP_ABS_WEIGHTS.get().map_or(&SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS, |weights| weights.as_ref())
     }
 
+    /// Enumerates all active KP-absolute feature indices for the position.
+    ///
+    /// This is the exact feature expansion used by `progress8kpabs`.
+    pub fn for_each_active_index(pos: &PackedSfenValue, mut f: impl FnMut(usize)) {
+        let board = pos.decode();
+        if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
+            return;
+        }
+
+        let sq_bk = board.black_king_sq.index();
+        let sq_wk = board.white_king_sq.inverse().index();
+
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in board.pieces(color, pt) {
+                    let piece = Piece::new(color, pt);
+
+                    let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
+                    if bp_b != BonaPiece::ZERO {
+                        f(sq_bk * FE_OLD_END + bp_b.value() as usize);
+                    }
+
+                    let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
+                    if bp_w != BonaPiece::ZERO {
+                        f(sq_wk * FE_OLD_END + bp_w.value() as usize);
+                    }
+                }
+            }
+        }
+
+        for owner in [Color::Black, Color::White] {
+            let hand = if owner == Color::Black { board.black_hand } else { board.white_hand };
+            for &pt in &HAND_PIECE_TYPES {
+                let count = hand.count(pt);
+                for c in 1..=count {
+                    let bp_b = BonaPiece::from_hand_piece(Color::Black, owner, pt, c);
+                    if bp_b != BonaPiece::ZERO {
+                        f(sq_bk * FE_OLD_END + bp_b.value() as usize);
+                    }
+
+                    let bp_w = BonaPiece::from_hand_piece(Color::White, owner, pt, c);
+                    if bp_w != BonaPiece::ZERO {
+                        f(sq_wk * FE_OLD_END + bp_w.value() as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collects all active KP-absolute feature indices into `out`.
+    pub fn collect_active_indices(pos: &PackedSfenValue, out: &mut Vec<usize>) {
+        out.clear();
+        Self::for_each_active_index(pos, |idx| out.push(idx));
+    }
+
     /// Loads KP-absolute weights from a YaneuraOu-compatible `progress.bin`.
     ///
     /// Only one KP-absolute model can be loaded per process.
@@ -266,52 +321,9 @@ impl ShogiProgressKPAbs {
 
     /// Estimates progress in `0.0..=1.0`.
     pub fn progress(&self, pos: &PackedSfenValue) -> f32 {
-        let board = pos.decode();
-        if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
-            return 0.5;
-        }
-
         let weights = Self::weights();
-        let sq_bk = board.black_king_sq.index();
-        let sq_wk = board.white_king_sq.inverse().index();
-
         let mut sum = 0.0f32;
-
-        for &pt in &BOARD_PIECE_TYPES {
-            for color in [Color::Black, Color::White] {
-                for sq in board.pieces(color, pt) {
-                    let piece = Piece::new(color, pt);
-
-                    let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
-                    if bp_b != BonaPiece::ZERO {
-                        sum += weights[sq_bk * FE_OLD_END + bp_b.value() as usize];
-                    }
-
-                    let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
-                    if bp_w != BonaPiece::ZERO {
-                        sum += weights[sq_wk * FE_OLD_END + bp_w.value() as usize];
-                    }
-                }
-            }
-        }
-
-        for owner in [Color::Black, Color::White] {
-            let hand = if owner == Color::Black { board.black_hand } else { board.white_hand };
-            for &pt in &HAND_PIECE_TYPES {
-                let count = hand.count(pt);
-                for c in 1..=count {
-                    let bp_b = BonaPiece::from_hand_piece(Color::Black, owner, pt, c);
-                    if bp_b != BonaPiece::ZERO {
-                        sum += weights[sq_bk * FE_OLD_END + bp_b.value() as usize];
-                    }
-
-                    let bp_w = BonaPiece::from_hand_piece(Color::White, owner, pt, c);
-                    if bp_w != BonaPiece::ZERO {
-                        sum += weights[sq_wk * FE_OLD_END + bp_w.value() as usize];
-                    }
-                }
-            }
-        }
+        Self::for_each_active_index(pos, |idx| sum += weights[idx]);
 
         let p = 1.0 / (1.0 + (-sum).exp());
         p.clamp(0.0, 1.0)

@@ -86,3 +86,7 @@ path = "../../examples/shogi_layerstack_eval.rs"
 [[example]]
 name = "shogi_bucket_survey"
 path = "../../examples/shogi_bucket_survey.rs"
+
+[[example]]
+name = "shogi_progress_kpabs_train"
+path = "../../examples/shogi_progress_kpabs_train.rs"

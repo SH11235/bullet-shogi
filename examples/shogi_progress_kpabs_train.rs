@@ -226,10 +226,11 @@ fn collect_pack_infos(spec: &str) -> io::Result<Vec<PackInfo>> {
         })?;
 
         if meta.is_file() {
-            if path.extension().and_then(|s| s.to_str()) == Some("bin") {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext == "bin" || ext == "pack" {
                 paths.push(path);
             } else {
-                eprintln!("Ignoring non-bin file: {}", path.display());
+                eprintln!("Ignoring unsupported file: {}", path.display());
             }
             continue;
         }
@@ -242,7 +243,8 @@ fn collect_pack_infos(spec: &str) -> io::Result<Vec<PackInfo>> {
                 if !entry.file_type()?.is_file() {
                     continue;
                 }
-                if entry_path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                let ext = entry_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if ext == "bin" || ext == "pack" {
                     dir_paths.push(entry_path);
                 }
             }
@@ -270,7 +272,7 @@ fn collect_pack_infos(spec: &str) -> io::Result<Vec<PackInfo>> {
     if packs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "no valid *.bin packs were found from --data",
+            "no valid *.bin or *.pack files were found from --data",
         ));
     }
 

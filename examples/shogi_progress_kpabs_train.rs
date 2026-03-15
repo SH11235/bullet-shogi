@@ -1,16 +1,19 @@
 /*
-Approximate KP-absolute progress trainer from shuffled PackedSfenValue packs.
+KP-absolute progress trainer: learns a YaneuraOu-compatible `progress.bin`
+for LayerStack bucket selection (`--bucket-mode progress8kpabs`).
 
-This utility trains a YaneuraOu-compatible `progress.bin` using `game_ply` as a
-proxy target:
+See examples/shogi_progress_kpabs_train.md for full documentation.
 
-    y = clamp((game_ply - 1) / (ply_max - 1), 0, 1)
-
-The learned model matches `progress8kpabs` inference:
-
+Model:
     z = sum(weights[kp_abs_index])
     p = sigmoid(z)
     bucket = min(7, floor(p * 8))
+
+Two modes:
+  - Default (approximate): y = clamp((game_ply - 1) / (ply_max - 1), 0, 1)
+    Works with shuffled data.
+  - --game-relative (recommended): y = game_ply / total_ply
+    Requires game-order-preserved data. Detects game boundaries by game_ply decrease.
 */
 
 use std::{

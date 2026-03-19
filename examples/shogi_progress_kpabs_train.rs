@@ -78,8 +78,21 @@ struct Args {
     /// Use game-relative progress target: y = game_ply / total_ply_of_game.
     /// Requires game-order-preserved (non-shuffled) pack data.
     /// Game boundaries are detected by game_ply decreasing.
+    /// Uses per-game batching (1 game = 1 gradient step) and file-streaming (no 2-pass).
     #[arg(long)]
     game_relative: bool,
+
+    /// Maximum number of games for training (game-relative mode only, 0=unlimited)
+    #[arg(long, default_value_t = 0)]
+    max_games: usize,
+
+    /// Number of validation games (game-relative mode only, 0=auto 5% of files)
+    #[arg(long, default_value_t = 0)]
+    val_games: usize,
+
+    /// Progress report interval in games (game-relative mode only)
+    #[arg(long, default_value_t = 1000)]
+    log_interval_games: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -122,12 +135,7 @@ struct AdamState {
 
 impl AdamState {
     fn new(size: usize) -> Self {
-        Self {
-            m: vec![0.0; size],
-            v: vec![0.0; size],
-            beta1_pow: 1.0,
-            beta2_pow: 1.0,
-        }
+        Self { m: vec![0.0; size], v: vec![0.0; size], beta1_pow: 1.0, beta2_pow: 1.0 }
     }
 
     fn step(&mut self, weights: &mut [f32], grad: &[f32], lr: f32) {
@@ -136,11 +144,7 @@ impl AdamState {
         let bias_correction1 = 1.0 - self.beta1_pow;
         let bias_correction2 = 1.0 - self.beta2_pow;
 
-        for ((w, m), (v, &g)) in weights
-            .iter_mut()
-            .zip(self.m.iter_mut())
-            .zip(self.v.iter_mut().zip(grad.iter()))
-        {
+        for ((w, m), (v, &g)) in weights.iter_mut().zip(self.m.iter_mut()).zip(self.v.iter_mut().zip(grad.iter())) {
             *m = ADAM_BETA1 * *m + (1.0 - ADAM_BETA1) * g;
             *v = ADAM_BETA2 * *v + (1.0 - ADAM_BETA2) * g * g;
 
@@ -155,10 +159,7 @@ impl PackCursor {
     fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let records = file.metadata()?.len() / PACK_RECORD_BYTES as u64;
-        Ok(Self {
-            reader: BufReader::new(file),
-            remaining_records: records,
-        })
+        Ok(Self { reader: BufReader::new(file), remaining_records: records })
     }
 
     fn next_psv(&mut self) -> io::Result<Option<PackedSfenValue>> {
@@ -291,9 +292,7 @@ fn pack_group_key(path: &Path) -> String {
         return "shuffled".to_string();
     }
 
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .map_or_else(|| "unknown".to_string(), |s| s.to_string())
+    path.file_stem().and_then(|s| s.to_str()).map_or_else(|| "unknown".to_string(), |s| s.to_string())
 }
 
 fn interleave_pack_groups(packs: Vec<PackInfo>) -> Vec<PackInfo> {
@@ -320,61 +319,215 @@ fn interleave_pack_groups(packs: Vec<PackInfo>) -> Vec<PackInfo> {
     out
 }
 
-/// game-relative モード用: 対局順保持データから各レコードの total_ply を事前計算する。
-///
-/// 対局境界の検出: game_ply が前のレコードの game_ply 以下になったら新しい対局の開始とみなす。
-/// 各対局のレコードは先読みして total_ply（最大 game_ply）を取得し、全レコード分のマップを返す。
-fn build_game_relative_targets(packs: &[PackInfo]) -> io::Result<Vec<f32>> {
-    // 1st pass: 全レコードの game_ply を読み込み
-    let mut all_plies: Vec<u16> = Vec::new();
-    for pack in packs {
-        let mut cursor = PackCursor::open(&pack.path)?;
-        while let Some(psv) = cursor.next_psv()? {
-            all_plies.push(psv.game_ply());
+/// ファイルから対局単位でレコードを返すイテレータ。
+/// 対局境界は game_ply が前のレコード以下になったら新対局と判定。
+struct GameIterator {
+    cursor: PackCursor,
+    buffer: Vec<PackedSfenValue>,
+    prev_ply: Option<u16>,
+    done: bool,
+}
+
+impl GameIterator {
+    fn new(cursor: PackCursor) -> Self {
+        Self { cursor, buffer: Vec::new(), prev_ply: None, done: false }
+    }
+
+    /// 次の対局のレコード列を返す。None = ファイル終端。
+    fn next_game(&mut self) -> io::Result<Option<Vec<PackedSfenValue>>> {
+        if self.done {
+            return Ok(None);
         }
-    }
 
-    if all_plies.is_empty() {
-        return Ok(Vec::new());
-    }
+        loop {
+            match self.cursor.next_psv()? {
+                Some(psv) => {
+                    let ply = psv.game_ply();
+                    let is_boundary = self.prev_ply.is_some_and(|prev| ply <= prev);
+                    self.prev_ply = Some(ply);
 
-    // 2nd pass: 対局境界を検出して各レコードの教師値を計算
-    // game_ply が前のレコード以下になったら新対局
-    let mut targets = Vec::with_capacity(all_plies.len());
+                    if is_boundary && !self.buffer.is_empty() {
+                        // 前の対局を返し、新しい対局をバッファに開始
+                        let game = std::mem::take(&mut self.buffer);
+                        self.buffer.push(psv);
+                        return Ok(Some(game));
+                    }
 
-    let mut game_start = 0usize;
-    for i in 1..=all_plies.len() {
-        let is_boundary = i == all_plies.len() || all_plies[i] <= all_plies[i - 1];
-        if is_boundary {
-            // game_start..i が1つの対局
-            let total_ply = all_plies[game_start..i].iter().copied().max().unwrap_or(1).max(1);
-            for j in game_start..i {
-                let y = all_plies[j] as f32 / total_ply as f32;
-                targets.push(y.clamp(0.0, 1.0));
+                    self.buffer.push(psv);
+                }
+                None => {
+                    self.done = true;
+                    if !self.buffer.is_empty() {
+                        return Ok(Some(std::mem::take(&mut self.buffer)));
+                    }
+                    return Ok(None);
+                }
             }
-            game_start = i;
+        }
+    }
+}
+
+/// 全ファイルを順次走査して対局を返すイテレータ。
+struct MultiFileGameIterator {
+    packs: Vec<PackInfo>,
+    file_index: usize,
+    current: Option<GameIterator>,
+}
+
+impl MultiFileGameIterator {
+    fn new(packs: Vec<PackInfo>) -> Self {
+        Self { packs, file_index: 0, current: None }
+    }
+
+    fn next_game(&mut self) -> io::Result<Option<Vec<PackedSfenValue>>> {
+        loop {
+            if let Some(ref mut gi) = self.current {
+                if let Some(game) = gi.next_game()? {
+                    return Ok(Some(game));
+                }
+            }
+            // 次のファイルへ
+            if self.file_index >= self.packs.len() {
+                return Ok(None);
+            }
+            let cursor = PackCursor::open(&self.packs[self.file_index].path)?;
+            self.current = Some(GameIterator::new(cursor));
+            self.file_index += 1;
         }
     }
 
-    // 対局数と分布の概要を表示
-    let num_games = {
-        let mut count = 1usize;
-        for i in 1..all_plies.len() {
-            if all_plies[i] <= all_plies[i - 1] {
-                count += 1;
-            }
-        }
-        count
-    };
-    let avg_ply = all_plies.len() as f64 / num_games as f64;
-    println!(
-        "game-relative: {} records, {} games detected, avg {:.1} ply/game",
-        all_plies.len(),
-        num_games,
-        avg_ply
-    );
+    fn file_index(&self) -> usize {
+        self.file_index
+    }
 
-    Ok(targets)
+    fn file_count(&self) -> usize {
+        self.packs.len()
+    }
+}
+
+/// game-relative モードの 1 epoch 学習 (対局単位バッチ、ファイル単位ストリーム)
+fn train_epoch_game_relative(
+    weights: &mut [f32],
+    adam: &mut AdamState,
+    packs: &[PackInfo],
+    lr: f32,
+    max_games: usize,
+    log_interval: usize,
+    epoch: usize,
+) -> io::Result<EpochStats> {
+    let mut iter = MultiFileGameIterator::new(packs.to_vec());
+    let mut grad = vec![0.0f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+    let mut active = Vec::with_capacity(96);
+    let mut hist = [0usize; 8];
+    let mut loss_sum = 0.0f64;
+    let mut samples = 0usize;
+    let mut games = 0usize;
+
+    while max_games == 0 || games < max_games {
+        let Some(game) = iter.next_game()? else {
+            break;
+        };
+
+        let game_len = game.len();
+        if game_len == 0 {
+            continue;
+        }
+
+        // 対局単位で勾配を蓄積
+        grad.fill(0.0);
+        let mut game_loss = 0.0f64;
+
+        for (i, psv) in game.iter().enumerate() {
+            // 教師値: linspace(0, 1, game_len)
+            let y = if game_len == 1 { 0.0f32 } else { i as f32 / (game_len - 1) as f32 };
+
+            ShogiProgressKPAbs::collect_active_indices(psv, &mut active);
+
+            let mut z = 0.0f32;
+            for &idx in &active {
+                z += weights[idx];
+            }
+            let p = sigmoid(z);
+            let err = p - y;
+            let grad_scale = 2.0 * err * p * (1.0 - p);
+
+            for &idx in &active {
+                grad[idx] += grad_scale;
+            }
+
+            game_loss += f64::from(err * err);
+            hist[progress_bucket(p)] += 1;
+        }
+
+        // 対局内の局面数で正規化して Adam 更新
+        let inv_len = 1.0 / game_len as f32;
+        for g in &mut grad {
+            *g *= inv_len;
+        }
+        adam.step(weights, &grad, lr);
+
+        loss_sum += game_loss;
+        samples += game_len;
+        games += 1;
+
+        if log_interval > 0 && games % log_interval == 0 {
+            println!(
+                "epoch {} file {}/{} games {} samples {} avg_loss {:.6} last_game_loss {:.6}",
+                epoch,
+                iter.file_index(),
+                iter.file_count(),
+                games,
+                samples,
+                loss_sum / samples as f64,
+                game_loss / game_len as f64,
+            );
+        }
+    }
+
+    Ok(EpochStats {
+        samples,
+        batches: games,
+        mean_loss: if samples > 0 { loss_sum / samples as f64 } else { 0.0 },
+        bucket_hist: hist,
+    })
+}
+
+/// game-relative モードの検証
+fn evaluate_game_relative(weights: &[f32], packs: &[PackInfo], max_games: usize) -> io::Result<EvalStats> {
+    let mut iter = MultiFileGameIterator::new(packs.to_vec());
+    let mut active = Vec::with_capacity(96);
+    let mut hist = [0usize; 8];
+    let mut loss_sum = 0.0f64;
+    let mut samples = 0usize;
+    let mut games = 0usize;
+
+    while max_games == 0 || games < max_games {
+        let Some(game) = iter.next_game()? else {
+            break;
+        };
+        let game_len = game.len();
+        if game_len == 0 {
+            continue;
+        }
+
+        for (i, psv) in game.iter().enumerate() {
+            let y = if game_len == 1 { 0.0f32 } else { i as f32 / (game_len - 1) as f32 };
+            ShogiProgressKPAbs::collect_active_indices(psv, &mut active);
+            let mut z = 0.0f32;
+            for &idx in &active {
+                z += weights[idx];
+            }
+            let p = sigmoid(z);
+            let err = p - y;
+            loss_sum += f64::from(err * err);
+            hist[progress_bucket(p)] += 1;
+        }
+
+        samples += game_len;
+        games += 1;
+    }
+
+    Ok(EvalStats { samples, mean_loss: if samples > 0 { loss_sum / samples as f64 } else { 0.0 }, bucket_hist: hist })
 }
 
 fn progress_target_from_ply(game_ply: u16, ply_max: u16) -> f32 {
@@ -425,11 +578,7 @@ fn evaluate(
     game_relative_targets: Option<&[f32]>,
 ) -> io::Result<EvalStats> {
     if val_positions == 0 {
-        return Ok(EvalStats {
-            samples: 0,
-            mean_loss: 0.0,
-            bucket_hist: [0; 8],
-        });
+        return Ok(EvalStats { samples: 0, mean_loss: 0.0, bucket_hist: [0; 8] });
     }
 
     let mut stream = RoundRobinPackStream::open(packs)?;
@@ -461,11 +610,7 @@ fn evaluate(
         samples += 1;
     }
 
-    Ok(EvalStats {
-        samples,
-        mean_loss: if samples > 0 { loss_sum / samples as f64 } else { 0.0 },
-        bucket_hist: hist,
-    })
+    Ok(EvalStats { samples, mean_loss: if samples > 0 { loss_sum / samples as f64 } else { 0.0 }, bucket_hist: hist })
 }
 
 fn train_epoch(
@@ -486,13 +631,8 @@ fn train_epoch(
     }
 
     // game-relative の場合、val_positions 分だけオフセットした教師値を使う
-    let train_targets = game_relative_targets.map(|t| {
-        if args.val_positions < t.len() {
-            &t[args.val_positions..]
-        } else {
-            &t[t.len()..]
-        }
-    });
+    let train_targets = game_relative_targets
+        .map(|t| if args.val_positions < t.len() { &t[args.val_positions..] } else { &t[t.len()..] });
 
     let mut grad = vec![0.0f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
     let mut active = Vec::with_capacity(96);
@@ -615,16 +755,27 @@ fn main() -> io::Result<()> {
     let mut weights = vec![0.0f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
     let mut adam = AdamState::new(SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS);
 
-    // game-relative モード: 事前に教師値を計算
-    let game_relative_targets = if args.game_relative {
-        Some(build_game_relative_targets(&packs)?)
-    } else {
-        None
-    };
-    let gr_ref = game_relative_targets.as_deref();
+    if args.game_relative {
+        // === game-relative モード ===
+        // ファイル単位ストリーム + 対局単位バッチ (2-pass 不要)
 
-    if args.val_positions > 0 {
-        let baseline = evaluate(&weights, &packs, args.val_positions, args.ply_max, gr_ref)?;
+        // train/val ファイル分割
+        let split = if args.val_games > 0 || packs.len() < 20 {
+            // val_games 指定時 or ファイル少数時: 先頭 5% を val に
+            packs.len().max(2) / 20
+        } else {
+            packs.len() / 20
+        }
+        .max(1)
+        .min(packs.len() - 1);
+
+        let val_packs = packs[..split].to_vec();
+        let train_packs = packs[split..].to_vec();
+        println!("game-relative mode: {} train files, {} val files", train_packs.len(), val_packs.len());
+
+        // baseline
+        let val_max_games = if args.val_games > 0 { args.val_games } else { 5000 };
+        let baseline = evaluate_game_relative(&weights, &val_packs, val_max_games)?;
         println!(
             "baseline val_loss {:.6} samples {} top_bucket b{} ({:.2}%)",
             baseline.mean_loss,
@@ -632,23 +783,29 @@ fn main() -> io::Result<()> {
             top_bucket_info(&baseline.bucket_hist).0,
             top_bucket_info(&baseline.bucket_hist).1 * 100.0
         );
-    }
 
-    for epoch in 1..=args.epochs {
-        let train = train_epoch(&mut weights, &mut adam, &packs, &args, epoch, gr_ref)?;
-        let (train_top_bucket, train_top_share) = top_bucket_info(&train.bucket_hist);
-        println!(
-            "epoch {} train_loss {:.6} samples {} batches {} top_bucket b{} ({:.2}%)",
-            epoch,
-            train.mean_loss,
-            train.samples,
-            train.batches,
-            train_top_bucket,
-            train_top_share * 100.0
-        );
+        for epoch in 1..=args.epochs {
+            let train = train_epoch_game_relative(
+                &mut weights,
+                &mut adam,
+                &train_packs,
+                args.lr,
+                args.max_games,
+                args.log_interval_games,
+                epoch,
+            )?;
+            let (train_top_bucket, train_top_share) = top_bucket_info(&train.bucket_hist);
+            println!(
+                "epoch {} train_loss {:.6} samples {} games {} top_bucket b{} ({:.2}%)",
+                epoch,
+                train.mean_loss,
+                train.samples,
+                train.batches,
+                train_top_bucket,
+                train_top_share * 100.0
+            );
 
-        if args.val_positions > 0 {
-            let val = evaluate(&weights, &packs, args.val_positions, args.ply_max, gr_ref)?;
+            let val = evaluate_game_relative(&weights, &val_packs, val_max_games)?;
             let (val_top_bucket, val_top_share) = top_bucket_info(&val.bucket_hist);
             println!(
                 "epoch {} val_loss {:.6} samples {} top_bucket b{} ({:.2}%)",
@@ -659,16 +816,51 @@ fn main() -> io::Result<()> {
                 val_top_share * 100.0
             );
         }
+    } else {
+        // === 近似版モード (従来通り) ===
+
+        if args.val_positions > 0 {
+            let baseline = evaluate(&weights, &packs, args.val_positions, args.ply_max, None)?;
+            println!(
+                "baseline val_loss {:.6} samples {} top_bucket b{} ({:.2}%)",
+                baseline.mean_loss,
+                baseline.samples,
+                top_bucket_info(&baseline.bucket_hist).0,
+                top_bucket_info(&baseline.bucket_hist).1 * 100.0
+            );
+        }
+
+        for epoch in 1..=args.epochs {
+            let train = train_epoch(&mut weights, &mut adam, &packs, &args, epoch, None)?;
+            let (train_top_bucket, train_top_share) = top_bucket_info(&train.bucket_hist);
+            println!(
+                "epoch {} train_loss {:.6} samples {} batches {} top_bucket b{} ({:.2}%)",
+                epoch,
+                train.mean_loss,
+                train.samples,
+                train.batches,
+                train_top_bucket,
+                train_top_share * 100.0
+            );
+
+            if args.val_positions > 0 {
+                let val = evaluate(&weights, &packs, args.val_positions, args.ply_max, None)?;
+                let (val_top_bucket, val_top_share) = top_bucket_info(&val.bucket_hist);
+                println!(
+                    "epoch {} val_loss {:.6} samples {} top_bucket b{} ({:.2}%)",
+                    epoch,
+                    val.mean_loss,
+                    val.samples,
+                    val_top_bucket,
+                    val_top_share * 100.0
+                );
+            }
+        }
     }
 
     write_progress_bin(&args.output, &weights)?;
     let bytes = fs::metadata(&args.output)?.len();
-    println!(
-        "Wrote {} weights to {} ({} bytes)",
-        SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-        args.output.display(),
-        bytes
-    );
+    println!("Wrote {} weights to {} ({} bytes)", SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, args.output.display(), bytes);
 
     Ok(())
 }

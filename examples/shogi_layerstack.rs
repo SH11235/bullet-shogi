@@ -840,7 +840,13 @@ fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32
 /// LayerStack 量子化出力の SavedFormat を構築する
 ///
 /// rshogi NetworkLayerStacks::read() と完全互換のバイナリを生成。
-fn build_layerstack_save_format(input_size: usize, ft_out: usize, l1_out: usize, l2_out: usize, fv_scale: i32) -> Vec<SavedFormat> {
+fn build_layerstack_save_format(
+    input_size: usize,
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    fv_scale: i32,
+) -> Vec<SavedFormat> {
     use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
 
     let l1_effective = l1_out - 1; // skip connection 分を除く

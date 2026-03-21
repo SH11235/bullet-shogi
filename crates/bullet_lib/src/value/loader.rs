@@ -2,12 +2,14 @@ mod direct;
 mod montybinpack;
 mod rng;
 mod sfbinpack;
+pub mod shogipack;
 mod text;
 pub mod viribinpack;
 
 pub use direct::{CanBeDirectlySequentiallyLoaded, DirectSequentialDataLoader};
 pub use montybinpack::MontyBinpackLoader;
 pub use sfbinpack::SfBinpackLoader;
+pub use shogipack::ShogiPackLoader;
 pub use text::InMemoryTextLoader;
 pub use viribinpack::ViriBinpackLoader;
 

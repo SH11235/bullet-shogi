@@ -35,7 +35,7 @@ Options:
     --file-shuffle-seed <SEED> Seed for epoch file shuffle
 */
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
     game::inputs::{ShogiHalfKA_hm, SparseInputType},
@@ -45,7 +45,7 @@ use bullet_lib::{
         ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
     },
     nn::{
-        Affine, InitSettings, Shape,
+        Affine, BackendMarker, InitSettings, NetworkBuilderNode, Shape,
         optimiser::{self, AdamWParams, RAdamParams, RangerParams},
     },
     trainer::{
@@ -65,6 +65,14 @@ use serde::{Deserialize, Serialize};
 const NUM_BUCKETS: usize = 9;
 const QA: i16 = 127;
 const QB: i16 = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct WrmLossParams {
+    nnue2score: f32,
+    in_scaling: f32,
+}
+
+static WRM_LOSS_PARAMS: OnceLock<WrmLossParams> = OnceLock::new();
 
 // =============================================================================
 // CLI Arguments
@@ -206,6 +214,13 @@ struct Args {
     #[arg(long)]
     win_rate_model: bool,
 
+    /// Apply WRM to network output in loss (nnue-pytorch-nodchip style).
+    /// Value is the in_scaling parameter (nodchip default: 340).
+    /// Requires --win-rate-model. When set, loss becomes |WRM_in(net) - WRM_out(target)|^2
+    /// instead of |sigmoid(net) - WRM_out(target)|^2.
+    #[arg(long, requires = "win_rate_model")]
+    wrm_in_scaling: Option<f32>,
+
     /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
     bucket_mode: BucketMode,
@@ -303,6 +318,15 @@ impl Args {
 
     fn interleave_batches_value(&self) -> Option<usize> {
         if self.interleave_file_batches == 0 { None } else { Some(self.interleave_file_batches) }
+    }
+
+    fn validate_wrm_settings(&self) -> Result<(), String> {
+        if let Some(in_scaling) = self.wrm_in_scaling {
+            if !in_scaling.is_finite() || in_scaling <= 0.0 {
+                return Err(format!("--wrm-in-scaling must be a positive finite value (got {})", in_scaling));
+            }
+        }
+        Ok(())
     }
 
     fn parse_ply_bounds_csv(text: &str) -> Result<[u16; 8], String> {
@@ -1077,6 +1101,10 @@ fn build_layerstack_save_format(
 
 fn main() {
     let args = Args::parse();
+    args.validate_wrm_settings().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
     let ply_bounds = args.resolved_ply_bounds().unwrap_or_else(|e| {
         eprintln!("ERROR: {}", e);
         std::process::exit(1);
@@ -1121,6 +1149,9 @@ fn main() {
     println!("Optimizer: {}", optimizer_name);
     println!("Weight decay: {}", args.weight_decay);
     println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
+    if let Some(in_scaling) = args.wrm_in_scaling {
+        println!("WRM in_scaling: {} (network output WRM enabled)", in_scaling);
+    }
     let batches_per_superbatch_display =
         args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
     let positions_per_superbatch = batches_per_superbatch_display as u64 * args.batch_size as u64;
@@ -1269,6 +1300,34 @@ fn main() {
         },
     };
 
+    type Nbn<'a> = NetworkBuilderNode<'a, BackendMarker>;
+
+    /// Loss function: WRM applied to network output (nodchip style).
+    fn loss_fn_wrm<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
+        let params =
+            *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
+        let offset = 270.0f32;
+        let scorenet = output * params.nnue2score;
+        let q = ((scorenet.copy() - offset) / params.in_scaling).sigmoid();
+        let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
+        let qf = (1.0 + q - qm) * 0.5;
+        qf.squared_error(target)
+    }
+
+    /// Loss function: standard sigmoid
+    fn loss_fn_sigmoid<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
+        output.sigmoid().squared_error(target)
+    }
+
+    let loss_fn: for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a> = if let Some(in_scaling) = args.wrm_in_scaling {
+        WRM_LOSS_PARAMS
+            .set(WrmLossParams { nnue2score: args.scale as f32, in_scaling })
+            .expect("WRM loss parameters should only be initialized once");
+        loss_fn_wrm
+    } else {
+        loss_fn_sigmoid
+    };
+
     macro_rules! build_trainer {
         ($opt:expr, $use_win_rate:expr, $bucket_impl:expr) => {{
             let mut builder = ValueTrainerBuilder::default()
@@ -1277,7 +1336,7 @@ fn main() {
                 .inputs(ShogiHalfKA_hm)
                 .output_buckets($bucket_impl)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+                .loss_fn(loss_fn);
             #[cfg(feature = "cpu")]
             {
                 builder = builder.use_threads(1);

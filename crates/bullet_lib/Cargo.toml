@@ -90,3 +90,27 @@ path = "../../examples/shogi_bucket_survey.rs"
 [[example]]
 name = "shogi_progress_kpabs_train"
 path = "../../examples/shogi_progress_kpabs_train.rs"
+
+[[example]]
+name = "compare_progress_buckets"
+path = "../../examples/compare_progress_buckets.rs"
+
+[[example]]
+name = "merge_scores"
+path = "../../examples/merge_scores.rs"
+
+[[example]]
+name = "compilation"
+path = "../../examples/extra/compilation.rs"
+
+[[example]]
+name = "custom_pass"
+path = "../../examples/extra/custom_pass.rs"
+
+[[example]]
+name = "scan_bad_records"
+path = "../../examples/scan_bad_records.rs"
+
+[[example]]
+name = "recover_experiment"
+path = "../../examples/recover_experiment.rs"

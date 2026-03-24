@@ -26,6 +26,9 @@ pub struct LocalSettings<'a> {
     /// Number of batches that the dataloader can prepare and put in a queue before
     /// they are processed in training.
     pub batch_queue_size: usize,
+    /// Optional callback invoked after each checkpoint save.
+    /// Receives the current superbatch number.
+    pub on_checkpoint_saved: Option<&'a dyn Fn(usize)>,
 }
 
 impl LocalSettings<'_> {

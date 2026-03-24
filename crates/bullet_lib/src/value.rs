@@ -184,6 +184,10 @@ where
                     save::write_losses(&format!("{path}/log.txt"), &error_record.borrow());
 
                     println!("Saved [{}]", logger::ansi(name, 31));
+
+                    if let Some(ref callback) = settings.on_checkpoint_saved {
+                        callback(superbatch);
+                    }
                 }
             },
         )

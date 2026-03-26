@@ -221,6 +221,13 @@ struct Args {
     #[arg(long, requires = "win_rate_model")]
     wrm_in_scaling: Option<f32>,
 
+    /// Scaling factor to convert network output to centipawn score for WRM loss.
+    /// Only used when --wrm-in-scaling is set. The raw network output is multiplied
+    /// by this value before being passed to the WRM function.
+    /// (nnue-pytorch-nodchip default: 600)
+    #[arg(long, default_value_t = 600.0, requires = "wrm_in_scaling")]
+    wrm_nnue2score: f32,
+
     /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
     bucket_mode: BucketMode,
@@ -324,6 +331,9 @@ impl Args {
         if let Some(in_scaling) = self.wrm_in_scaling {
             if !in_scaling.is_finite() || in_scaling <= 0.0 {
                 return Err(format!("--wrm-in-scaling must be a positive finite value (got {})", in_scaling));
+            }
+            if !self.wrm_nnue2score.is_finite() || self.wrm_nnue2score <= 0.0 {
+                return Err(format!("--wrm-nnue2score must be a positive finite value (got {})", self.wrm_nnue2score));
             }
         }
         Ok(())
@@ -1219,7 +1229,7 @@ fn main() {
     println!("Weight decay: {}", args.weight_decay);
     println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
     if let Some(in_scaling) = args.wrm_in_scaling {
-        println!("WRM in_scaling: {} (network output WRM enabled)", in_scaling);
+        println!("WRM in_scaling: {} nnue2score: {} (network output WRM enabled)", in_scaling, args.wrm_nnue2score);
     }
     let batches_per_superbatch_display =
         args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
@@ -1396,7 +1406,7 @@ fn main() {
 
     let loss_fn: for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a> = if let Some(in_scaling) = args.wrm_in_scaling {
         WRM_LOSS_PARAMS
-            .set(WrmLossParams { nnue2score: args.scale as f32, in_scaling })
+            .set(WrmLossParams { nnue2score: args.wrm_nnue2score, in_scaling })
             .expect("WRM loss parameters should only be initialized once");
         loss_fn_wrm
     } else {

@@ -30,7 +30,7 @@ struct Args {
     #[arg(long)]
     name: Option<String>,
 
-    /// アーキテクチャ名 (e.g. "LayerStack-1536x2-16-32")
+    /// アーキテクチャ名 (e.g. "LayerStack-1536-16-32")
     #[arg(long)]
     architecture: Option<String>,
 

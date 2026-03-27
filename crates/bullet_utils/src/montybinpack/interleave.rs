@@ -50,7 +50,7 @@ impl InterleaveOptions {
         while remaining > 0 {
             let mut spot = rng.rand() % remaining;
             let mut idx = 0;
-            while streams[idx].0 < spot {
+            while spot >= streams[idx].0 {
                 spot -= streams[idx].0;
                 idx += 1;
             }

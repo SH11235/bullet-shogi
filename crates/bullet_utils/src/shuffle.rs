@@ -1,15 +1,18 @@
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufReader, IoSliceMut, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use bulletformat::ChessBoard;
 use structopt::StructOpt;
 
-use crate::{Rand, interleave::InterleaveOptions};
+use crate::{
+    Rand,
+    interleave::{InterleaveMode, InterleaveOptions},
+};
 
 #[derive(StructOpt)]
 pub struct ShuffleOptions {
@@ -19,6 +22,12 @@ pub struct ShuffleOptions {
     pub output: PathBuf,
     #[structopt(required = true, short, long)]
     pub mem_used_mb: usize,
+    #[structopt(long, default_value = "block", parse(try_from_str))]
+    pub interleave_mode: InterleaveMode,
+    #[structopt(long, default_value = "8")]
+    pub interleave_block_mb: usize,
+    #[structopt(long)]
+    pub seed: Option<u64>,
 }
 
 const CHESS_BOARD_SIZE: usize = std::mem::size_of::<ChessBoard>();
@@ -31,17 +40,21 @@ impl ShuffleOptions {
         let input_size = fs::metadata(self.input.clone()).with_context(|| "Input file is invalid.")?.len() as usize;
         assert_eq!(0, input_size % CHESS_BOARD_SIZE);
 
+        let bytes_used = self.mem_used_mb.checked_mul(BYTES_PER_MB).context("memory limit overflow")?;
+        ensure!(bytes_used > 0, "mem_used_mb must be at least 1");
+
         // Test path before doing useless work
         validate_output_path(Path::new(&self.output))
             .with_context(|| format!("Invalid output path: {}", self.output.display()))?;
 
         println!("# [Shuffling Data]");
         let time = Instant::now();
+        let base_seed = self.seed.unwrap_or_else(Rand::random_seed);
 
-        if input_size <= self.mem_used_mb * BYTES_PER_MB {
+        if input_size <= bytes_used {
             let mut raw_bytes = std::fs::read(&self.input).with_context(|| "Failed to read input.")?;
 
-            shuffle_positions(&mut raw_bytes);
+            shuffle_positions(&mut raw_bytes, Rand::derive_seed(base_seed, 1));
 
             let mut file = File::create(&self.output).with_context(|| "Provide a correct path!")?;
             file.write_all(&raw_bytes)?;
@@ -50,7 +63,6 @@ impl ShuffleOptions {
             if !Path::exists(temp_dir) {
                 fs::create_dir(temp_dir).with_context(|| "Temp dir could not be created.")?;
             }
-            let bytes_used = self.mem_used_mb * BYTES_PER_MB;
             let num_tmp_files = input_size.div_ceil(bytes_used).max(MIN_TMP_FILES);
             let temp_files = (0..num_tmp_files)
                 .map(|idx| {
@@ -63,10 +75,17 @@ impl ShuffleOptions {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            assert!(self.split_file(&temp_files, input_size).is_ok());
+            self.split_file(&temp_files, input_size, base_seed)?;
 
             println!("# [Finished splitting data. Interleaving...]");
-            let interleave = InterleaveOptions::new(temp_files.to_vec(), self.output.clone());
+            let interleave_seed = Rand::derive_seed(base_seed, temp_files.len() as u64 + 1);
+            let interleave = InterleaveOptions::new(
+                temp_files.to_vec(),
+                self.output.clone(),
+                self.interleave_mode,
+                self.interleave_block_mb,
+                Some(interleave_seed),
+            );
             interleave.run()?;
 
             if fs::remove_dir_all(temp_dir).is_err() {
@@ -79,7 +98,7 @@ impl ShuffleOptions {
         Ok(())
     }
 
-    fn split_file(&self, temp_files: &[PathBuf], input_size: usize) -> anyhow::Result<()> {
+    fn split_file(&self, temp_files: &[PathBuf], input_size: usize, base_seed: u64) -> anyhow::Result<()> {
         let mut input = BufReader::new(File::open(self.input.clone()).with_context(|| "Failed to open file.")?);
         let temp_files = temp_files
             .iter()
@@ -102,7 +121,6 @@ impl ShuffleOptions {
             let mut buffer = vec![0u8; buffer_size];
 
             // performs better than a read_exact
-
             let chunk_size = 1024 * 1024;
             let mut offset = 0;
 
@@ -121,35 +139,79 @@ impl ShuffleOptions {
 
             println!("    -> Shuffling in memory");
 
-            shuffle_positions(&mut buffer[0..buffer_size]);
+            shuffle_positions(&mut buffer[..buffer_size], Rand::derive_seed(base_seed, idx as u64 + 1));
 
             println!("    -> Writing to temp file");
-            file.write_all(&buffer[0..buffer_size])?;
+            file.write_all(&buffer[..buffer_size])?;
         }
 
         Ok(())
     }
 }
 
-fn shuffle_positions(data: &mut [u8]) {
+fn shuffle_positions(data: &mut [u8], seed: u64) {
     assert_eq!(data.len() % CHESS_BOARD_SIZE, 0);
 
     let len = data.len() / CHESS_BOARD_SIZE;
+    let mut rng = Rand::with_seed(seed);
 
-    let mut rng = Rand::default();
+    let records = unsafe {
+        // SAFETY: `[u8; CHESS_BOARD_SIZE]` has alignment 1, and `data.len()` is a multiple
+        // of `CHESS_BOARD_SIZE`, so the slice can be reinterpreted as fixed-size records.
+        std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<[u8; CHESS_BOARD_SIZE]>(), len)
+    };
 
     for i in (0..len).rev() {
         let idx = rng.rand() as usize % (i + 1);
-        for j in 0..CHESS_BOARD_SIZE {
-            data.swap(CHESS_BOARD_SIZE * idx + j, CHESS_BOARD_SIZE * i + j);
-        }
+        records.swap(idx, i);
     }
 }
 
 /// Test if we can write to the output path
 fn validate_output_path(path: &Path) -> anyhow::Result<()> {
-    match File::create(path) {
+    match OpenOptions::new().write(true).create(true).truncate(false).open(path) {
         Ok(_) => Ok(()),
         Err(e) => Err(anyhow::anyhow!("Cannot create file at specified path: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_records(values: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * CHESS_BOARD_SIZE);
+        for &value in values {
+            let mut record = [value; CHESS_BOARD_SIZE];
+            record[0] = value;
+            bytes.extend_from_slice(&record);
+        }
+        bytes
+    }
+
+    fn record_ids(data: &[u8]) -> Vec<u8> {
+        data.chunks_exact(CHESS_BOARD_SIZE).map(|chunk| chunk[0]).collect()
+    }
+
+    #[test]
+    fn shuffle_positions_is_reproducible() {
+        let mut a = make_records(&[1, 2, 3, 4, 5]);
+        let mut b = make_records(&[1, 2, 3, 4, 5]);
+
+        shuffle_positions(&mut a, 123);
+        shuffle_positions(&mut b, 123);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn shuffle_positions_preserves_all_records() {
+        let mut data = make_records(&[1, 2, 3, 4, 5]);
+
+        shuffle_positions(&mut data, 456);
+
+        let mut ids = record_ids(&data);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
     }
 }

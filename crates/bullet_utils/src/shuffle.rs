@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use bulletformat::ChessBoard;
 use structopt::StructOpt;
 
 use crate::{
@@ -28,17 +27,23 @@ pub struct ShuffleOptions {
     pub interleave_block_mb: usize,
     #[structopt(long)]
     pub seed: Option<u64>,
+    /// Record size in bytes (default: 32 for ChessBoard, use 40 for PackedSfenValue)
+    #[structopt(long, default_value = "32")]
+    pub record_size: usize,
 }
-
-const CHESS_BOARD_SIZE: usize = std::mem::size_of::<ChessBoard>();
 const MIN_TMP_FILES: usize = 4;
 const BYTES_PER_MB: usize = 1_048_576;
 const TMP_DIR: &str = "./tmp";
 
 impl ShuffleOptions {
     pub fn run(&self) -> anyhow::Result<()> {
+        let record_size = self.record_size;
+        ensure!(record_size > 0, "record_size must be at least 1");
         let input_size = fs::metadata(self.input.clone()).with_context(|| "Input file is invalid.")?.len() as usize;
-        assert_eq!(0, input_size % CHESS_BOARD_SIZE);
+        ensure!(
+            input_size % record_size == 0,
+            "Input file size ({input_size}) is not a multiple of record size ({record_size})"
+        );
 
         let bytes_used = self.mem_used_mb.checked_mul(BYTES_PER_MB).context("memory limit overflow")?;
         ensure!(bytes_used > 0, "mem_used_mb must be at least 1");
@@ -47,14 +52,14 @@ impl ShuffleOptions {
         validate_output_path(Path::new(&self.output))
             .with_context(|| format!("Invalid output path: {}", self.output.display()))?;
 
-        println!("# [Shuffling Data]");
+        println!("# [Shuffling Data] (record_size={})", record_size);
         let time = Instant::now();
         let base_seed = self.seed.unwrap_or_else(Rand::random_seed);
 
         if input_size <= bytes_used {
             let mut raw_bytes = std::fs::read(&self.input).with_context(|| "Failed to read input.")?;
 
-            shuffle_positions(&mut raw_bytes, Rand::derive_seed(base_seed, 1));
+            shuffle_positions(&mut raw_bytes, record_size, Rand::derive_seed(base_seed, 1));
 
             let mut file = File::create(&self.output).with_context(|| "Provide a correct path!")?;
             file.write_all(&raw_bytes)?;
@@ -85,6 +90,7 @@ impl ShuffleOptions {
                 self.interleave_mode,
                 self.interleave_block_mb,
                 Some(interleave_seed),
+                record_size,
             );
             interleave.run()?;
 
@@ -99,13 +105,14 @@ impl ShuffleOptions {
     }
 
     fn split_file(&self, temp_files: &[PathBuf], input_size: usize, base_seed: u64) -> anyhow::Result<()> {
+        let record_size = self.record_size;
         let mut input = BufReader::new(File::open(self.input.clone()).with_context(|| "Failed to open file.")?);
         let temp_files = temp_files
             .iter()
             .map(|f| File::create(f).with_context(|| "Tmp file could not be created."))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let total_positions = input_size / CHESS_BOARD_SIZE;
+        let total_positions = input_size / record_size;
         let ideal_positions_per_file = total_positions / temp_files.len();
         let mut positions_per_file = vec![ideal_positions_per_file; temp_files.len()];
         let remaining_positions = total_positions % temp_files.len();
@@ -117,7 +124,7 @@ impl ShuffleOptions {
             println!("# [Shuffling temp file {} / {}]", idx + 1, temp_files.len());
             println!("    -> Reading into ram");
 
-            let buffer_size = positions_per_file[idx] * CHESS_BOARD_SIZE;
+            let buffer_size = positions_per_file[idx] * record_size;
             let mut buffer = vec![0u8; buffer_size];
 
             // performs better than a read_exact
@@ -139,7 +146,7 @@ impl ShuffleOptions {
 
             println!("    -> Shuffling in memory");
 
-            shuffle_positions(&mut buffer[..buffer_size], Rand::derive_seed(base_seed, idx as u64 + 1));
+            shuffle_positions(&mut buffer[..buffer_size], record_size, Rand::derive_seed(base_seed, idx as u64 + 1));
 
             println!("    -> Writing to temp file");
             file.write_all(&buffer[..buffer_size])?;
@@ -149,21 +156,20 @@ impl ShuffleOptions {
     }
 }
 
-fn shuffle_positions(data: &mut [u8], seed: u64) {
-    assert_eq!(data.len() % CHESS_BOARD_SIZE, 0);
+fn shuffle_positions(data: &mut [u8], record_size: usize, seed: u64) {
+    assert_eq!(data.len() % record_size, 0);
 
-    let len = data.len() / CHESS_BOARD_SIZE;
+    let len = data.len() / record_size;
     let mut rng = Rand::with_seed(seed);
 
-    let records = unsafe {
-        // SAFETY: `[u8; CHESS_BOARD_SIZE]` has alignment 1, and `data.len()` is a multiple
-        // of `CHESS_BOARD_SIZE`, so the slice can be reinterpreted as fixed-size records.
-        std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<[u8; CHESS_BOARD_SIZE]>(), len)
-    };
-
-    for i in (0..len).rev() {
+    for i in (1..len).rev() {
         let idx = rng.rand() as usize % (i + 1);
-        records.swap(idx, i);
+        if idx != i {
+            // Swap records at positions idx and i
+            let (lo, hi) = if idx < i { (idx, i) } else { (i, idx) };
+            let (left, right) = data.split_at_mut(hi * record_size);
+            left[lo * record_size..lo * record_size + record_size].swap_with_slice(&mut right[..record_size]);
+        }
     }
 }
 
@@ -179,10 +185,12 @@ fn validate_output_path(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    const TEST_RECORD_SIZE: usize = 32;
+
     fn make_records(values: &[u8]) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(values.len() * CHESS_BOARD_SIZE);
+        let mut bytes = Vec::with_capacity(values.len() * TEST_RECORD_SIZE);
         for &value in values {
-            let mut record = [value; CHESS_BOARD_SIZE];
+            let mut record = [value; TEST_RECORD_SIZE];
             record[0] = value;
             bytes.extend_from_slice(&record);
         }
@@ -190,7 +198,7 @@ mod tests {
     }
 
     fn record_ids(data: &[u8]) -> Vec<u8> {
-        data.chunks_exact(CHESS_BOARD_SIZE).map(|chunk| chunk[0]).collect()
+        data.chunks_exact(TEST_RECORD_SIZE).map(|chunk| chunk[0]).collect()
     }
 
     #[test]
@@ -198,8 +206,8 @@ mod tests {
         let mut a = make_records(&[1, 2, 3, 4, 5]);
         let mut b = make_records(&[1, 2, 3, 4, 5]);
 
-        shuffle_positions(&mut a, 123);
-        shuffle_positions(&mut b, 123);
+        shuffle_positions(&mut a, TEST_RECORD_SIZE, 123);
+        shuffle_positions(&mut b, TEST_RECORD_SIZE, 123);
 
         assert_eq!(a, b);
     }
@@ -208,7 +216,7 @@ mod tests {
     fn shuffle_positions_preserves_all_records() {
         let mut data = make_records(&[1, 2, 3, 4, 5]);
 
-        shuffle_positions(&mut data, 456);
+        shuffle_positions(&mut data, TEST_RECORD_SIZE, 456);
 
         let mut ids = record_ids(&data);
         ids.sort_unstable();

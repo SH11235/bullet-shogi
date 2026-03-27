@@ -15,3 +15,8 @@
 *.binpack
 *.network
 logs
+
+docs/experiments
+yaneuraou/
+__pycache__
+scripts/

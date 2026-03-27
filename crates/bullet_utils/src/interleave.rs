@@ -9,7 +9,6 @@ use crate::Rand;
 use anyhow::{Context, ensure};
 use structopt::StructOpt;
 
-const SIZE: usize = 32;
 const BYTES_PER_MB: usize = 1_048_576;
 const PROGRESS_INTERVAL_RECORDS: usize = 1_048_576;
 
@@ -45,6 +44,9 @@ pub struct InterleaveOptions {
     pub block_mb: usize,
     #[structopt(long)]
     pub seed: Option<u64>,
+    /// Record size in bytes (default: 32)
+    #[structopt(long, default_value = "32")]
+    pub record_size: usize,
 }
 
 struct Stream {
@@ -67,22 +69,24 @@ impl InterleaveOptions {
         mode: InterleaveMode,
         block_mb: usize,
         seed: Option<u64>,
+        record_size: usize,
     ) -> Self {
-        Self { inputs, output, mode, block_mb, seed }
+        Self { inputs, output, mode, block_mb, seed, record_size }
     }
 
     fn run_record(&self, seed: u64) -> anyhow::Result<()> {
+        let size = self.record_size;
         println!("Writing to {:#?}", self.output);
         println!("Reading from:\n{:#?}", self.inputs);
 
         let (mut streams, total_records) = self.collect_streams()?;
-        let expected_bytes = total_records.checked_mul(SIZE).context("interleave size overflow")?;
+        let expected_bytes = total_records.checked_mul(size).context("interleave size overflow")?;
         let target = File::create(&self.output).with_context(|| "Failed to create output file")?;
         let mut writer = BufWriter::new(target);
         let mut remaining = total_records;
         let mut rng = Rand::with_seed(seed);
         let mut prev = remaining / PROGRESS_INTERVAL_RECORDS;
-        let mut value = [0; SIZE];
+        let mut value = vec![0u8; size];
 
         while remaining > 0 {
             let spot = rng.rand() as usize % remaining;
@@ -111,23 +115,25 @@ impl InterleaveOptions {
     }
 
     fn run_block(&self, seed: u64) -> anyhow::Result<()> {
+        let size = self.record_size;
         ensure!(self.block_mb > 0, "block size must be at least 1 MB");
         let block_bytes = self.block_mb.checked_mul(BYTES_PER_MB).context("block size overflow")?;
-        let block_records = (block_bytes / SIZE).max(1);
+        let block_records = (block_bytes / size).max(1);
         self.run_block_with_records(block_records, seed)
     }
 
     fn run_block_with_records(&self, block_records: usize, seed: u64) -> anyhow::Result<()> {
+        let size = self.record_size;
         ensure!(block_records > 0, "block size must include at least one record");
 
         println!("Writing to {:#?}", self.output);
         println!("Reading from:\n{:#?}", self.inputs);
 
         let (mut streams, total_records) = self.collect_streams()?;
-        let expected_bytes = total_records.checked_mul(SIZE).context("interleave size overflow")?;
+        let expected_bytes = total_records.checked_mul(size).context("interleave size overflow")?;
         let target = File::create(&self.output).with_context(|| "Failed to create output file")?;
         let mut writer = BufWriter::new(target);
-        let mut buffer = vec![0u8; block_records.checked_mul(SIZE).context("block buffer overflow")?];
+        let mut buffer = vec![0u8; block_records.checked_mul(size).context("block buffer overflow")?];
         let mut remaining = total_records;
         let mut rng = Rand::with_seed(seed);
         let mut prev = remaining / PROGRESS_INTERVAL_RECORDS;
@@ -137,7 +143,7 @@ impl InterleaveOptions {
             let idx = pick_weighted_index(&streams, spot, |stream| stream.remaining_records);
             let stream = &mut streams[idx];
             let records_to_copy = stream.remaining_records.min(block_records);
-            let bytes_to_copy = records_to_copy * SIZE;
+            let bytes_to_copy = records_to_copy * size;
 
             stream.reader.read_exact(&mut buffer[..bytes_to_copy])?;
             writer.write_all(&buffer[..bytes_to_copy])?;
@@ -169,8 +175,8 @@ impl InterleaveOptions {
         let mut expected_bytes = 0usize;
 
         for path in &self.inputs {
-            let file = File::open(path)
-                .with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
+            let file =
+                File::open(path).with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
             let bytes = file.metadata()?.len() as usize;
             expected_bytes = expected_bytes.checked_add(bytes).context("concat size overflow")?;
             let mut reader = BufReader::new(file);
@@ -184,16 +190,17 @@ impl InterleaveOptions {
     }
 
     fn collect_streams(&self) -> anyhow::Result<(Vec<Stream>, usize)> {
+        let size = self.record_size;
         let mut streams = Vec::new();
         let mut total_records = 0usize;
 
         for path in &self.inputs {
-            let file = File::open(path)
-                .with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
+            let file =
+                File::open(path).with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
             let bytes = file.metadata()?.len() as usize;
-            ensure!(bytes % SIZE == 0, "input file size is not a multiple of {SIZE}: {}", path.display());
+            ensure!(bytes % size == 0, "input file size is not a multiple of {size}: {}", path.display());
 
-            let records = bytes / SIZE;
+            let records = bytes / size;
             if records > 0 {
                 total_records = total_records.checked_add(records).context("interleave record count overflow")?;
                 streams.push(Stream { remaining_records: records, reader: BufReader::new(file) });
@@ -240,7 +247,10 @@ fn validate_output_size(path: &Path, expected_bytes: usize) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn unique_dir(label: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -249,6 +259,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         dir
     }
+
+    const SIZE: usize = 32;
 
     fn record(byte: u8) -> [u8; SIZE] {
         let mut record = [byte; SIZE];
@@ -306,6 +318,7 @@ mod tests {
             InterleaveMode::Record,
             8,
             Some(42),
+            SIZE,
         )
         .run()
         .unwrap();
@@ -315,6 +328,7 @@ mod tests {
             InterleaveMode::Record,
             8,
             Some(42),
+            SIZE,
         )
         .run()
         .unwrap();
@@ -340,6 +354,7 @@ mod tests {
             InterleaveMode::Block,
             8,
             Some(7),
+            SIZE,
         );
         options.run_block_with_records(2, 7).unwrap();
 
@@ -363,6 +378,7 @@ mod tests {
             InterleaveMode::Concat,
             8,
             Some(1),
+            SIZE,
         )
         .run()
         .unwrap();

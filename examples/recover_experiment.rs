@@ -300,7 +300,8 @@ fn main() {
             (Some(bs), Some(bps)) => Some(bs as u64 * bps as u64 * num_superbatches as u64),
             _ => None,
         };
-        let dataset_passes = total_positions.and_then(|tp| if positions > 0 { Some(tp as f64 / positions as f64) } else { None });
+        let dataset_passes =
+            total_positions.and_then(|tp| if positions > 0 { Some(tp as f64 / positions as f64) } else { None });
 
         ExperimentData {
             name: data_name.clone(),
@@ -334,12 +335,7 @@ fn main() {
             qb: args.qb,
         },
         data,
-        results: ExperimentResults {
-            training_time_seconds: None,
-            fv_scale,
-            best_loss,
-            best_loss_superbatch,
-        },
+        results: ExperimentResults { training_time_seconds: None, fv_scale, best_loss, best_loss_superbatch },
         history,
         checkpoints,
     };

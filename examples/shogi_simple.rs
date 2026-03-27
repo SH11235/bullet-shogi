@@ -653,7 +653,11 @@ impl ExperimentContext {
                 if let Ok(existing) = serde_json::from_str::<serde_json::Value>(&content) {
                     let existing_id = existing.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if !existing_id.is_empty() && existing_id != self.experiment_id {
-                        eprintln!("ERROR: {} already contains a different experiment (id: {}).", json_path.display(), existing_id);
+                        eprintln!(
+                            "ERROR: {} already contains a different experiment (id: {}).",
+                            json_path.display(),
+                            existing_id
+                        );
                         eprintln!("Resume would overwrite the previous experiment's record.");
                         eprintln!("Use a different --net-id or --output directory for the new run.");
                         std::process::exit(1);

@@ -967,6 +967,7 @@ fn build_layerstack_save_format(
     // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
+         PSQT={},\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -976,13 +977,14 @@ fn build_layerstack_save_format(
          fv_scale={}",
         input_size,
         ft_out,
-        l2_out,     // Output input
-        l2_out,     // L2 output / L3 input
-        l2_out,     // L2 output
-        l2_in,      // L2 input
-        l2_in,      // dual activation output
-        l1_out,     // L1 output
-        ft_out * 2, // L1 input (dual perspective)
+        NUM_BUCKETS, // PSQT bucket count
+        l2_out,      // Output input
+        l2_out,      // L2 output / L3 input
+        l2_out,      // L2 output
+        l2_in,       // L2 input
+        l2_in,       // dual activation output
+        l1_out,      // L1 output
+        ft_out * 2,  // L1 input (dual perspective)
         ft_out * 2,
         ft_out * 2,
         fv_scale,
@@ -1032,6 +1034,37 @@ fn build_layerstack_save_format(
             let _ = (ft_out_captured, input_size_captured);
             let leb128_bytes = encode_leb128_tensor_i16(&weights_i16);
             leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
+        })
+        .quantise::<i8>(1);
+
+    // ---- PSQT weights/biases (raw i32) ----
+    let input_size_for_psqt = input_size;
+    let psqt_data = SavedFormat::empty()
+        .transform(move |graph, _| {
+            let psqt_w = graph.get("psqtw"); // [NUM_BUCKETS, input_size] column-major
+            let psqt_b = graph.get("psqtb"); // [NUM_BUCKETS]
+
+            let scale = (QA as i32 * QB as i32) as f64; // 8128.0
+            let mut bytes: Vec<u8> = Vec::new();
+
+            // Biases: i32[9]
+            for bucket in 0..NUM_BUCKETS {
+                let val = (scale * psqt_b.values[bucket] as f64).round() as i32;
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+
+            // Weights: i32[input_size][9] (feature-major)
+            for feat in 0..input_size_for_psqt {
+                for bucket in 0..NUM_BUCKETS {
+                    // column-major: feat * rows + bucket
+                    let w = psqt_w.values[feat * NUM_BUCKETS + bucket];
+                    let val = (scale * w as f64).round() as i32;
+                    bytes.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+
+            // byte passthrough: 各バイトを i8 として f32 にキャスト
+            bytes.iter().map(|&b| (b as i8) as f32).collect()
         })
         .quantise::<i8>(1);
 
@@ -1174,6 +1207,7 @@ fn build_layerstack_save_format(
         SavedFormat::custom(ft_hash_bytes),
         ft_biases_leb128,
         ft_weights_leb128,
+        psqt_data,
         layerstack_data,
     ]
 }
@@ -1453,6 +1487,13 @@ fn main() {
                 let l2 = builder.new_affine("l2", l2_in_c, NUM_BUCKETS * l2_out_c);
                 let l3 = builder.new_affine("l3", l2_out_c, NUM_BUCKETS);
 
+                // PSQT shortcut: FT と同じ入力、出力 = バケット数
+                // 学習初期に「PSQTなし」と等価にするため Zeroed で開始
+                let psqt = Affine {
+                    weights: builder.new_weights("psqtw", Shape::new(NUM_BUCKETS, input_size), InitSettings::Zeroed),
+                    bias: builder.new_weights("psqtb", Shape::new(NUM_BUCKETS, 1), InitSettings::Zeroed),
+                };
+
                 // Forward pass
                 let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
                 let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
@@ -1467,7 +1508,16 @@ fn main() {
 
                 let l2_out_t = l2.forward(l2_input_tensor).select(output_buckets).crelu();
                 let l3_out = l3.forward(l2_out_t).select(output_buckets);
-                l3_out + l1_skip
+                let net_output = l3_out + l1_skip;
+
+                // PSQT shortcut (Stockfish 準拠: (stm - nstm) / 2)
+                // 各駒は両視点に逆符号で寄与するため、stm - nstm は正味の配置価値を
+                // 約2倍にカウントする。/2 はこの二重カウントを補正する正規化。
+                let stm_psqt = psqt.forward(stm_inputs);
+                let ntm_psqt = psqt.forward(ntm_inputs) * (-1.0);
+                let psqt_diff = (stm_psqt + ntm_psqt).select(output_buckets) * 0.5;
+
+                net_output + psqt_diff
             })
         }};
     }

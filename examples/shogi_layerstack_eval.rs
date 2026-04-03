@@ -37,7 +37,7 @@ use bullet_lib::{
             ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
         },
     },
-    nn::optimiser,
+    nn::{Affine, InitSettings, Shape, optimiser},
     value::ValueTrainerBuilder,
 };
 use clap::{Parser, ValueEnum};
@@ -590,6 +590,12 @@ fn main() {
             let l2 = builder.new_affine("l2", l2_input, NUM_BUCKETS * l2_size);
             let l3 = builder.new_affine("l3", l2_size, NUM_BUCKETS);
 
+            // PSQT shortcut
+            let psqt = Affine {
+                weights: builder.new_weights("psqtw", Shape::new(NUM_BUCKETS, input_size), InitSettings::Zeroed),
+                bias: builder.new_weights("psqtb", Shape::new(NUM_BUCKETS, 1), InitSettings::Zeroed),
+            };
+
             // Forward pass
             let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
             let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
@@ -605,7 +611,14 @@ fn main() {
 
             let l2_out = l2.forward(l2_input_tensor).select(output_buckets).crelu();
             let l3_out = l3.forward(l2_out).select(output_buckets);
-            l3_out + l1_skip
+            let net_output = l3_out + l1_skip;
+
+            // PSQT shortcut (Stockfish 準拠: (stm - nstm) / 2)
+            let stm_psqt = psqt.forward(stm_inputs);
+            let ntm_psqt = psqt.forward(ntm_inputs) * (-1.0);
+            let psqt_diff = (stm_psqt + ntm_psqt).select(output_buckets) * 0.5;
+
+            net_output + psqt_diff
         });
 
     // Load weights from checkpoint (optimiser_state/weights.bin)
@@ -685,6 +698,10 @@ fn main() {
                 let arch_len = u32::from_le_bytes(buf4) as usize;
                 let mut arch = vec![0u8; arch_len];
                 let _ = f.read_exact(&mut arch);
+                let arch_str = String::from_utf8_lossy(&arch);
+                let has_psqt = arch_str.contains("PSQT=");
+                println!("Architecture: {}", arch_str);
+                println!("Has PSQT: {}", has_psqt);
 
                 // ft_hash
                 let _ = f.read_exact(&mut buf4);
@@ -738,6 +755,49 @@ fn main() {
                     }
                 }
                 println!();
+
+                // PSQT ブロック (FT と LayerStack の間)
+                if has_psqt {
+                    let mut psqt_biases_q = [0i32; NUM_BUCKETS];
+                    for bias in psqt_biases_q.iter_mut() {
+                        let _ = f.read_exact(&mut buf4);
+                        *bias = i32::from_le_bytes(buf4);
+                    }
+                    let weight_count = input_size * NUM_BUCKETS;
+                    let mut psqt_weights_q = vec![0i32; weight_count];
+                    for w in psqt_weights_q.iter_mut() {
+                        let _ = f.read_exact(&mut buf4);
+                        *w = i32::from_le_bytes(buf4);
+                    }
+
+                    let psqt_w = weights.get("psqtw");
+                    let psqt_b = weights.get("psqtb");
+                    let scale = 127.0f32 * 64.0f32; // QA * QB = 8128
+
+                    println!("=== PSQT bias sample check (quantised.bin vs weights.bin) ===");
+                    for (idx, &q_file) in psqt_biases_q.iter().enumerate().take(4) {
+                        let q_expected = (psqt_b.values[idx] as f64 * scale as f64).round() as i32;
+                        println!(
+                            "psqt_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}",
+                            psqt_b.values[idx]
+                        );
+                    }
+                    println!();
+
+                    println!("=== PSQT weight sample check (quantised.bin vs weights.bin) ===");
+                    for feat in 0..3 {
+                        for bucket in 0..2 {
+                            let idx = feat * NUM_BUCKETS + bucket;
+                            let q_file = psqt_weights_q[idx];
+                            let w = psqt_w.values[idx];
+                            let q_expected = (w as f64 * scale as f64).round() as i32;
+                            println!(
+                                "psqt_w[feat={feat} bucket={bucket}]: float={w:.6} q_expected={q_expected} q_file={q_file}"
+                            );
+                        }
+                    }
+                    println!();
+                }
 
                 // FT ブロック消費後、LayerStack 本体を読む。
 
@@ -1012,8 +1072,16 @@ struct FloatIntermediates {
     pub l2_out: Vec<f32>,
     /// 最終出力 (bypass 加算前)
     pub out_before_bypass: f32,
-    /// 最終出力 (bypass 加算後)
+    /// 最終出力 (bypass 加算後, PSQT 加算前)
     pub final_output: f32,
+    /// PSQT STM accumulator [9]
+    pub psqt_stm: Vec<f32>,
+    /// PSQT NSTM accumulator [9]
+    pub psqt_nstm: Vec<f32>,
+    /// PSQT value = (stm - nstm) / 2 for selected bucket
+    pub psqt_value: f32,
+    /// 最終出力 (PSQT 加算後)
+    pub final_output_with_psqt: f32,
     /// 使用したバケット
     pub bucket: usize,
 }
@@ -1065,7 +1133,12 @@ impl FloatIntermediates {
         // Output
         println!();
         println!("Out (before bypass): {:.4}", self.out_before_bypass);
-        println!("Final output: {:.4}", self.final_output);
+        println!("Final output (dense only): {:.4}", self.final_output);
+        println!();
+        println!("PSQT STM acc: {:?}", self.psqt_stm.iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
+        println!("PSQT NSTM acc: {:?}", self.psqt_nstm.iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
+        println!("PSQT value (bucket={}): {:.4}", self.bucket, self.psqt_value);
+        println!("Final output (dense + PSQT): {:.4}", self.final_output_with_psqt);
         println!("=============================================");
     }
 }
@@ -1093,6 +1166,8 @@ fn dump_float_intermediates(
     let l2b = weights.get("l2b");
     let l3w = weights.get("l3w");
     let l3b = weights.get("l3b");
+    let psqtw = weights.get("psqtw");
+    let psqtb = weights.get("psqtb");
 
     // Read one sample from pack file
     let mut file = File::open(pack_path).expect("Failed to open pack file");
@@ -1210,6 +1285,28 @@ fn dump_float_intermediates(
 
     let final_output = out_before_bypass + l1_bypass;
 
+    // PSQT: accumulate per-bucket scalars for both perspectives
+    let mut psqt_stm = vec![0.0f32; NUM_BUCKETS];
+    let mut psqt_nstm = vec![0.0f32; NUM_BUCKETS];
+    for b in 0..NUM_BUCKETS {
+        psqt_stm[b] = psqtb.values[b];
+        psqt_nstm[b] = psqtb.values[b];
+    }
+    for &feat_idx in &stm_features {
+        for b in 0..NUM_BUCKETS {
+            // psqtw: column-major [NUM_BUCKETS, input_size] → idx = feat * NUM_BUCKETS + b
+            psqt_stm[b] += psqtw.values[feat_idx * NUM_BUCKETS + b];
+        }
+    }
+    for &feat_idx in &nstm_features {
+        for b in 0..NUM_BUCKETS {
+            psqt_nstm[b] += psqtw.values[feat_idx * NUM_BUCKETS + b];
+        }
+    }
+    // Stockfish 準拠: (stm - nstm) / 2
+    let psqt_value = (psqt_stm[bucket] - psqt_nstm[bucket]) * 0.5;
+    let final_output_with_psqt = final_output + psqt_value;
+
     let intermediates = FloatIntermediates {
         ft_stm,
         ft_nstm,
@@ -1220,6 +1317,10 @@ fn dump_float_intermediates(
         l2_out,
         out_before_bypass,
         final_output,
+        psqt_stm,
+        psqt_nstm,
+        psqt_value,
+        final_output_with_psqt,
         bucket,
     };
 
@@ -1245,7 +1346,20 @@ fn dump_float_intermediates(
         "L2 out (×127): {:?}",
         intermediates.l2_out[..8].iter().map(|x| (*x * 127.0).round() as i32).collect::<Vec<_>>()
     );
-    println!("Final (×508 for cp): {}", (intermediates.final_output * 508.0).round() as i32);
+    println!("Dense final (×8128): {}", (intermediates.final_output * 8128.0).round() as i32);
+    let psqt_scale = 8128.0;
+    println!(
+        "PSQT STM acc (×{}): {:?}",
+        psqt_scale,
+        intermediates.psqt_stm.iter().map(|x| (*x * psqt_scale).round() as i32).collect::<Vec<_>>()
+    );
+    println!(
+        "PSQT NSTM acc (×{}): {:?}",
+        psqt_scale,
+        intermediates.psqt_nstm.iter().map(|x| (*x * psqt_scale).round() as i32).collect::<Vec<_>>()
+    );
+    println!("PSQT value (×{}): {}", psqt_scale, (intermediates.psqt_value * psqt_scale).round() as i32);
+    println!("Final with PSQT (×8128): {}", (intermediates.final_output_with_psqt * 8128.0).round() as i32);
 }
 
 /// Get active features for a position

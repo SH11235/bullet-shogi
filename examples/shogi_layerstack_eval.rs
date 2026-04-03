@@ -19,6 +19,8 @@ Options:
     --l1 <SIZE>          L1 サイズ (default: 16)
     --l2 <SIZE>          L2 サイズ (default: 32)
     --scale <N>          学習時の scale (default: 600)
+    --integer-forward    quantised.bin から整数演算のみで forward pass を実行 (golden forward 検証)
+    --quantised <PATH>   quantised.bin のパス (省略時: checkpoint/quantised.bin)
 */
 
 use std::{
@@ -94,6 +96,14 @@ struct Args {
     /// Dump intermediate values (CPU forward pass with float weights)
     #[arg(long, default_value_t = false)]
     dump_intermediates: bool,
+
+    /// Integer golden forward using quantised.bin (bit-exact verification)
+    #[arg(long, default_value_t = false)]
+    integer_forward: bool,
+
+    /// Path to quantised.bin (default: checkpoint/quantised.bin)
+    #[arg(long)]
+    quantised: Option<PathBuf>,
 
     /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
@@ -537,6 +547,37 @@ fn main() {
     let l2_size = args.l2;
     let input_size = ShogiHalfKA_hm.num_inputs();
     let l1_input_dim = l0_size;
+
+    // Integer golden forward mode: quantised.bin のみで整数演算 forward、trainer 不要
+    if args.integer_forward {
+        let quantised_path = args
+            .quantised
+            .clone()
+            .unwrap_or_else(|| args.checkpoint.join("quantised.bin"));
+        if !quantised_path.exists() {
+            eprintln!("Error: quantised.bin not found: {}", quantised_path.display());
+            std::process::exit(1);
+        }
+        let net =
+            QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, input_size, args.scale)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: Failed to load quantised.bin: {e}");
+                    std::process::exit(1);
+                });
+        println!("=== Integer Golden Forward Mode ===");
+        println!("quantised.bin: {}", quantised_path.display());
+        run_integer_forward(
+            &net,
+            &args.pack,
+            args.offset,
+            args.samples,
+            bucket_impl,
+            l0_size,
+            l1_size,
+            l2_size,
+        );
+        return;
+    }
 
     println!("=== Shogi LayerStack NNUE Inference Test ===");
     println!("Checkpoint: {}", args.checkpoint.display());
@@ -1374,4 +1415,341 @@ fn get_active_features(psv: &bullet_lib::shogi::PackedSfenValue) -> (Vec<usize>,
 
     debug_assert_eq!(stm_features.len(), nstm_features.len());
     (stm_features, nstm_features)
+}
+
+// =============================================================================
+// Integer Golden Forward (quantised.bin ベース bit-exact 検証)
+// =============================================================================
+
+#[allow(dead_code)]
+struct QuantisedNetwork {
+    arch_str: String,
+    has_psqt: bool,
+    fv_scale: i32,
+    ft_biases: Vec<i16>,
+    ft_weights: Vec<i16>,
+    psqt_biases: Vec<i32>,
+    psqt_weights: Vec<i32>,
+    l1_biases: Vec<i32>,
+    l1_weights: Vec<i8>,
+    l2_biases: Vec<i32>,
+    l2_weights: Vec<i8>,
+    l3_biases: Vec<i32>,
+    l3_weights: Vec<i8>,
+}
+
+impl QuantisedNetwork {
+    fn load(
+        path: &std::path::Path,
+        l0_size: usize,
+        l1_size: usize,
+        l2_size: usize,
+        input_size: usize,
+        default_fv_scale: i32,
+    ) -> io::Result<Self> {
+        let mut f = File::open(path)?;
+        let mut buf4 = [0u8; 4];
+
+        // Header: version, network_hash, desc_len, description
+        f.read_exact(&mut buf4)?;
+        f.read_exact(&mut buf4)?;
+        f.read_exact(&mut buf4)?;
+        let arch_len = u32::from_le_bytes(buf4) as usize;
+        let mut arch_buf = vec![0u8; arch_len];
+        f.read_exact(&mut arch_buf)?;
+        let arch_str = String::from_utf8_lossy(&arch_buf).to_string();
+        let has_psqt = arch_str.contains("PSQT=");
+
+        // Parse fv_scale from architecture string ("...,fv_scale=N")
+        let fv_scale = arch_str
+            .split(',')
+            .find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("fv_scale=")
+                    .and_then(|v| v.parse::<i32>().ok())
+            })
+            .unwrap_or(default_fv_scale);
+
+        // FT hash
+        f.read_exact(&mut buf4)?;
+
+        // FT biases and weights (LEB128 compressed)
+        let ft_biases = read_leb128_i16_block(&mut f)?;
+        let ft_weights = read_leb128_i16_block(&mut f)?;
+
+        if ft_biases.len() != l0_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("FT bias length mismatch: got {}, expected {}", ft_biases.len(), l0_size),
+            ));
+        }
+        if ft_weights.len() != input_size * l0_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "FT weight length mismatch: got {}, expected {}",
+                    ft_weights.len(),
+                    input_size * l0_size
+                ),
+            ));
+        }
+
+        // PSQT block (only if architecture includes PSQT)
+        let (psqt_biases, psqt_weights) = if has_psqt {
+            let mut biases = vec![0i32; NUM_BUCKETS];
+            for b in biases.iter_mut() {
+                f.read_exact(&mut buf4)?;
+                *b = i32::from_le_bytes(buf4);
+            }
+            let weight_count = input_size * NUM_BUCKETS;
+            let mut weights = vec![0i32; weight_count];
+            for w in weights.iter_mut() {
+                f.read_exact(&mut buf4)?;
+                *w = i32::from_le_bytes(buf4);
+            }
+            (biases, weights)
+        } else {
+            (vec![0i32; NUM_BUCKETS], vec![0i32; input_size * NUM_BUCKETS])
+        };
+
+        // LayerStack per-bucket: [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
+        let l1_effective = l1_size - 1;
+        let l2_in_dim = l1_effective * 2;
+        let l1_input_dim = l0_size;
+        let l1_padded_in = pad32(l1_input_dim);
+        let l2_padded_in = pad32(l2_in_dim);
+        let out_padded_in = pad32(l2_size);
+
+        let mut l1_biases = vec![0i32; NUM_BUCKETS * l1_size];
+        let mut l1_weights = vec![0i8; NUM_BUCKETS * l1_size * l1_input_dim];
+        let mut l2_biases = vec![0i32; NUM_BUCKETS * l2_size];
+        let mut l2_weights = vec![0i8; NUM_BUCKETS * l2_size * l2_in_dim];
+        let mut l3_biases = vec![0i32; NUM_BUCKETS];
+        let mut l3_weights = vec![0i8; NUM_BUCKETS * l2_size];
+
+        for bucket in 0..NUM_BUCKETS {
+            f.read_exact(&mut buf4)?; // fc_hash
+
+            // L1 biases
+            for out_idx in 0..l1_size {
+                f.read_exact(&mut buf4)?;
+                l1_biases[bucket * l1_size + out_idx] = i32::from_le_bytes(buf4);
+            }
+
+            // L1 weights (row-major, padded input dim)
+            let mut row = vec![0u8; l1_padded_in];
+            for out_idx in 0..l1_size {
+                f.read_exact(&mut row)?;
+                let global_out = bucket * l1_size + out_idx;
+                for in_idx in 0..l1_input_dim {
+                    l1_weights[global_out * l1_input_dim + in_idx] = row[in_idx] as i8;
+                }
+            }
+
+            // L2 biases
+            for out_idx in 0..l2_size {
+                f.read_exact(&mut buf4)?;
+                l2_biases[bucket * l2_size + out_idx] = i32::from_le_bytes(buf4);
+            }
+
+            // L2 weights (row-major, padded input dim)
+            let mut l2_row = vec![0u8; l2_padded_in];
+            for out_idx in 0..l2_size {
+                f.read_exact(&mut l2_row)?;
+                let global_out = bucket * l2_size + out_idx;
+                for in_idx in 0..l2_in_dim {
+                    l2_weights[global_out * l2_in_dim + in_idx] = l2_row[in_idx] as i8;
+                }
+            }
+
+            // L3 (output) bias
+            f.read_exact(&mut buf4)?;
+            l3_biases[bucket] = i32::from_le_bytes(buf4);
+
+            // L3 (output) weights (padded)
+            let mut out_row = vec![0u8; out_padded_in];
+            f.read_exact(&mut out_row)?;
+            for in_idx in 0..l2_size {
+                l3_weights[bucket * l2_size + in_idx] = out_row[in_idx] as i8;
+            }
+        }
+
+        Ok(QuantisedNetwork {
+            arch_str,
+            has_psqt,
+            fv_scale,
+            ft_biases,
+            ft_weights,
+            psqt_biases,
+            psqt_weights,
+            l1_biases,
+            l1_weights,
+            l2_biases,
+            l2_weights,
+            l3_biases,
+            l3_weights,
+        })
+    }
+}
+
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn run_integer_forward(
+    net: &QuantisedNetwork,
+    pack_path: &std::path::Path,
+    offset: u64,
+    samples: usize,
+    bucket_impl: ShogiLayerStackBucket9,
+    l0_size: usize,
+    l1_size: usize,
+    l2_size: usize,
+) {
+    let l1_effective = l1_size - 1;
+    let l2_in_dim = l1_effective * 2;
+    let l1_input_dim = l0_size;
+    let half = l0_size / 2;
+
+    let mut file = File::open(pack_path).unwrap_or_else(|e| {
+        eprintln!("Error: Failed to open pack file: {e}");
+        std::process::exit(1);
+    });
+    let record_size = std::mem::size_of::<bullet_lib::shogi::PackedSfenValue>() as u64;
+    file.seek(SeekFrom::Start(offset * record_size)).unwrap();
+
+    println!("Architecture: {}", net.arch_str);
+    println!("fv_scale: {}", net.fv_scale);
+    println!();
+
+    for sample_idx in 0..samples {
+        let mut buf = [0u8; 40];
+        if file.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let mut psv = bullet_lib::shogi::PackedSfenValue::default();
+        psv.as_bytes_mut().copy_from_slice(&buf);
+
+        let decoded = psv.decode();
+        let sfen = board_to_sfen(&decoded, psv.game_ply());
+        let bucket = bucket_impl.bucket(&psv) as usize;
+        let (stm_features, nstm_features) = get_active_features(&psv);
+
+        println!("=== Integer Golden Forward (sample {}) ===", offset + sample_idx as u64);
+        println!("SFEN: {}", sfen);
+        println!("bucket_index: {}", bucket);
+
+        // --- 1. Feature Transformer accumulation (i16) ---
+        let mut acc_stm = net.ft_biases.clone();
+        let mut acc_nstm = net.ft_biases.clone();
+        for &feat in &stm_features {
+            for i in 0..l0_size {
+                acc_stm[i] += net.ft_weights[feat * l0_size + i];
+            }
+        }
+        for &feat in &nstm_features {
+            for i in 0..l0_size {
+                acc_nstm[i] += net.ft_weights[feat * l0_size + i];
+            }
+        }
+
+        println!("FT acc[stm] first 8: {:?}", &acc_stm[..8]);
+        println!("FT acc[nstm] first 8: {:?}", &acc_nstm[..8]);
+
+        // --- 2. SqrClippedReLU (Product Pooling): i16 → u8 ---
+        // output[i] = (clamp(acc[i], 0, 127) * clamp(acc[i + half], 0, 127)) >> 7
+        let mut pp_out = vec![0u8; l0_size];
+        for i in 0..half {
+            let a = acc_stm[i].clamp(0, 127);
+            let b = acc_stm[i + half].clamp(0, 127);
+            pp_out[i] = ((a * b) >> 7) as u8;
+        }
+        for i in 0..half {
+            let a = acc_nstm[i].clamp(0, 127);
+            let b = acc_nstm[i + half].clamp(0, 127);
+            pp_out[i + half] = ((a * b) >> 7) as u8;
+        }
+
+        println!("PP out first 8: {:?}", &pp_out[..8]);
+
+        // --- 3. L1: l0_size → l1_size (i32) ---
+        let mut l1_out = vec![0i32; l1_size];
+        for out in 0..l1_size {
+            let global_out = bucket * l1_size + out;
+            l1_out[out] = net.l1_biases[global_out];
+            for in_idx in 0..l1_input_dim {
+                l1_out[out] += net.l1_weights[global_out * l1_input_dim + in_idx] as i32
+                    * pp_out[in_idx] as i32;
+            }
+        }
+
+        println!("L1 out ({}): {:?}", l1_size, &l1_out);
+        let l1_skip = l1_out[l1_effective];
+        println!("L1 skip: {}", l1_skip);
+
+        // --- 4. Split [l1_effective, 1] + Dual Activation → u8[l2_in_dim] ---
+        let mut l2_in = vec![0u8; l2_in_dim];
+        for i in 0..l1_effective {
+            // SqrClippedReLU: (x² >> 19) clamped to [0, 127]  — i64 必須
+            let val = l1_out[i] as i64;
+            let sqr = (val * val) >> 19;
+            l2_in[i] = sqr.clamp(0, 127) as u8;
+
+            // ClippedReLU: (x >> 6) clamped to [0, 127]
+            l2_in[l1_effective + i] = (l1_out[i] >> 6).clamp(0, 127) as u8;
+        }
+
+        println!("L2 input ({}): {:?}", l2_in_dim, &l2_in);
+
+        // --- 5. L2: l2_in_dim → l2_size (i32) + ClippedReLU → u8 ---
+        let mut l2_raw = vec![0i32; l2_size];
+        for out in 0..l2_size {
+            let global_out = bucket * l2_size + out;
+            l2_raw[out] = net.l2_biases[global_out];
+            for in_idx in 0..l2_in_dim {
+                l2_raw[out] +=
+                    net.l2_weights[global_out * l2_in_dim + in_idx] as i32 * l2_in[in_idx] as i32;
+            }
+        }
+        let mut l2_relu = vec![0u8; l2_size];
+        for out in 0..l2_size {
+            l2_relu[out] = (l2_raw[out] >> 6).clamp(0, 127) as u8;
+        }
+
+        println!("L2 out ({}): {:?}", l2_size, &l2_relu);
+
+        // --- 6. Output: l2_size → 1 + skip ---
+        let mut output = net.l3_biases[bucket];
+        for in_idx in 0..l2_size {
+            output += net.l3_weights[bucket * l2_size + in_idx] as i32 * l2_relu[in_idx] as i32;
+        }
+
+        println!("Output (before skip): {}", output);
+        let raw_score = output + l1_skip;
+        println!("raw_score: {}", raw_score);
+
+        // --- 7. PSQT ---
+        let mut psqt_stm = net.psqt_biases.clone();
+        let mut psqt_nstm = net.psqt_biases.clone();
+        for &feat in &stm_features {
+            for b in 0..NUM_BUCKETS {
+                psqt_stm[b] += net.psqt_weights[feat * NUM_BUCKETS + b];
+            }
+        }
+        for &feat in &nstm_features {
+            for b in 0..NUM_BUCKETS {
+                psqt_nstm[b] += net.psqt_weights[feat * NUM_BUCKETS + b];
+            }
+        }
+        let psqt_value = (psqt_stm[bucket] - psqt_nstm[bucket]) / 2;
+
+        println!("psqt_acc[stm]: {:?}", &psqt_stm);
+        println!("psqt_acc[nstm]: {:?}", &psqt_nstm);
+        println!("psqt_value: {}", psqt_value);
+
+        // --- 8. Final score ---
+        let combined = raw_score + psqt_value;
+        println!("raw_score + psqt_value: {}", combined);
+        println!("fv_scale: {}", net.fv_scale);
+        let final_score = combined / net.fv_scale;
+        println!("final_score: {}", final_score);
+        println!();
+    }
 }

@@ -1,12 +1,12 @@
-//! HalfKA_hm + Threat 2a 連結特徴量
+//! HalfKA_hm + Threat 連結特徴量
 //!
-//! HalfKA_hm (73,305 次元) と Threat 2a (216,720 次元) を連結した
+//! HalfKA_hm (73,305 次元) と Threat (216,720 次元) を連結した
 //! sparse input 型を提供する。
 //!
 //! ## 仕様
 //!
 //! - HalfKA_hm: 既存の `ShogiHalfKA_hm` と同一ロジック
-//! - Threat 2a: rshogi `threat_features.rs` と同一 index 計算
+//! - Threat: rshogi `threat_features.rs` と同一 index 計算
 //! - 仕様メモ: `docs/threat_spec.md` (rshogi リポジトリ)
 
 use super::shogi_halfka::{HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES};
@@ -78,10 +78,10 @@ fn halfka_index(kb: usize, packed_bp: usize) -> usize {
 }
 
 // =============================================================================
-// Threat 2a 定数
+// Threat 定数
 // =============================================================================
 
-/// Threat 2a の総特徴量次元数
+/// Threat の総特徴量次元数
 const THREAT_DIMENSIONS: usize = 216_720;
 
 /// ThreatClass の数（King 除外）
@@ -734,9 +734,9 @@ fn threat_index(params: &ThreatParams, from_offset_table: &FromOffsetTable) -> u
 // ShogiHalfKaHmThreat
 // =============================================================================
 
-/// HalfKA_hm + Threat 2a 連結特徴量
+/// HalfKA_hm + Threat 連結特徴量
 ///
-/// `SparseInputType` を実装し、HalfKA_hm 特徴量と Threat 2a 特徴量を
+/// `SparseInputType` を実装し、HalfKA_hm 特徴量と Threat 特徴量を
 /// 連結した sparse input として提供する。
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -774,7 +774,7 @@ impl SparseInputType for ShogiHalfKaHmThreat {
 // 特徴量列挙
 // =============================================================================
 
-/// HalfKA_hm + Threat 2a の特徴量を列挙する
+/// HalfKA_hm + Threat の特徴量を列挙する
 fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     let stm = board.side_to_move;
     let nstm = stm.opponent();
@@ -878,7 +878,7 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
     }
 
     // -------------------------------------------------------
-    // Part 2: Threat 2a 特徴量
+    // Part 2: Threat 特徴量
     // -------------------------------------------------------
 
     let from_offset_table = FromOffsetTable::new();
@@ -1253,6 +1253,75 @@ mod tests {
         assert_eq!(
             normalize_sq(sq, Color::White, true),
             sq.inverse().mirror_file()
+        );
+    }
+
+    /// Canonical test vector: rshogi の threat_features.rs と同一の初期局面 threat index を検証
+    /// この値が変わったら rshogi 側も同時に更新すること
+    #[test]
+    fn test_canonical_startpos_threat_indices() {
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+
+        for file in 0..9u8 {
+            board.board[Square::new(file, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+            board.board[Square::new(file, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        }
+
+        board.board[Square::new(7, 7).index()] = Piece::new(Color::Black, PieceType::Bishop);
+        board.board[Square::new(1, 7).index()] = Piece::new(Color::Black, PieceType::Rook);
+        board.board[Square::new(1, 1).index()] = Piece::new(Color::White, PieceType::Bishop);
+        board.board[Square::new(7, 1).index()] = Piece::new(Color::White, PieceType::Rook);
+
+        board.board[Square::new(0, 8).index()] = Piece::new(Color::Black, PieceType::Lance);
+        board.board[Square::new(8, 8).index()] = Piece::new(Color::Black, PieceType::Lance);
+        board.board[Square::new(0, 0).index()] = Piece::new(Color::White, PieceType::Lance);
+        board.board[Square::new(8, 0).index()] = Piece::new(Color::White, PieceType::Lance);
+
+        board.board[Square::new(1, 8).index()] = Piece::new(Color::Black, PieceType::Knight);
+        board.board[Square::new(7, 8).index()] = Piece::new(Color::Black, PieceType::Knight);
+        board.board[Square::new(1, 0).index()] = Piece::new(Color::White, PieceType::Knight);
+        board.board[Square::new(7, 0).index()] = Piece::new(Color::White, PieceType::Knight);
+
+        board.board[Square::new(2, 8).index()] = Piece::new(Color::Black, PieceType::Silver);
+        board.board[Square::new(6, 8).index()] = Piece::new(Color::Black, PieceType::Silver);
+        board.board[Square::new(2, 0).index()] = Piece::new(Color::White, PieceType::Silver);
+        board.board[Square::new(6, 0).index()] = Piece::new(Color::White, PieceType::Silver);
+
+        board.board[Square::new(3, 8).index()] = Piece::new(Color::Black, PieceType::Gold);
+        board.board[Square::new(5, 8).index()] = Piece::new(Color::Black, PieceType::Gold);
+        board.board[Square::new(3, 0).index()] = Piece::new(Color::White, PieceType::Gold);
+        board.board[Square::new(5, 0).index()] = Piece::new(Color::White, PieceType::Gold);
+
+        let mut stm_threat_indices = Vec::new();
+        map_halfka_hm_threat_features(&board, |stm_idx, _nstm_idx| {
+            if stm_idx >= HALFKA_HM_DIMENSIONS {
+                stm_threat_indices.push(stm_idx - HALFKA_HM_DIMENSIONS);
+            }
+        });
+        stm_threat_indices.sort();
+
+        #[rustfmt::skip]
+        let expected: Vec<usize> = vec![
+            1330, 1618, 7147, 7148, 7231, 7232, 11047, 11213,
+            16475, 16578, 23268, 23270, 24087, 25717, 37487, 40080,
+            43974, 112573, 112861, 116503, 116504, 116587, 116588,
+            122160, 122650, 128533, 128636, 138321, 138323, 139136,
+            140770, 158280, 160871, 164753,
+        ];
+
+        assert_eq!(
+            stm_threat_indices, expected,
+            "Canonical mismatch with rshogi! count: bullet={} vs expected={}",
+            stm_threat_indices.len(),
+            expected.len()
         );
     }
 }

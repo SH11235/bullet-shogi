@@ -5,6 +5,7 @@ mod chess_buckets;
 mod chess_buckets_mk;
 mod factorised;
 mod shogi_halfka;
+mod shogi_halfka_hm_threat;
 mod shogi_halfkp;
 
 #[allow(deprecated)]
@@ -16,6 +17,7 @@ pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
 pub use shogi_halfka::{FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, ShogiHalfKA, ShogiHalfKA_hm};
+pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
 pub use shogi_halfkp::{FEATURE_HASH, ShogiHalfKP};
 
 #[allow(deprecated)]

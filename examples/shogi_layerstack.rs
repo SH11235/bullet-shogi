@@ -33,6 +33,8 @@ Options:
     --interleave-file-batches <N> File mix granularity (0=sequential, 1=round-robin)
     --epoch-file-shuffle Shuffle file order every epoch
     --file-shuffle-seed <SEED> Seed for epoch file shuffle
+    --psqt               Enable PSQT shortcut layer
+    --threat            Enable Threat concatenated input (placeholder)
 */
 
 use std::{path::PathBuf, sync::OnceLock};
@@ -235,6 +237,14 @@ struct Args {
     /// Optional boundaries for ply9 buckets (8 comma-separated values)
     #[arg(long)]
     ply_bounds: Option<String>,
+
+    /// Enable PSQT shortcut layer
+    #[arg(long)]
+    psqt: bool,
+
+    /// Enable Threat concatenated input (placeholder for future implementation)
+    #[arg(long)]
+    threat: bool,
 
     /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
@@ -953,6 +963,8 @@ fn build_layerstack_save_format(
     l1_out: usize,
     l2_out: usize,
     fv_scale: i32,
+    psqt: bool,
+    threat: bool,
 ) -> Vec<SavedFormat> {
     use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
 
@@ -965,9 +977,14 @@ fn build_layerstack_save_format(
     let network_hash = fc_hash ^ ft_hash;
 
     // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
+    let psqt_part = if psqt { format!("PSQT={},", NUM_BUCKETS) } else { String::new() };
+    // Threat は入力切り替え・export 実装完了後に有効化する
+    let threat_part = String::new();
+    let _ = threat; // 将来使用
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
-         PSQT={},\
+         {psqt_part}\
+         {threat_part}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -977,14 +994,13 @@ fn build_layerstack_save_format(
          fv_scale={}",
         input_size,
         ft_out,
-        NUM_BUCKETS, // PSQT bucket count
-        l2_out,      // Output input
-        l2_out,      // L2 output / L3 input
-        l2_out,      // L2 output
-        l2_in,       // L2 input
-        l2_in,       // dual activation output
-        l1_out,      // L1 output
-        ft_out * 2,  // L1 input (dual perspective)
+        l2_out,     // Output input
+        l2_out,     // L2 output / L3 input
+        l2_out,     // L2 output
+        l2_in,      // L2 input
+        l2_in,      // dual activation output
+        l1_out,     // L1 output
+        ft_out * 2, // L1 input (dual perspective)
         ft_out * 2,
         ft_out * 2,
         fv_scale,
@@ -1038,35 +1054,41 @@ fn build_layerstack_save_format(
         .quantise::<i8>(1);
 
     // ---- PSQT weights/biases (raw i32) ----
-    let input_size_for_psqt = input_size;
-    let psqt_data = SavedFormat::empty()
-        .transform(move |graph, _| {
-            let psqt_w = graph.get("psqtw"); // [NUM_BUCKETS, input_size] column-major
-            let psqt_b = graph.get("psqtb"); // [NUM_BUCKETS]
+    let psqt_data = if psqt {
+        let input_size_for_psqt = input_size;
+        Some(
+            SavedFormat::empty()
+                .transform(move |graph, _| {
+                    let psqt_w = graph.get("psqtw"); // [NUM_BUCKETS, input_size] column-major
+                    let psqt_b = graph.get("psqtb"); // [NUM_BUCKETS]
 
-            let scale = (QA as i32 * QB as i32) as f64; // 8128.0
-            let mut bytes: Vec<u8> = Vec::new();
+                    let scale = (QA as i32 * QB as i32) as f64; // 8128.0
+                    let mut bytes: Vec<u8> = Vec::new();
 
-            // Biases: i32[9]
-            for bucket in 0..NUM_BUCKETS {
-                let val = (scale * psqt_b.values[bucket] as f64).round() as i32;
-                bytes.extend_from_slice(&val.to_le_bytes());
-            }
+                    // Biases: i32[9]
+                    for bucket in 0..NUM_BUCKETS {
+                        let val = (scale * psqt_b.values[bucket] as f64).round() as i32;
+                        bytes.extend_from_slice(&val.to_le_bytes());
+                    }
 
-            // Weights: i32[input_size][9] (feature-major)
-            for feat in 0..input_size_for_psqt {
-                for bucket in 0..NUM_BUCKETS {
-                    // column-major: feat * rows + bucket
-                    let w = psqt_w.values[feat * NUM_BUCKETS + bucket];
-                    let val = (scale * w as f64).round() as i32;
-                    bytes.extend_from_slice(&val.to_le_bytes());
-                }
-            }
+                    // Weights: i32[input_size][9] (feature-major)
+                    for feat in 0..input_size_for_psqt {
+                        for bucket in 0..NUM_BUCKETS {
+                            // column-major: feat * rows + bucket
+                            let w = psqt_w.values[feat * NUM_BUCKETS + bucket];
+                            let val = (scale * w as f64).round() as i32;
+                            bytes.extend_from_slice(&val.to_le_bytes());
+                        }
+                    }
 
-            // byte passthrough: 各バイトを i8 として f32 にキャスト
-            bytes.iter().map(|&b| (b as i8) as f32).collect()
-        })
-        .quantise::<i8>(1);
+                    // byte passthrough: 各バイトを i8 として f32 にキャスト
+                    bytes.iter().map(|&b| (b as i8) as f32).collect()
+                })
+                .quantise::<i8>(1),
+        )
+    } else {
+        None
+    };
 
     // ---- LayerStacks (9 buckets) ----
     // 各バケットについて: fc_hash + L1(biases, weights) + L2(biases, weights) + Output(bias, weights)
@@ -1202,14 +1224,13 @@ fn build_layerstack_save_format(
         })
         .quantise::<i8>(1);
 
-    vec![
-        SavedFormat::custom(header),
-        SavedFormat::custom(ft_hash_bytes),
-        ft_biases_leb128,
-        ft_weights_leb128,
-        psqt_data,
-        layerstack_data,
-    ]
+    let mut formats =
+        vec![SavedFormat::custom(header), SavedFormat::custom(ft_hash_bytes), ft_biases_leb128, ft_weights_leb128];
+    if let Some(psqt) = psqt_data {
+        formats.push(psqt);
+    }
+    formats.push(layerstack_data);
+    formats
 }
 
 // =============================================================================
@@ -1254,6 +1275,11 @@ fn main() {
         ft_out, l1_out, l1_effective, l2_out
     );
     println!("L2 input: {} (sqr_crelu concat crelu)", l2_in);
+    println!("PSQT shortcut: {}", if args.psqt { "enabled" } else { "disabled" });
+    if args.threat {
+        panic!("--threat is not yet implemented. Input switching and Threat export block are pending (task #8).");
+    }
+    println!("Threat: disabled (not yet implemented)");
     println!("Buckets: {}", NUM_BUCKETS);
     println!("Bucket mode: {}", args.bucket_mode_name());
     if let Some(bounds) = ply_bounds {
@@ -1398,7 +1424,8 @@ fn main() {
     }
 
     // SavedFormat
-    let save_format = build_layerstack_save_format(input_size, ft_out, l1_out, l2_out, fv_scale);
+    let save_format =
+        build_layerstack_save_format(input_size, ft_out, l1_out, l2_out, fv_scale, args.psqt, args.threat);
 
     // Network builder
     let ft_out_c = ft_out;
@@ -1406,6 +1433,7 @@ fn main() {
     let l1_effective_c = l1_effective;
     let l2_out_c = l2_out;
     let l2_in_c = l2_in;
+    let use_psqt = args.psqt;
     let bucket_impl = match args.bucket_mode {
         BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
         BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
@@ -1487,13 +1515,6 @@ fn main() {
                 let l2 = builder.new_affine("l2", l2_in_c, NUM_BUCKETS * l2_out_c);
                 let l3 = builder.new_affine("l3", l2_out_c, NUM_BUCKETS);
 
-                // PSQT shortcut: FT と同じ入力、出力 = バケット数
-                // 学習初期に「PSQTなし」と等価にするため Zeroed で開始
-                let psqt = Affine {
-                    weights: builder.new_weights("psqtw", Shape::new(NUM_BUCKETS, input_size), InitSettings::Zeroed),
-                    bias: builder.new_weights("psqtb", Shape::new(NUM_BUCKETS, 1), InitSettings::Zeroed),
-                };
-
                 // Forward pass
                 let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
                 let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
@@ -1510,14 +1531,29 @@ fn main() {
                 let l3_out = l3.forward(l2_out_t).select(output_buckets);
                 let net_output = l3_out + l1_skip;
 
-                // PSQT shortcut (Stockfish 準拠: (stm - nstm) / 2)
-                // 各駒は両視点に逆符号で寄与するため、stm - nstm は正味の配置価値を
-                // 約2倍にカウントする。/2 はこの二重カウントを補正する正規化。
-                let stm_psqt = psqt.forward(stm_inputs);
-                let ntm_psqt = psqt.forward(ntm_inputs) * (-1.0);
-                let psqt_diff = (stm_psqt + ntm_psqt).select(output_buckets) * 0.5;
+                if use_psqt {
+                    // PSQT shortcut: FT と同じ入力、出力 = バケット数
+                    // 学習初期に「PSQTなし」と等価にするため Zeroed で開始
+                    let psqt = Affine {
+                        weights: builder.new_weights(
+                            "psqtw",
+                            Shape::new(NUM_BUCKETS, input_size),
+                            InitSettings::Zeroed,
+                        ),
+                        bias: builder.new_weights("psqtb", Shape::new(NUM_BUCKETS, 1), InitSettings::Zeroed),
+                    };
 
-                net_output + psqt_diff
+                    // PSQT shortcut (Stockfish 準拠: (stm - nstm) / 2)
+                    // 各駒は両視点に逆符号で寄与するため、stm - nstm は正味の配置価値を
+                    // 約2倍にカウントする。/2 はこの二重カウントを補正する正規化。
+                    let stm_psqt = psqt.forward(stm_inputs);
+                    let ntm_psqt = psqt.forward(ntm_inputs) * (-1.0);
+                    let psqt_diff = (stm_psqt + ntm_psqt).select(output_buckets) * 0.5;
+
+                    net_output + psqt_diff
+                } else {
+                    net_output
+                }
             })
         }};
     }

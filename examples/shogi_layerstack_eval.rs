@@ -32,7 +32,7 @@ use std::{
 use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::dataloader::PreparedBatchDevice};
 use bullet_lib::{
     game::{
-        inputs::{ShogiHalfKA_hm, SparseInputType},
+        inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, THREAT_DIMENSIONS},
         outputs::{
             OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
             SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -120,6 +120,10 @@ struct Args {
     /// Optional output path to dump evaluated positions as SFEN (one per line)
     #[arg(long)]
     dump_sfens: Option<PathBuf>,
+
+    /// Enable Threat concatenated input
+    #[arg(long, default_value_t = false)]
+    threat: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -545,37 +549,25 @@ fn main() {
     let l1_effective = l1_size - 1;
     let l2_input = l1_effective * 2;
     let l2_size = args.l2;
-    let input_size = ShogiHalfKA_hm.num_inputs();
+    let halfka_dim = ShogiHalfKA_hm.num_inputs();
+    let input_size = if args.threat { ShogiHalfKaHmThreat.num_inputs() } else { halfka_dim };
     let l1_input_dim = l0_size;
 
     // Integer golden forward mode: quantised.bin のみで整数演算 forward、trainer 不要
     if args.integer_forward {
-        let quantised_path = args
-            .quantised
-            .clone()
-            .unwrap_or_else(|| args.checkpoint.join("quantised.bin"));
+        let quantised_path = args.quantised.clone().unwrap_or_else(|| args.checkpoint.join("quantised.bin"));
         if !quantised_path.exists() {
             eprintln!("Error: quantised.bin not found: {}", quantised_path.display());
             std::process::exit(1);
         }
-        let net =
-            QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, input_size, args.scale)
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: Failed to load quantised.bin: {e}");
-                    std::process::exit(1);
-                });
+        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, input_size, args.scale)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: Failed to load quantised.bin: {e}");
+                std::process::exit(1);
+            });
         println!("=== Integer Golden Forward Mode ===");
         println!("quantised.bin: {}", quantised_path.display());
-        run_integer_forward(
-            &net,
-            &args.pack,
-            args.offset,
-            args.samples,
-            bucket_impl,
-            l0_size,
-            l1_size,
-            l2_size,
-        );
+        run_integer_forward(&net, &args.pack, args.offset, args.samples, bucket_impl, l0_size, l1_size, l2_size);
         return;
     }
 
@@ -1224,7 +1216,7 @@ fn dump_float_intermediates(
     println!();
 
     // Get active features for both perspectives
-    let (stm_features, nstm_features) = get_active_features(&psv);
+    let (stm_features, nstm_features) = get_active_features(&psv, false);
     println!("STM features: {} active", stm_features.len());
     println!("NSTM features: {} active", nstm_features.len());
 
@@ -1404,14 +1396,24 @@ fn dump_float_intermediates(
 }
 
 /// Get active features for a position
-fn get_active_features(psv: &bullet_lib::shogi::PackedSfenValue) -> (Vec<usize>, Vec<usize>) {
+fn get_active_features(
+    psv: &bullet_lib::shogi::PackedSfenValue,
+    use_threat: bool,
+) -> (Vec<usize>, Vec<usize>) {
     let mut stm_features = Vec::new();
     let mut nstm_features = Vec::new();
 
-    ShogiHalfKA_hm.map_features(psv, |stm_idx, nstm_idx| {
-        stm_features.push(stm_idx);
-        nstm_features.push(nstm_idx);
-    });
+    if use_threat {
+        ShogiHalfKaHmThreat.map_features(psv, |stm_idx, nstm_idx| {
+            stm_features.push(stm_idx);
+            nstm_features.push(nstm_idx);
+        });
+    } else {
+        ShogiHalfKA_hm.map_features(psv, |stm_idx, nstm_idx| {
+            stm_features.push(stm_idx);
+            nstm_features.push(nstm_idx);
+        });
+    }
 
     debug_assert_eq!(stm_features.len(), nstm_features.len());
     (stm_features, nstm_features)
@@ -1425,11 +1427,13 @@ fn get_active_features(psv: &bullet_lib::shogi::PackedSfenValue) -> (Vec<usize>,
 struct QuantisedNetwork {
     arch_str: String,
     has_psqt: bool,
+    has_threat: bool,
     fv_scale: i32,
     ft_biases: Vec<i16>,
     ft_weights: Vec<i16>,
     psqt_biases: Vec<i32>,
     psqt_weights: Vec<i32>,
+    threat_weights: Vec<i8>,
     l1_biases: Vec<i32>,
     l1_weights: Vec<i8>,
     l2_biases: Vec<i32>,
@@ -1459,14 +1463,20 @@ impl QuantisedNetwork {
         f.read_exact(&mut arch_buf)?;
         let arch_str = String::from_utf8_lossy(&arch_buf).to_string();
         let has_psqt = arch_str.contains("PSQT=");
+        let has_threat = arch_str.contains("Threat=");
+        // FT weights は HalfKA 部分のみ (Threat 部分は別ブロック)
+        let halfka_dim_for_load = if has_threat {
+            input_size - THREAT_DIMENSIONS
+        } else {
+            input_size
+        };
 
         // Parse fv_scale from architecture string ("...,fv_scale=N")
         let fv_scale = arch_str
             .split(',')
             .find_map(|part| {
                 let part = part.trim();
-                part.strip_prefix("fv_scale=")
-                    .and_then(|v| v.parse::<i32>().ok())
+                part.strip_prefix("fv_scale=").and_then(|v| v.parse::<i32>().ok())
             })
             .unwrap_or(default_fv_scale);
 
@@ -1483,25 +1493,22 @@ impl QuantisedNetwork {
                 format!("FT bias length mismatch: got {}, expected {}", ft_biases.len(), l0_size),
             ));
         }
-        if ft_weights.len() != input_size * l0_size {
+        if ft_weights.len() != halfka_dim_for_load * l0_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "FT weight length mismatch: got {}, expected {}",
-                    ft_weights.len(),
-                    input_size * l0_size
-                ),
+                format!("FT weight length mismatch: got {}, expected {}", ft_weights.len(), halfka_dim_for_load * l0_size),
             ));
         }
 
         // PSQT block (only if architecture includes PSQT)
+        // PSQT は HalfKA 部分のみ
         let (psqt_biases, psqt_weights) = if has_psqt {
             let mut biases = vec![0i32; NUM_BUCKETS];
             for b in biases.iter_mut() {
                 f.read_exact(&mut buf4)?;
                 *b = i32::from_le_bytes(buf4);
             }
-            let weight_count = input_size * NUM_BUCKETS;
+            let weight_count = halfka_dim_for_load * NUM_BUCKETS;
             let mut weights = vec![0i32; weight_count];
             for w in weights.iter_mut() {
                 f.read_exact(&mut buf4)?;
@@ -1509,7 +1516,18 @@ impl QuantisedNetwork {
             }
             (biases, weights)
         } else {
-            (vec![0i32; NUM_BUCKETS], vec![0i32; input_size * NUM_BUCKETS])
+            (vec![0i32; NUM_BUCKETS], vec![0i32; halfka_dim_for_load * NUM_BUCKETS])
+        };
+
+        // Threat block (i8 raw, after PSQT)
+        let threat_weights = if has_threat {
+            let count = THREAT_DIMENSIONS * l0_size;
+            let mut weights = vec![0i8; count];
+            let slice = unsafe { std::slice::from_raw_parts_mut(weights.as_mut_ptr() as *mut u8, count) };
+            f.read_exact(slice)?;
+            weights
+        } else {
+            Vec::new()
         };
 
         // LayerStack per-bucket: [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
@@ -1577,11 +1595,13 @@ impl QuantisedNetwork {
         Ok(QuantisedNetwork {
             arch_str,
             has_psqt,
+            has_threat,
             fv_scale,
             ft_biases,
             ft_weights,
             psqt_biases,
             psqt_weights,
+            threat_weights,
             l1_biases,
             l1_weights,
             l2_biases,
@@ -1630,23 +1650,56 @@ fn run_integer_forward(
         let decoded = psv.decode();
         let sfen = board_to_sfen(&decoded, psv.game_ply());
         let bucket = bucket_impl.bucket(&psv) as usize;
-        let (stm_features, nstm_features) = get_active_features(&psv);
+        // HalfKA features のみ (Threat は別途処理)
+        let (stm_features, nstm_features) = get_active_features(&psv, false);
+        // Threat features (has_threat の場合のみ)
+        let (stm_threat, nstm_threat) = if net.has_threat {
+            let (all_stm, all_nstm) = get_active_features(&psv, true);
+            // Threat features = index >= halfka_dim の部分
+            let halfka_dim = ShogiHalfKA_hm.num_inputs();
+            let t_stm: Vec<usize> = all_stm.into_iter().filter(|&i| i >= halfka_dim).collect();
+            let t_nstm: Vec<usize> = all_nstm.into_iter().filter(|&i| i >= halfka_dim).collect();
+            (t_stm, t_nstm)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         println!("=== Integer Golden Forward (sample {}) ===", offset + sample_idx as u64);
         println!("SFEN: {}", sfen);
         println!("bucket_index: {}", bucket);
+        if net.has_threat {
+            println!("HalfKA features: {}, Threat features: {}", stm_features.len(), stm_threat.len());
+        }
 
         // --- 1. Feature Transformer accumulation (i16) ---
+        // Piece (HalfKA) weights: i16
         let mut acc_stm = net.ft_biases.clone();
         let mut acc_nstm = net.ft_biases.clone();
         for &feat in &stm_features {
             for i in 0..l0_size {
-                acc_stm[i] += net.ft_weights[feat * l0_size + i];
+                acc_stm[i] = acc_stm[i].wrapping_add(net.ft_weights[feat * l0_size + i]);
             }
         }
         for &feat in &nstm_features {
             for i in 0..l0_size {
-                acc_nstm[i] += net.ft_weights[feat * l0_size + i];
+                acc_nstm[i] = acc_nstm[i].wrapping_add(net.ft_weights[feat * l0_size + i]);
+            }
+        }
+
+        // Threat weights: i8 → i16 sign-extended add
+        if net.has_threat {
+            let halfka_dim = ShogiHalfKA_hm.num_inputs();
+            for &feat in &stm_threat {
+                let threat_idx = feat - halfka_dim;
+                for i in 0..l0_size {
+                    acc_stm[i] = acc_stm[i].wrapping_add(net.threat_weights[threat_idx * l0_size + i] as i16);
+                }
+            }
+            for &feat in &nstm_threat {
+                let threat_idx = feat - halfka_dim;
+                for i in 0..l0_size {
+                    acc_nstm[i] = acc_nstm[i].wrapping_add(net.threat_weights[threat_idx * l0_size + i] as i16);
+                }
             }
         }
 
@@ -1675,8 +1728,7 @@ fn run_integer_forward(
             let global_out = bucket * l1_size + out;
             l1_out[out] = net.l1_biases[global_out];
             for in_idx in 0..l1_input_dim {
-                l1_out[out] += net.l1_weights[global_out * l1_input_dim + in_idx] as i32
-                    * pp_out[in_idx] as i32;
+                l1_out[out] += net.l1_weights[global_out * l1_input_dim + in_idx] as i32 * pp_out[in_idx] as i32;
             }
         }
 
@@ -1704,8 +1756,7 @@ fn run_integer_forward(
             let global_out = bucket * l2_size + out;
             l2_raw[out] = net.l2_biases[global_out];
             for in_idx in 0..l2_in_dim {
-                l2_raw[out] +=
-                    net.l2_weights[global_out * l2_in_dim + in_idx] as i32 * l2_in[in_idx] as i32;
+                l2_raw[out] += net.l2_weights[global_out * l2_in_dim + in_idx] as i32 * l2_in[in_idx] as i32;
             }
         }
         let mut l2_relu = vec![0u8; l2_size];

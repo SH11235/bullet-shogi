@@ -560,7 +560,7 @@ fn main() {
             eprintln!("Error: quantised.bin not found: {}", quantised_path.display());
             std::process::exit(1);
         }
-        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, input_size, args.scale)
+        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, args.scale)
             .unwrap_or_else(|e| {
                 eprintln!("Error: Failed to load quantised.bin: {e}");
                 std::process::exit(1);
@@ -759,11 +759,12 @@ fn main() {
                     eprintln!("Warning: FT bias length mismatch: got {}, expected {}", ft_biases_q.len(), l0_size);
                     return;
                 }
-                if ft_weights_q.len() != input_size * l0_size {
+                // FT weights は HalfKA 部分のみ（Threat 有効時も同一）
+                if ft_weights_q.len() != halfka_dim * l0_size {
                     eprintln!(
                         "Warning: FT weight length mismatch: got {}, expected {}",
                         ft_weights_q.len(),
-                        input_size * l0_size
+                        halfka_dim * l0_size
                     );
                     return;
                 }
@@ -796,7 +797,7 @@ fn main() {
                         let _ = f.read_exact(&mut buf4);
                         *bias = i32::from_le_bytes(buf4);
                     }
-                    let weight_count = input_size * NUM_BUCKETS;
+                    let weight_count = halfka_dim * NUM_BUCKETS;
                     let mut psqt_weights_q = vec![0i32; weight_count];
                     for w in psqt_weights_q.iter_mut() {
                         let _ = f.read_exact(&mut buf4);
@@ -1448,7 +1449,6 @@ impl QuantisedNetwork {
         l0_size: usize,
         l1_size: usize,
         l2_size: usize,
-        input_size: usize,
         default_fv_scale: i32,
     ) -> io::Result<Self> {
         let mut f = File::open(path)?;
@@ -1464,12 +1464,9 @@ impl QuantisedNetwork {
         let arch_str = String::from_utf8_lossy(&arch_buf).to_string();
         let has_psqt = arch_str.contains("PSQT=");
         let has_threat = arch_str.contains("Threat=");
-        // FT weights は HalfKA 部分のみ (Threat 部分は別ブロック)
-        let halfka_dim_for_load = if has_threat {
-            input_size - THREAT_DIMENSIONS
-        } else {
-            input_size
-        };
+        // FT weights / PSQT は HalfKA 部分のみ (Threat は別ブロック)
+        // arch_str から自動判定し、CLI --threat フラグに依存しない
+        let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
 
         // Parse fv_scale from architecture string ("...,fv_scale=N")
         let fv_scale = arch_str
@@ -1493,10 +1490,10 @@ impl QuantisedNetwork {
                 format!("FT bias length mismatch: got {}, expected {}", ft_biases.len(), l0_size),
             ));
         }
-        if ft_weights.len() != halfka_dim_for_load * l0_size {
+        if ft_weights.len() != halfka_dim * l0_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("FT weight length mismatch: got {}, expected {}", ft_weights.len(), halfka_dim_for_load * l0_size),
+                format!("FT weight length mismatch: got {}, expected {}", ft_weights.len(), halfka_dim * l0_size),
             ));
         }
 
@@ -1508,7 +1505,7 @@ impl QuantisedNetwork {
                 f.read_exact(&mut buf4)?;
                 *b = i32::from_le_bytes(buf4);
             }
-            let weight_count = halfka_dim_for_load * NUM_BUCKETS;
+            let weight_count = halfka_dim * NUM_BUCKETS;
             let mut weights = vec![0i32; weight_count];
             for w in weights.iter_mut() {
                 f.read_exact(&mut buf4)?;
@@ -1516,7 +1513,7 @@ impl QuantisedNetwork {
             }
             (biases, weights)
         } else {
-            (vec![0i32; NUM_BUCKETS], vec![0i32; halfka_dim_for_load * NUM_BUCKETS])
+            (vec![0i32; NUM_BUCKETS], vec![0i32; halfka_dim * NUM_BUCKETS])
         };
 
         // Threat block (i8 raw, after PSQT)

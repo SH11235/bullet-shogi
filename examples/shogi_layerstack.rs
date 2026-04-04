@@ -239,11 +239,11 @@ struct Args {
     ply_bounds: Option<String>,
 
     /// Enable PSQT shortcut layer
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     psqt: bool,
 
     /// Enable Threat concatenated input (placeholder for future implementation)
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     threat: bool,
 
     /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs

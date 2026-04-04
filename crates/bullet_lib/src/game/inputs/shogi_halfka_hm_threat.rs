@@ -9,73 +9,17 @@
 //! - Threat: rshogi `threat_features.rs` と同一 index 計算
 //! - 仕様メモ: `docs/threat_spec.md` (rshogi リポジトリ)
 
-use super::shogi_halfka::{HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES};
+use std::sync::LazyLock;
+
 use super::SparseInputType;
+use super::shogi_halfka::{
+    HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece,
+};
 use crate::shogi::{
     PackedSfenValue, ShogiBoard,
+    bona_piece::BonaPiece,
     types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, PieceType, Square},
 };
-
-// =============================================================================
-// HalfKA_hm 再利用 (shogi_halfka.rs からインポートできない private 関数を複製)
-// =============================================================================
-
-// shogi_halfka.rs の private 関数を再利用するため、必要なものだけここに複製する。
-// 理想的には shogi_halfka.rs の関数を pub にすべきだが、既存コードの変更を最小限にする。
-
-use crate::shogi::bona_piece::{BonaPiece, E_KING, F_KING, FE_HAND_END};
-
-/// キングバケットを計算 (Half-Mirror)
-#[inline]
-fn king_bucket(ksq: Square, perspective: Color) -> usize {
-    let sq = if perspective == Color::Black { ksq } else { ksq.inverse() };
-    let file = sq.file() as usize;
-    let rank = sq.rank() as usize;
-    let file_m = if file >= 5 { 8 - file } else { file };
-    file_m * 9 + rank
-}
-
-/// Half-Mirror が必要かどうかを判定
-#[inline]
-fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
-    let sq = if perspective == Color::Black { ksq } else { ksq.inverse() };
-    sq.file() as usize >= 5
-}
-
-/// BonaPiece を HalfKA_hm 用にパック
-#[inline]
-fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
-    let mut pp = bp.value() as usize;
-    if hm_mirror && pp >= FE_HAND_END {
-        let rel = pp - FE_HAND_END;
-        let piece_index = rel / 81;
-        let sq = rel % 81;
-        let file = sq / 9;
-        let rank = sq % 9;
-        let mirrored_file = 8 - file;
-        let mirrored_sq = mirrored_file * 9 + rank;
-        pp = FE_HAND_END + piece_index * 81 + mirrored_sq;
-    }
-    if pp >= E_KING as usize {
-        pp -= 81;
-    }
-    pp
-}
-
-/// 王の BonaPiece を生成
-#[inline]
-fn king_bonapiece(sq_index: usize, is_friend: bool) -> BonaPiece {
-    let base = if is_friend { F_KING } else { E_KING };
-    BonaPiece::new((base as usize + sq_index) as u16)
-}
-
-/// HalfKA_hm の特徴インデックスを計算
-const PIECE_INPUTS: usize = 1629;
-
-#[inline]
-fn halfka_index(kb: usize, packed_bp: usize) -> usize {
-    kb * PIECE_INPUTS + packed_bp
-}
 
 // =============================================================================
 // Threat 定数
@@ -205,11 +149,7 @@ const NUM_ATTACK_PATTERNS: usize = 14;
 fn is_directional(class: ThreatClass) -> bool {
     matches!(
         class,
-        ThreatClass::Pawn
-            | ThreatClass::Lance
-            | ThreatClass::Knight
-            | ThreatClass::Silver
-            | ThreatClass::GoldLike
+        ThreatClass::Pawn | ThreatClass::Lance | ThreatClass::Knight | ThreatClass::Silver | ThreatClass::GoldLike
     )
 }
 
@@ -277,13 +217,7 @@ fn attacks_empty_board(class: ThreatClass, color: Color, from: Square) -> ([u8; 
             // 先手: (-1,-1),(0,-1),(1,-1),(-1,1),(1,1)
             // 後手: (-1,1),(0,1),(1,1),(-1,-1),(1,-1)
             let forward: i8 = if color == Color::Black { -1 } else { 1 };
-            let deltas: [(i8, i8); 5] = [
-                (-1, forward),
-                (0, forward),
-                (1, forward),
-                (-1, -forward),
-                (1, -forward),
-            ];
+            let deltas: [(i8, i8); 5] = [(-1, forward), (0, forward), (1, forward), (-1, -forward), (1, -forward)];
             for (df, dr) in deltas {
                 let f = file + df;
                 let r = rank + dr;
@@ -297,14 +231,7 @@ fn attacks_empty_board(class: ThreatClass, color: Color, from: Square) -> ([u8; 
             // 先手: (-1,-1),(0,-1),(1,-1),(-1,0),(1,0),(0,1)
             // 後手: (-1,1),(0,1),(1,1),(-1,0),(1,0),(0,-1)
             let forward: i8 = if color == Color::Black { -1 } else { 1 };
-            let deltas: [(i8, i8); 6] = [
-                (-1, forward),
-                (0, forward),
-                (1, forward),
-                (-1, 0),
-                (1, 0),
-                (0, -forward),
-            ];
+            let deltas: [(i8, i8); 6] = [(-1, forward), (0, forward), (1, forward), (-1, 0), (1, 0), (0, -forward)];
             for (df, dr) in deltas {
                 let f = file + df;
                 let r = rank + dr;
@@ -434,8 +361,7 @@ impl FromOffsetTable {
                 let mut cumulative = 0usize;
                 for sq_raw in 0..81u8 {
                     data[pattern][sq_raw as usize] = cumulative;
-                    let (_, cnt) =
-                        attacks_empty_board(class, Color::Black, Square(sq_raw));
+                    let (_, cnt) = attacks_empty_board(class, Color::Black, Square(sq_raw));
                     cumulative += cnt;
                 }
             }
@@ -445,8 +371,7 @@ impl FromOffsetTable {
                 let mut cumulative = 0usize;
                 for sq_raw in 0..81u8 {
                     data[pattern][sq_raw as usize] = cumulative;
-                    let (_, cnt) =
-                        attacks_empty_board(class, Color::White, Square(sq_raw));
+                    let (_, cnt) = attacks_empty_board(class, Color::White, Square(sq_raw));
                     cumulative += cnt;
                 }
             }
@@ -461,6 +386,9 @@ impl FromOffsetTable {
     }
 }
 
+/// 遅延初期化された `FromOffsetTable` シングルトン
+static FROM_OFFSET_TABLE: LazyLock<FromOffsetTable> = LazyLock::new(FromOffsetTable::new);
+
 // =============================================================================
 // attack_order 計算
 // =============================================================================
@@ -474,10 +402,7 @@ fn compute_attack_order(class: ThreatClass, color: Color, from_sq: Square, to_sq
             return i;
         }
     }
-    panic!(
-        "attack_order: to_sq {} is not attacked by {:?} ({:?}) at {}",
-        to_sq.0, class, color, from_sq.0
-    );
+    panic!("attack_order: to_sq {} is not attacked by {:?} ({:?}) at {}", to_sq.0, class, color, from_sq.0);
 }
 
 // =============================================================================
@@ -506,22 +431,12 @@ impl Occupied {
 
     #[inline]
     fn is_occupied(&self, sq: u8) -> bool {
-        if sq < 64 {
-            (self.bits[0] >> sq) & 1 != 0
-        } else {
-            (self.bits[1] >> (sq - 64)) & 1 != 0
-        }
+        if sq < 64 { (self.bits[0] >> sq) & 1 != 0 } else { (self.bits[1] >> (sq - 64)) & 1 != 0 }
     }
 }
 
 /// 実盤面上の攻撃先マスを列挙し、コールバックを呼ぶ
-fn for_each_attack<F: FnMut(Square)>(
-    pt: PieceType,
-    color: Color,
-    from: Square,
-    occ: &Occupied,
-    mut callback: F,
-) {
+fn for_each_attack<F: FnMut(Square)>(pt: PieceType, color: Color, from: Square, occ: &Occupied, mut callback: F) {
     let file = from.file() as i8;
     let rank = from.rank() as i8;
 
@@ -564,13 +479,7 @@ fn for_each_attack<F: FnMut(Square)>(
         }
         PieceType::Silver => {
             let forward: i8 = if color == Color::Black { -1 } else { 1 };
-            let deltas: [(i8, i8); 5] = [
-                (-1, forward),
-                (0, forward),
-                (1, forward),
-                (-1, -forward),
-                (1, -forward),
-            ];
+            let deltas: [(i8, i8); 5] = [(-1, forward), (0, forward), (1, forward), (-1, -forward), (1, -forward)];
             for (df, dr) in deltas {
                 let f = file + df;
                 let r = rank + dr;
@@ -579,20 +488,9 @@ fn for_each_attack<F: FnMut(Square)>(
                 }
             }
         }
-        PieceType::Gold
-        | PieceType::ProPawn
-        | PieceType::ProLance
-        | PieceType::ProKnight
-        | PieceType::ProSilver => {
+        PieceType::Gold | PieceType::ProPawn | PieceType::ProLance | PieceType::ProKnight | PieceType::ProSilver => {
             let forward: i8 = if color == Color::Black { -1 } else { 1 };
-            let deltas: [(i8, i8); 6] = [
-                (-1, forward),
-                (0, forward),
-                (1, forward),
-                (-1, 0),
-                (1, 0),
-                (0, -forward),
-            ];
+            let deltas: [(i8, i8); 6] = [(-1, forward), (0, forward), (1, forward), (-1, 0), (1, 0), (0, -forward)];
             for (df, dr) in deltas {
                 let f = file + df;
                 let r = rank + dr;
@@ -713,20 +611,11 @@ struct ThreatParams {
 /// Threat index を計算する
 #[inline]
 fn threat_index(params: &ThreatParams, from_offset_table: &FromOffsetTable) -> usize {
-    let base = pair_base(
-        params.attacker_side,
-        params.attacker_class,
-        params.attacked_side,
-        params.attacked_class,
-    );
+    let base = pair_base(params.attacker_side, params.attacker_class, params.attacked_side, params.attacked_class);
     let pattern = attack_pattern_id(params.attacker_class, params.oriented_color);
     let from_off = from_offset_table.get(pattern, params.from_sq_n);
-    let attack_ord = compute_attack_order(
-        params.attacker_class,
-        params.oriented_color,
-        params.from_sq_n,
-        params.to_sq_n,
-    );
+    let attack_ord =
+        compute_attack_order(params.attacker_class, params.oriented_color, params.from_sq_n, params.to_sq_n);
     base + from_off + attack_ord
 }
 
@@ -763,10 +652,7 @@ impl SparseInputType for ShogiHalfKaHmThreat {
     }
 
     fn description(&self) -> String {
-        format!(
-            "Shogi HalfKA_hm ({}) + Threat ({}) concatenated",
-            HALFKA_HM_DIMENSIONS, THREAT_DIMENSIONS
-        )
+        format!("Shogi HalfKA_hm ({}) + Threat ({}) concatenated", HALFKA_HM_DIMENSIONS, THREAT_DIMENSIONS)
     }
 }
 
@@ -814,38 +700,24 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
 
     // 両方の玉の特徴量
     {
-        let stm_king_sq_idx = if stm == Color::Black {
-            stm_king_sq.index()
-        } else {
-            stm_king_sq.inverse().index()
-        };
+        let stm_king_sq_idx = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
         let stm_friend_king_bp = king_bonapiece(stm_king_sq_idx, true);
         let stm_friend_packed = pack_bonapiece(stm_friend_king_bp, stm_hm);
         let stm_friend_idx = halfka_index(stm_kb, stm_friend_packed);
 
-        let nstm_king_sq_for_stm = if stm == Color::Black {
-            nstm_king_sq.index()
-        } else {
-            nstm_king_sq.inverse().index()
-        };
+        let nstm_king_sq_for_stm =
+            if stm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
         let stm_enemy_king_bp = king_bonapiece(nstm_king_sq_for_stm, false);
         let stm_enemy_packed = pack_bonapiece(stm_enemy_king_bp, stm_hm);
         let stm_enemy_idx = halfka_index(stm_kb, stm_enemy_packed);
 
-        let nstm_king_sq_idx = if nstm == Color::Black {
-            nstm_king_sq.index()
-        } else {
-            nstm_king_sq.inverse().index()
-        };
+        let nstm_king_sq_idx = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
         let nstm_friend_king_bp = king_bonapiece(nstm_king_sq_idx, true);
         let nstm_friend_packed = pack_bonapiece(nstm_friend_king_bp, nstm_hm);
         let nstm_friend_idx = halfka_index(nstm_kb, nstm_friend_packed);
 
-        let stm_king_sq_for_nstm = if nstm == Color::Black {
-            stm_king_sq.index()
-        } else {
-            stm_king_sq.inverse().index()
-        };
+        let stm_king_sq_for_nstm =
+            if nstm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
         let nstm_enemy_king_bp = king_bonapiece(stm_king_sq_for_nstm, false);
         let nstm_enemy_packed = pack_bonapiece(nstm_enemy_king_bp, nstm_hm);
         let nstm_enemy_idx = halfka_index(nstm_kb, nstm_enemy_packed);
@@ -881,7 +753,7 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
     // Part 2: Threat 特徴量
     // -------------------------------------------------------
 
-    let from_offset_table = FromOffsetTable::new();
+    let from_offset_table = &*FROM_OFFSET_TABLE;
     let occ = Occupied::from_board(board);
 
     // STM perspective
@@ -934,11 +806,7 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
             let stm_attacked_side = if target_color == stm_friend { 0 } else { 1 };
             let stm_from_n = normalize_sq(from_sq, stm, stm_hm);
             let stm_to_n = normalize_sq(to_sq, stm, stm_hm);
-            let stm_oriented_color = if stm == Color::Black {
-                attacker_color
-            } else {
-                attacker_color.opponent()
-            };
+            let stm_oriented_color = if stm == Color::Black { attacker_color } else { attacker_color.opponent() };
             let stm_threat_idx = threat_index(
                 &ThreatParams {
                     attacker_side: stm_attacker_side,
@@ -949,7 +817,7 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
                     from_sq_n: stm_from_n,
                     to_sq_n: stm_to_n,
                 },
-                &from_offset_table,
+                from_offset_table,
             );
             debug_assert!(stm_threat_idx < THREAT_DIMENSIONS);
             let stm_idx = HALFKA_HM_DIMENSIONS + stm_threat_idx;
@@ -959,11 +827,7 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
             let nstm_attacked_side = if target_color == nstm_friend { 0 } else { 1 };
             let nstm_from_n = normalize_sq(from_sq, nstm, nstm_hm);
             let nstm_to_n = normalize_sq(to_sq, nstm, nstm_hm);
-            let nstm_oriented_color = if nstm == Color::Black {
-                attacker_color
-            } else {
-                attacker_color.opponent()
-            };
+            let nstm_oriented_color = if nstm == Color::Black { attacker_color } else { attacker_color.opponent() };
             let nstm_threat_idx = threat_index(
                 &ThreatParams {
                     attacker_side: nstm_attacker_side,
@@ -974,7 +838,7 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
                     from_sq_n: nstm_from_n,
                     to_sq_n: nstm_to_n,
                 },
-                &from_offset_table,
+                from_offset_table,
             );
             debug_assert!(nstm_threat_idx < THREAT_DIMENSIONS);
             let nstm_idx = HALFKA_HM_DIMENSIONS + nstm_threat_idx;
@@ -1011,10 +875,7 @@ mod tests {
         // 最後の pair の末尾が THREAT_DIMENSIONS と一致
         let last_idx = 162 + 8 * 18 + 9 + 8;
         let last_base = PAIR_BASE[last_idx];
-        assert_eq!(
-            last_base + ATTACKS_PER_COLOR[ThreatClass::Dragon as usize],
-            THREAT_DIMENSIONS
-        );
+        assert_eq!(last_base + ATTACKS_PER_COLOR[ThreatClass::Dragon as usize], THREAT_DIMENSIONS);
     }
 
     #[test]
@@ -1037,11 +898,7 @@ mod tests {
                     cnt
                 })
                 .sum();
-            assert_eq!(
-                total, ATTACKS_PER_COLOR[i],
-                "{:?}: expected {}, got {}",
-                class, ATTACKS_PER_COLOR[i], total
-            );
+            assert_eq!(total, ATTACKS_PER_COLOR[i], "{:?}: expected {}, got {}", class, ATTACKS_PER_COLOR[i], total);
         }
     }
 
@@ -1063,10 +920,7 @@ mod tests {
         let pattern = attack_pattern_id(ThreatClass::Rook, Color::Black);
         // Rook: 全マスで attacks=16
         for sq_raw in 0..81u8 {
-            assert_eq!(
-                table.get(pattern, Square(sq_raw)),
-                16 * sq_raw as usize
-            );
+            assert_eq!(table.get(pattern, Square(sq_raw)), 16 * sq_raw as usize);
         }
     }
 
@@ -1078,10 +932,7 @@ mod tests {
 
         // 最初の攻撃先は order=0
         let first_sq = Square(targets[0]);
-        assert_eq!(
-            compute_attack_order(ThreatClass::Rook, Color::Black, Square(40), first_sq),
-            0
-        );
+        assert_eq!(compute_attack_order(ThreatClass::Rook, Color::Black, Square(40), first_sq), 0);
     }
 
     #[test]
@@ -1250,10 +1101,7 @@ mod tests {
         assert_eq!(normalize_sq(sq, Color::White, false), sq.inverse());
 
         // White perspective, mirror: inverse + mirror
-        assert_eq!(
-            normalize_sq(sq, Color::White, true),
-            sq.inverse().mirror_file()
-        );
+        assert_eq!(normalize_sq(sq, Color::White, true), sq.inverse().mirror_file());
     }
 
     /// Canonical test vector: rshogi の threat_features.rs と同一の初期局面 threat index を検証
@@ -1318,7 +1166,8 @@ mod tests {
         ];
 
         assert_eq!(
-            stm_threat_indices, expected,
+            stm_threat_indices,
+            expected,
             "Canonical mismatch with rshogi! count: bullet={} vs expected={}",
             stm_threat_indices.len(),
             expected.len()

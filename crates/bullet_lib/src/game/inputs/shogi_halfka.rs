@@ -227,7 +227,7 @@ fn map_halfka_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 /// 9段:    8   17   26   35   44
 /// ```
 #[inline]
-fn king_bucket(ksq: Square, perspective: Color) -> usize {
+pub(crate) fn king_bucket(ksq: Square, perspective: Color) -> usize {
     // 視点に応じてマスを変換（後手視点では盤面を180度回転）
     let sq = if perspective == Color::Black { ksq } else { ksq.inverse() };
 
@@ -245,7 +245,7 @@ fn king_bucket(ksq: Square, perspective: Color) -> usize {
 ///
 /// 玉のファイルが 5 以上 (6筋-9筋) の場合に true。
 #[inline]
-fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
+pub(crate) fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
     let sq = if perspective == Color::Black { ksq } else { ksq.inverse() };
     sq.file() as usize >= 5
 }
@@ -260,7 +260,7 @@ fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
 /// 2. 盤上駒 (>=90): hm_mirror が必要な場合はマス目を反転
 /// 3. 敵王 (>=e_king): -81 して f_king 平面に揃える
 #[inline]
-fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
+pub(crate) fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
     let mut pp = bp.value() as usize;
 
     // 手駒はミラー不要
@@ -291,14 +291,14 @@ fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
 ///
 /// HalfKA_hm では両方の王を特徴量に含める。
 #[inline]
-fn king_bonapiece(sq_index: usize, is_friend: bool) -> BonaPiece {
+pub(crate) fn king_bonapiece(sq_index: usize, is_friend: bool) -> BonaPiece {
     let base = if is_friend { F_KING } else { E_KING };
     BonaPiece::new((base as usize + sq_index) as u16)
 }
 
 /// HalfKA_hm の特徴インデックスを計算
 #[inline]
-fn halfka_index(kb: usize, packed_bp: usize) -> usize {
+pub(crate) fn halfka_index(kb: usize, packed_bp: usize) -> usize {
     kb * PIECE_INPUTS + packed_bp
 }
 

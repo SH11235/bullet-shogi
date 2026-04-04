@@ -26,7 +26,7 @@ use crate::shogi::{
 // =============================================================================
 
 /// Threat の総特徴量次元数
-const THREAT_DIMENSIONS: usize = 216_720;
+pub const THREAT_DIMENSIONS: usize = 216_720;
 
 /// ThreatClass の数（King 除外）
 const NUM_THREAT_CLASSES: usize = 9;

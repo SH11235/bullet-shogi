@@ -40,7 +40,7 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
-    game::inputs::{ShogiHalfKA_hm, SparseInputType},
+    game::inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, THREAT_DIMENSIONS},
     game::outputs::{
         SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
         SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -958,6 +958,7 @@ fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32
 ///
 /// rshogi NetworkLayerStacks::read() と完全互換のバイナリを生成。
 fn build_layerstack_save_format(
+    halfka_dim: usize,
     input_size: usize,
     ft_out: usize,
     l1_out: usize,
@@ -978,9 +979,7 @@ fn build_layerstack_save_format(
 
     // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
     let psqt_part = if psqt { format!("PSQT={},", NUM_BUCKETS) } else { String::new() };
-    // Threat は入力切り替え・export 実装完了後に有効化する
-    let threat_part = String::new();
-    let _ = threat; // 将来使用
+    let threat_part = if threat { format!("Threat={THREAT_DIMENSIONS},") } else { String::new() };
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
          {psqt_part}\
@@ -1036,18 +1035,22 @@ fn build_layerstack_save_format(
         .quantise::<i8>(1);
 
     let qa_i16 = QA;
+    let halfka_dim_captured = halfka_dim;
     let ft_weights_leb128 = SavedFormat::empty()
         .transform(move |graph, _| {
             let l0w = graph.get("l0w");
 
             // Quantise to i16 (scale = QA = 127)
+            // Threat 有効時は最初の halfka_dim 特徴量のみ（piece 部分）を書き出す。
+            // column-major: l0w.values[feat * ft_out + out]
+            // piece 部分 = feat 0..halfka_dim → indices 0..halfka_dim*ft_out
             let qa_f = qa_i16 as f64;
-            let weights_i16: Vec<i16> = l0w.values.iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
-            // acyclib dense weights are column-major [rows, cols].
-            // l0w shape is [ft_out, input_size], so storage index is:
-            //   idx = feat * ft_out + out
-            // This already matches NNUE FT layout [input][output], so no transpose is required.
-            let _ = (ft_out_captured, input_size_captured);
+            let piece_end = halfka_dim_captured * ft_out_captured;
+            let weights_i16: Vec<i16> = l0w.values[..piece_end]
+                .iter()
+                .map(|&v| (qa_f * v as f64).round() as i16)
+                .collect();
+            let _ = input_size_captured;
             let leb128_bytes = encode_leb128_tensor_i16(&weights_i16);
             leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
         })
@@ -1055,7 +1058,8 @@ fn build_layerstack_save_format(
 
     // ---- PSQT weights/biases (raw i32) ----
     let psqt_data = if psqt {
-        let input_size_for_psqt = input_size;
+        // PSQT は HalfKA 特徴量のみ対象。Threat 部分は含めない。
+        let input_size_for_psqt = halfka_dim;
         Some(
             SavedFormat::empty()
                 .transform(move |graph, _| {
@@ -1082,6 +1086,36 @@ fn build_layerstack_save_format(
                     }
 
                     // byte passthrough: 各バイトを i8 として f32 にキャスト
+                    bytes.iter().map(|&b| (b as i8) as f32).collect()
+                })
+                .quantise::<i8>(1),
+        )
+    } else {
+        None
+    };
+
+    // ---- Threat weights (raw i8) ----
+    // l0w の threat 部分 (feat halfka_dim..input_size) を i8 で書き出す。
+    // レイアウト: i8[THREAT_DIMENSIONS × ft_out] (feature-major)
+    let threat_data = if threat {
+        let halfka_dim_for_threat = halfka_dim;
+        let ft_out_for_threat = ft_out;
+        let qa_for_threat = QA;
+        Some(
+            SavedFormat::empty()
+                .transform(move |graph, _| {
+                    let l0w = graph.get("l0w");
+                    let qa_f = qa_for_threat as f64;
+
+                    // threat 部分: feat halfka_dim..input_size
+                    // column-major: indices halfka_dim*ft_out .. input_size*ft_out
+                    let threat_start = halfka_dim_for_threat * ft_out_for_threat;
+                    let mut bytes: Vec<u8> = Vec::new();
+                    for &v in &l0w.values[threat_start..] {
+                        let q = (qa_f * v as f64).round().clamp(-128.0, 127.0) as i8;
+                        bytes.push(q as u8);
+                    }
+
                     bytes.iter().map(|&b| (b as i8) as f32).collect()
                 })
                 .quantise::<i8>(1),
@@ -1229,6 +1263,9 @@ fn build_layerstack_save_format(
     if let Some(psqt) = psqt_data {
         formats.push(psqt);
     }
+    if let Some(threat) = threat_data {
+        formats.push(threat);
+    }
     formats.push(layerstack_data);
     formats
 }
@@ -1257,7 +1294,12 @@ fn main() {
     let l1_effective = l1_out - 1;
     let l2_in = l1_effective * 2;
     let l2_out = args.l2;
-    let input_size = ShogiHalfKA_hm.num_inputs();
+    let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
+    let input_size = if args.threat {
+        ShogiHalfKaHmThreat.num_inputs() // 73305 + 216720 = 290025
+    } else {
+        halfka_dim
+    };
 
     let optimizer_name = match args.optimizer {
         OptimizerType::AdamW => "AdamW",
@@ -1276,10 +1318,11 @@ fn main() {
     );
     println!("L2 input: {} (sqr_crelu concat crelu)", l2_in);
     println!("PSQT shortcut: {}", if args.psqt { "enabled" } else { "disabled" });
-    if args.threat {
-        panic!("--threat is not yet implemented. Input switching and Threat export block are pending (task #8).");
-    }
-    println!("Threat: disabled (not yet implemented)");
+    println!("Threat: {}", if args.threat {
+        format!("enabled ({} dimensions, total input={})", THREAT_DIMENSIONS, input_size)
+    } else {
+        "disabled".to_string()
+    });
     println!("Buckets: {}", NUM_BUCKETS);
     println!("Bucket mode: {}", args.bucket_mode_name());
     if let Some(bounds) = ply_bounds {
@@ -1425,7 +1468,7 @@ fn main() {
 
     // SavedFormat
     let save_format =
-        build_layerstack_save_format(input_size, ft_out, l1_out, l2_out, fv_scale, args.psqt, args.threat);
+        build_layerstack_save_format(halfka_dim, input_size, ft_out, l1_out, l2_out, fv_scale, args.psqt, args.threat);
 
     // Network builder
     let ft_out_c = ft_out;
@@ -1479,12 +1522,12 @@ fn main() {
         loss_fn_sigmoid
     };
 
-    macro_rules! build_trainer {
-        ($opt:expr, $use_win_rate:expr, $bucket_impl:expr) => {{
+    macro_rules! build_trainer_with_input {
+        ($opt:expr, $use_win_rate:expr, $bucket_impl:expr, $input:expr) => {{
             let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
-                .inputs(ShogiHalfKA_hm)
+                .inputs($input)
                 .output_buckets($bucket_impl)
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
@@ -1587,23 +1630,35 @@ fn main() {
 
     let use_win_rate_model = args.win_rate_model;
 
-    match args.optimizer {
-        OptimizerType::AdamW => {
-            let mut trainer = build_trainer!(optimiser::AdamW, use_win_rate_model, bucket_impl);
-            trainer.optimiser.set_params(AdamWParams { decay: args.weight_decay, ..Default::default() });
-            maybe_run_or_quantise!(trainer);
-        }
-        OptimizerType::RAdam => {
-            let mut trainer = build_trainer!(optimiser::RAdam, use_win_rate_model, bucket_impl);
-            let params = RAdamParams { decay: args.weight_decay, ..Default::default() };
-            trainer.optimiser.set_params(params.into());
-            maybe_run_or_quantise!(trainer);
-        }
-        OptimizerType::Ranger => {
-            let mut trainer = build_trainer!(optimiser::Ranger, use_win_rate_model, bucket_impl);
-            trainer.optimiser.set_params(RangerParams { decay: args.weight_decay, ..Default::default() });
-            maybe_run_or_quantise!(trainer);
-        }
+    // 入力型の分岐: threat 有効時は ShogiHalfKaHmThreat、無効時は ShogiHalfKA_hm
+    // ジェネリクスが異なるため、各 optimizer × input の組み合わせを展開する
+    macro_rules! run_optimizer {
+        ($input:expr) => {{
+            match args.optimizer {
+                OptimizerType::AdamW => {
+                    let mut trainer = build_trainer_with_input!(optimiser::AdamW, use_win_rate_model, bucket_impl, $input);
+                    trainer.optimiser.set_params(AdamWParams { decay: args.weight_decay, ..Default::default() });
+                    maybe_run_or_quantise!(trainer);
+                }
+                OptimizerType::RAdam => {
+                    let mut trainer = build_trainer_with_input!(optimiser::RAdam, use_win_rate_model, bucket_impl, $input);
+                    let params = RAdamParams { decay: args.weight_decay, ..Default::default() };
+                    trainer.optimiser.set_params(params.into());
+                    maybe_run_or_quantise!(trainer);
+                }
+                OptimizerType::Ranger => {
+                    let mut trainer = build_trainer_with_input!(optimiser::Ranger, use_win_rate_model, bucket_impl, $input);
+                    trainer.optimiser.set_params(RangerParams { decay: args.weight_decay, ..Default::default() });
+                    maybe_run_or_quantise!(trainer);
+                }
+            }
+        }};
+    }
+
+    if args.threat {
+        run_optimizer!(ShogiHalfKaHmThreat);
+    } else {
+        run_optimizer!(ShogiHalfKA_hm);
     }
 
     // Generate final experiment JSON (status: completed)

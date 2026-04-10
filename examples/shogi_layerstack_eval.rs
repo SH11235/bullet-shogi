@@ -1514,17 +1514,26 @@ impl QuantisedNetwork {
 
         // Threat block (i8 raw, after PSQT)
         let threat_weights = if has_threat {
-            // ThreatProfile= がある場合は profile id (u32 LE) を読み飛ばす
+            use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
             if arch_str.contains("ThreatProfile=") {
+                // 新モデル: profile id (u32 LE) を読んで検証
                 f.read_exact(&mut buf4)?;
                 let model_profile_id = u32::from_le_bytes(buf4);
-                use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
                 if model_profile_id != THREAT_PROFILE_ID {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("Threat profile mismatch: model={model_profile_id}, engine={THREAT_PROFILE_ID}"),
                     ));
                 }
+            } else if THREAT_PROFILE_ID != 0 {
+                // 旧モデル (ThreatProfile= なし) は profile 0 のみ許可
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Old model (no ThreatProfile) requires engine profile 0, \
+                         but engine has profile {THREAT_PROFILE_ID}"
+                    ),
+                ));
             }
             let count = THREAT_DIMENSIONS * l0_size;
             let mut weights = vec![0i8; count];

@@ -7,6 +7,7 @@ mod factorised;
 mod shogi_halfka;
 mod shogi_halfka_hm_threat;
 mod shogi_halfkp;
+pub mod shogi_threat_exclusion;
 
 #[allow(deprecated)]
 mod legacy;

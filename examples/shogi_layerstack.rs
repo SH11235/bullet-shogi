@@ -979,7 +979,16 @@ fn build_layerstack_save_format(
 
     // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
     let psqt_part = if psqt { format!("PSQT={},", NUM_BUCKETS) } else { String::new() };
-    let threat_part = if threat { format!("Threat={THREAT_DIMENSIONS},") } else { String::new() };
+    let threat_part = if threat {
+        use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
+        if THREAT_PROFILE_ID == 0 {
+            format!("Threat={THREAT_DIMENSIONS},")
+        } else {
+            format!("Threat={THREAT_DIMENSIONS},ThreatProfile={THREAT_PROFILE_ID},")
+        }
+    } else {
+        String::new()
+    };
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
          {psqt_part}\
@@ -1046,10 +1055,8 @@ fn build_layerstack_save_format(
             // piece 部分 = feat 0..halfka_dim → indices 0..halfka_dim*ft_out
             let qa_f = qa_i16 as f64;
             let piece_end = halfka_dim_captured * ft_out_captured;
-            let weights_i16: Vec<i16> = l0w.values[..piece_end]
-                .iter()
-                .map(|&v| (qa_f * v as f64).round() as i16)
-                .collect();
+            let weights_i16: Vec<i16> =
+                l0w.values[..piece_end].iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
             let _ = input_size_captured;
             let leb128_bytes = encode_leb128_tensor_i16(&weights_i16);
             leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
@@ -1264,6 +1271,14 @@ fn build_layerstack_save_format(
         formats.push(psqt);
     }
     if let Some(threat) = threat_data {
+        // profile id (u32 LE) を Threat weights の直前に書き込む
+        // rshogi 側で ThreatProfile= の有無から読み込みを判定する。
+        // profile 0 (full) でも ThreatProfile= なしで後方互換を維持するため、
+        // profile_id > 0 のときだけ書き込む（arch_str に ThreatProfile= がある場合のみ）
+        use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
+        if THREAT_PROFILE_ID != 0 {
+            formats.push(SavedFormat::custom(THREAT_PROFILE_ID.to_le_bytes().to_vec()));
+        }
         formats.push(threat);
     }
     formats.push(layerstack_data);
@@ -1318,11 +1333,14 @@ fn main() {
     );
     println!("L2 input: {} (sqr_crelu concat crelu)", l2_in);
     println!("PSQT shortcut: {}", if args.psqt { "enabled" } else { "disabled" });
-    println!("Threat: {}", if args.threat {
-        format!("enabled ({} dimensions, total input={})", THREAT_DIMENSIONS, input_size)
-    } else {
-        "disabled".to_string()
-    });
+    println!(
+        "Threat: {}",
+        if args.threat {
+            format!("enabled ({} dimensions, total input={})", THREAT_DIMENSIONS, input_size)
+        } else {
+            "disabled".to_string()
+        }
+    );
     println!("Buckets: {}", NUM_BUCKETS);
     println!("Bucket mode: {}", args.bucket_mode_name());
     if let Some(bounds) = ply_bounds {
@@ -1368,7 +1386,7 @@ fn main() {
 
     // Experiment context
     let experiment_params = ExperimentParams {
-        architecture: format!("LayerStack-{}x{}-{}-{}", ft_out, 2, l1_out, l2_out),
+        architecture: format!("LayerStack-{}-{}-{}", ft_out, l1_out, l2_out),
         l0: ft_out,
         l1: l1_out,
         l2: l2_out,
@@ -1636,18 +1654,21 @@ fn main() {
         ($input:expr) => {{
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_with_input!(optimiser::AdamW, use_win_rate_model, bucket_impl, $input);
+                    let mut trainer =
+                        build_trainer_with_input!(optimiser::AdamW, use_win_rate_model, bucket_impl, $input);
                     trainer.optimiser.set_params(AdamWParams { decay: args.weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_with_input!(optimiser::RAdam, use_win_rate_model, bucket_impl, $input);
+                    let mut trainer =
+                        build_trainer_with_input!(optimiser::RAdam, use_win_rate_model, bucket_impl, $input);
                     let params = RAdamParams { decay: args.weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_with_input!(optimiser::Ranger, use_win_rate_model, bucket_impl, $input);
+                    let mut trainer =
+                        build_trainer_with_input!(optimiser::Ranger, use_win_rate_model, bucket_impl, $input);
                     trainer.optimiser.set_params(RangerParams { decay: args.weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }

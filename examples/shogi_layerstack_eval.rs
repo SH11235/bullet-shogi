@@ -560,11 +560,10 @@ fn main() {
             eprintln!("Error: quantised.bin not found: {}", quantised_path.display());
             std::process::exit(1);
         }
-        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, args.scale)
-            .unwrap_or_else(|e| {
-                eprintln!("Error: Failed to load quantised.bin: {e}");
-                std::process::exit(1);
-            });
+        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, args.scale).unwrap_or_else(|e| {
+            eprintln!("Error: Failed to load quantised.bin: {e}");
+            std::process::exit(1);
+        });
         println!("=== Integer Golden Forward Mode ===");
         println!("quantised.bin: {}", quantised_path.display());
         run_integer_forward(&net, &args.pack, args.offset, args.samples, bucket_impl, l0_size, l1_size, l2_size);
@@ -1397,10 +1396,7 @@ fn dump_float_intermediates(
 }
 
 /// Get active features for a position
-fn get_active_features(
-    psv: &bullet_lib::shogi::PackedSfenValue,
-    use_threat: bool,
-) -> (Vec<usize>, Vec<usize>) {
+fn get_active_features(psv: &bullet_lib::shogi::PackedSfenValue, use_threat: bool) -> (Vec<usize>, Vec<usize>) {
     let mut stm_features = Vec::new();
     let mut nstm_features = Vec::new();
 

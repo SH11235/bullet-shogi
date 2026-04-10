@@ -25,8 +25,8 @@ use crate::shogi::{
 // Threat 定数
 // =============================================================================
 
-/// Threat の総特徴量次元数
-pub const THREAT_DIMENSIONS: usize = 216_720;
+/// Threat の総特徴量次元数 (profile 依存)
+pub const THREAT_DIMENSIONS: usize = PAIR_DATA.1;
 
 /// ThreatClass の数（King 除外）
 const NUM_THREAT_CLASSES: usize = 9;
@@ -104,7 +104,10 @@ const ATTACKS_PER_COLOR: [usize; NUM_THREAT_CLASSES] = [
 
 const NUM_PAIRS: usize = 2 * NUM_THREAT_CLASSES * 2 * NUM_THREAT_CLASSES; // 324
 
-const fn build_pair_base() -> [usize; NUM_PAIRS] {
+/// 除外された pair の sentinel 値
+const EXCLUDED_PAIR_BASE: usize = usize::MAX;
+
+const fn build_pair_base() -> ([usize; NUM_PAIRS], usize) {
     let mut table = [0usize; NUM_PAIRS];
     let mut cumulative = 0usize;
     let mut attacker_side = 0usize;
@@ -116,8 +119,12 @@ const fn build_pair_base() -> [usize; NUM_PAIRS] {
                 let mut dc = 0usize;
                 while dc < NUM_THREAT_CLASSES {
                     let idx = attacker_side * 162 + ac * 18 + ds * 9 + dc;
-                    table[idx] = cumulative;
-                    cumulative += ATTACKS_PER_COLOR[ac];
+                    if super::shogi_threat_exclusion::is_excluded(attacker_side, ac, ds, dc) {
+                        table[idx] = EXCLUDED_PAIR_BASE;
+                    } else {
+                        table[idx] = cumulative;
+                        cumulative += ATTACKS_PER_COLOR[ac];
+                    }
                     dc += 1;
                 }
                 ds += 1;
@@ -126,15 +133,19 @@ const fn build_pair_base() -> [usize; NUM_PAIRS] {
         }
         attacker_side += 1;
     }
-    table
+    (table, cumulative)
 }
 
-static PAIR_BASE: [usize; NUM_PAIRS] = build_pair_base();
+const PAIR_DATA: ([usize; NUM_PAIRS], usize) = build_pair_base();
 
+static PAIR_BASE: [usize; NUM_PAIRS] = PAIR_DATA.0;
+
+/// pair_base を取得。除外された pair は None を返す。
 #[inline]
-fn pair_base(attacker_side: usize, ac: ThreatClass, attacked_side: usize, dc: ThreatClass) -> usize {
+fn pair_base(attacker_side: usize, ac: ThreatClass, attacked_side: usize, dc: ThreatClass) -> Option<usize> {
     let idx = attacker_side * 162 + (ac as usize) * 18 + attacked_side * 9 + dc as usize;
-    PAIR_BASE[idx]
+    let base = PAIR_BASE[idx];
+    if base == EXCLUDED_PAIR_BASE { None } else { Some(base) }
 }
 
 // =============================================================================
@@ -608,15 +619,15 @@ struct ThreatParams {
     to_sq_n: Square,
 }
 
-/// Threat index を計算する
+/// Threat index を計算する。除外された pair は None を返す。
 #[inline]
-fn threat_index(params: &ThreatParams, from_offset_table: &FromOffsetTable) -> usize {
-    let base = pair_base(params.attacker_side, params.attacker_class, params.attacked_side, params.attacked_class);
+fn threat_index(params: &ThreatParams, from_offset_table: &FromOffsetTable) -> Option<usize> {
+    let base = pair_base(params.attacker_side, params.attacker_class, params.attacked_side, params.attacked_class)?;
     let pattern = attack_pattern_id(params.attacker_class, params.oriented_color);
     let from_off = from_offset_table.get(pattern, params.from_sq_n);
     let attack_ord =
         compute_attack_order(params.attacker_class, params.oriented_color, params.from_sq_n, params.to_sq_n);
-    base + from_off + attack_ord
+    Some(base + from_off + attack_ord)
 }
 
 // =============================================================================
@@ -819,6 +830,9 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
                 },
                 from_offset_table,
             );
+            let Some(stm_threat_idx) = stm_threat_idx else {
+                return; // excluded pair
+            };
             debug_assert!(stm_threat_idx < THREAT_DIMENSIONS);
             let stm_idx = HALFKA_HM_DIMENSIONS + stm_threat_idx;
 
@@ -840,6 +854,9 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
                 },
                 from_offset_table,
             );
+            let Some(nstm_threat_idx) = nstm_threat_idx else {
+                return; // excluded pair
+            };
             debug_assert!(nstm_threat_idx < THREAT_DIMENSIONS);
             let nstm_idx = HALFKA_HM_DIMENSIONS + nstm_threat_idx;
 
@@ -860,8 +877,7 @@ mod tests {
     #[test]
     fn test_total_dimensions() {
         let input = ShogiHalfKaHmThreat;
-        assert_eq!(input.num_inputs(), 73_305 + 216_720);
-        assert_eq!(input.num_inputs(), 290_025);
+        assert_eq!(input.num_inputs(), HALFKA_HM_DIMENSIONS + THREAT_DIMENSIONS);
     }
 
     #[test]
@@ -872,10 +888,16 @@ mod tests {
 
     #[test]
     fn test_pair_base_dimensions() {
-        // 最後の pair の末尾が THREAT_DIMENSIONS と一致
-        let last_idx = 162 + 8 * 18 + 9 + 8;
-        let last_base = PAIR_BASE[last_idx];
-        assert_eq!(last_base + ATTACKS_PER_COLOR[ThreatClass::Dragon as usize], THREAT_DIMENSIONS);
+        // 最後の non-excluded pair の base + attacks_per_color == THREAT_DIMENSIONS
+        let mut last_base = 0usize;
+        let mut last_ac = 0usize;
+        for (i, &base) in PAIR_BASE.iter().enumerate() {
+            if base != EXCLUDED_PAIR_BASE && base >= last_base {
+                last_base = base;
+                last_ac = (i % 162) / 18;
+            }
+        }
+        assert_eq!(last_base + ATTACKS_PER_COLOR[last_ac], THREAT_DIMENSIONS);
     }
 
     #[test]
@@ -972,15 +994,17 @@ mod tests {
                                         },
                                         &from_offset_table,
                                     );
-                                    assert!(
-                                        idx < THREAT_DIMENSIONS,
-                                        "index {} out of range for class={:?} color={:?} sq={} to={}",
-                                        idx,
-                                        class,
-                                        oriented_color,
-                                        sq.0,
-                                        to.0
-                                    );
+                                    if let Some(idx) = idx {
+                                        assert!(
+                                            idx < THREAT_DIMENSIONS,
+                                            "index {} out of range for class={:?} color={:?} sq={} to={}",
+                                            idx,
+                                            class,
+                                            oriented_color,
+                                            sq.0,
+                                            to.0
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1085,7 +1109,8 @@ mod tests {
     #[test]
     fn test_shorthand() {
         let input = ShogiHalfKaHmThreat;
-        assert_eq!(input.shorthand(), "shogi-290025x45hm+threat");
+        let expected = format!("shogi-{}x45hm+threat", HALFKA_HM_DIMENSIONS + THREAT_DIMENSIONS);
+        assert_eq!(input.shorthand(), expected);
     }
 
     #[test]
@@ -1105,8 +1130,10 @@ mod tests {
     }
 
     /// Canonical test vector: rshogi の threat_features.rs と同一の初期局面 threat index を検証
-    /// この値が変わったら rshogi 側も同時に更新すること
+    /// この値が変わったら rshogi 側も同時に更新すること。
+    /// Profile 0 (full) のみ有効（他の profile では index が変わる）。
     #[test]
+    #[cfg(not(any(feature = "threat-profile-same-class", feature = "threat-profile-same-class-major-pawn",)))]
     fn test_canonical_startpos_threat_indices() {
         let mut board = ShogiBoard {
             side_to_move: Color::Black,

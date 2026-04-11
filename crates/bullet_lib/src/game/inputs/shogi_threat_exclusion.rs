@@ -23,10 +23,8 @@ pub enum ThreatProfile {
     SameClass,
     /// Profile 2: 同種 + 大駒→歩除外
     SameClassMajorPawn,
-    /// Profile 10: cross-side 異種ペアのみ (両方向)
+    /// Profile 10: cross-side 異種ペアのみ
     CrossSide,
-    /// Profile 11: enemy→friend 異種ペアのみ
-    EnemyOnly,
 }
 
 impl ThreatProfile {
@@ -37,7 +35,6 @@ impl ThreatProfile {
             "same-class" => Some(Self::SameClass),
             "same-class-major-pawn" => Some(Self::SameClassMajorPawn),
             "cross-side" => Some(Self::CrossSide),
-            "enemy-only" => Some(Self::EnemyOnly),
             _ => None,
         }
     }
@@ -49,7 +46,6 @@ impl ThreatProfile {
             Self::SameClass => 1,
             Self::SameClassMajorPawn => 2,
             Self::CrossSide => 10,
-            Self::EnemyOnly => 11,
         }
     }
 
@@ -68,13 +64,12 @@ impl ThreatProfile {
             Self::SameClass => ac == dc,
             Self::SameClassMajorPawn => ac == dc || (ac >= 5 && dc == 0),
             Self::CrossSide => as_ == ds || ac == dc,
-            Self::EnemyOnly => !(as_ == 1 && ds == 0 && ac != dc),
         }
     }
 
     /// 利用可能な profile 名の一覧（ヘルプ表示用）
     pub fn available() -> &'static str {
-        "full, same-class, same-class-major-pawn, cross-side, enemy-only"
+        "full, same-class, same-class-major-pawn, cross-side"
     }
 }
 
@@ -85,7 +80,6 @@ impl std::fmt::Display for ThreatProfile {
             Self::SameClass => write!(f, "same-class"),
             Self::SameClassMajorPawn => write!(f, "same-class-major-pawn"),
             Self::CrossSide => write!(f, "cross-side"),
-            Self::EnemyOnly => write!(f, "enemy-only"),
         }
     }
 }

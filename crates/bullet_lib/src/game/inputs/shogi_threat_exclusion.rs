@@ -1,63 +1,85 @@
-//! Threat pair 除外 profile
+//! Threat pair 除外 profile (runtime 選択)
 //!
-//! Cargo feature flag で選択された profile に基づき、除外する pair を定義する。
-//! rshogi の `threat_exclusion.rs` と同一ロジック。手動同期すること。
+//! 学習・評価時に CLI オプションで profile を指定する。
+//! rshogi 側は compile-time (feature flag) で同一ロジックを実装。
 //!
 //! ## Profile 一覧
 //!
-//! | id | feature flag | 除外内容 |
-//! |----|-------------|---------|
-//! | 0 | (default) | なし (Baseline) |
-//! | 1 | `threat-profile-same-class` | 同種ペア全除外 |
-//! | 2 | `threat-profile-same-class-major-pawn` | 同種 + 大駒→歩除外 |
+//! | id | CLI 値 | 除外内容 |
+//! |----|--------|---------|
+//! | 0 | `full` | なし (Baseline) |
+//! | 1 | `same-class` | 同種ペア全除外 |
+//! | 2 | `same-class-major-pawn` | 同種 + 大駒→歩除外 |
+//! | 10 | `cross-side` | cross-side 異種ペアのみ (増やすアプローチ) |
 //!
 //! 仕様: rshogi `docs/threat_spec.md` Exclusion profiles セクション
 
-// 相互排他チェック: 複数 profile を同時選択すると compile error
-const _PROFILE_EXCLUSIVITY: () = {
-    let count = cfg!(feature = "threat-profile-same-class") as usize
-        + cfg!(feature = "threat-profile-same-class-major-pawn") as usize;
-    assert!(count <= 1, "Multiple threat profiles selected. Choose at most one.");
-};
+/// Threat pair 除外 profile
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreatProfile {
+    /// Profile 0: 全 pair (Baseline)
+    Full,
+    /// Profile 1: 同種ペア全除外
+    SameClass,
+    /// Profile 2: 同種 + 大駒→歩除外
+    SameClassMajorPawn,
+    /// Profile 10: cross-side 異種ペアのみ
+    CrossSide,
+}
 
-/// Threat profile ID
-///
-/// quantised.bin に書き込まれる profile 識別子。
-/// engine と model の profile が一致しなければ読み込みエラー。
-pub const THREAT_PROFILE_ID: u32 = {
-    if cfg!(feature = "threat-profile-same-class-major-pawn") {
-        2
-    } else if cfg!(feature = "threat-profile-same-class") {
-        1
-    } else {
-        0
-    }
-};
-
-/// pair を除外すべきかどうか判定する
-///
-/// `build_pair_base` (const fn) から呼ばれるため、引数は usize。
-///
-/// # 引数
-/// - `_as`: attacker side (0=friend, 1=enemy)
-/// - `ac`: attacker class index (0..8, ThreatClass の discriminant)
-/// - `_ds`: attacked side (0=friend, 1=enemy)
-/// - `dc`: attacked class index (0..8)
-///
-/// # ThreatClass index
-/// 0=Pawn, 1=Lance, 2=Knight, 3=Silver, 4=GoldLike,
-/// 5=Bishop, 6=Rook, 7=Horse, 8=Dragon
-pub const fn is_excluded(_as: usize, ac: usize, _ds: usize, dc: usize) -> bool {
-    // 同種ペア全除外 (profile >= 1)
-    if cfg!(any(feature = "threat-profile-same-class", feature = "threat-profile-same-class-major-pawn",)) && ac == dc {
-        return true;
+impl ThreatProfile {
+    /// CLI 文字列から変換
+    pub fn from_cli(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(Self::Full),
+            "same-class" => Some(Self::SameClass),
+            "same-class-major-pawn" => Some(Self::SameClassMajorPawn),
+            "cross-side" => Some(Self::CrossSide),
+            _ => None,
+        }
     }
 
-    // 大駒 attacker → Pawn attacked (profile >= 2)
-    // ac ∈ {Bishop(5), Rook(6), Horse(7), Dragon(8)} && dc == Pawn(0)
-    if cfg!(feature = "threat-profile-same-class-major-pawn") && ac >= 5 && dc == 0 {
-        return true;
+    /// quantised.bin に書き込む profile ID
+    pub fn profile_id(self) -> u32 {
+        match self {
+            Self::Full => 0,
+            Self::SameClass => 1,
+            Self::SameClassMajorPawn => 2,
+            Self::CrossSide => 10,
+        }
     }
 
-    false
+    /// pair を除外すべきかどうか判定する
+    ///
+    /// rshogi の `threat_exclusion::is_excluded` と同一ロジック。
+    ///
+    /// # 引数
+    /// - `as_`: attacker side (0=friend, 1=enemy)
+    /// - `ac`: attacker class index (0..8)
+    /// - `ds`: attacked side (0=friend, 1=enemy)
+    /// - `dc`: attacked class index (0..8)
+    pub fn is_excluded(self, as_: usize, ac: usize, ds: usize, dc: usize) -> bool {
+        match self {
+            Self::Full => false,
+            Self::SameClass => ac == dc,
+            Self::SameClassMajorPawn => ac == dc || (ac >= 5 && dc == 0),
+            Self::CrossSide => as_ == ds || ac == dc,
+        }
+    }
+
+    /// 利用可能な profile 名の一覧（ヘルプ表示用）
+    pub fn available() -> &'static str {
+        "full, same-class, same-class-major-pawn, cross-side"
+    }
+}
+
+impl std::fmt::Display for ThreatProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::SameClass => write!(f, "same-class"),
+            Self::SameClassMajorPawn => write!(f, "same-class-major-pawn"),
+            Self::CrossSide => write!(f, "cross-side"),
+        }
+    }
 }

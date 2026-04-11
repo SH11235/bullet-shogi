@@ -18,8 +18,9 @@ pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
 pub use shogi_halfka::{FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, ShogiHalfKA, ShogiHalfKA_hm};
-pub use shogi_halfka_hm_threat::{ShogiHalfKaHmThreat, THREAT_DIMENSIONS};
+pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
 pub use shogi_halfkp::{FEATURE_HASH, ShogiHalfKP};
+pub use shogi_threat_exclusion::ThreatProfile;
 
 #[allow(deprecated)]
 pub use chess_buckets_mk::*;

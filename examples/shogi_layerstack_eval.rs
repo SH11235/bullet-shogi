@@ -32,7 +32,7 @@ use std::{
 use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::dataloader::PreparedBatchDevice};
 use bullet_lib::{
     game::{
-        inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, THREAT_DIMENSIONS},
+        inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
         outputs::{
             OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
             SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -124,6 +124,10 @@ struct Args {
     /// Enable Threat concatenated input
     #[arg(long, default_value_t = false)]
     threat: bool,
+
+    /// Threat exclusion profile (full, same-class, same-class-major-pawn, cross-side)
+    #[arg(long, default_value = "full")]
+    threat_profile: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -550,7 +554,19 @@ fn main() {
     let l2_input = l1_effective * 2;
     let l2_size = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs();
-    let input_size = if args.threat { ShogiHalfKaHmThreat.num_inputs() } else { halfka_dim };
+    let threat_profile = if args.threat {
+        Some(ThreatProfile::from_cli(&args.threat_profile).unwrap_or_else(|| {
+            eprintln!(
+                "ERROR: Unknown threat profile '{}'. Available: {}",
+                args.threat_profile,
+                ThreatProfile::available()
+            );
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
+    let input_size = if let Some(tp) = threat_profile { ShogiHalfKaHmThreat::new(tp).num_inputs() } else { halfka_dim };
     let l1_input_dim = l0_size;
 
     // Integer golden forward mode: quantised.bin のみで整数演算 forward、trainer 不要
@@ -566,7 +582,17 @@ fn main() {
         });
         println!("=== Integer Golden Forward Mode ===");
         println!("quantised.bin: {}", quantised_path.display());
-        run_integer_forward(&net, &args.pack, args.offset, args.samples, bucket_impl, l0_size, l1_size, l2_size);
+        run_integer_forward(
+            &net,
+            &args.pack,
+            args.offset,
+            args.samples,
+            bucket_impl,
+            l0_size,
+            l1_size,
+            l2_size,
+            threat_profile,
+        );
         return;
     }
 
@@ -1216,7 +1242,7 @@ fn dump_float_intermediates(
     println!();
 
     // Get active features for both perspectives
-    let (stm_features, nstm_features) = get_active_features(&psv, false);
+    let (stm_features, nstm_features) = get_active_features(&psv, None);
     println!("STM features: {} active", stm_features.len());
     println!("NSTM features: {} active", nstm_features.len());
 
@@ -1396,12 +1422,15 @@ fn dump_float_intermediates(
 }
 
 /// Get active features for a position
-fn get_active_features(psv: &bullet_lib::shogi::PackedSfenValue, use_threat: bool) -> (Vec<usize>, Vec<usize>) {
+fn get_active_features(
+    psv: &bullet_lib::shogi::PackedSfenValue,
+    threat_profile: Option<ThreatProfile>,
+) -> (Vec<usize>, Vec<usize>) {
     let mut stm_features = Vec::new();
     let mut nstm_features = Vec::new();
 
-    if use_threat {
-        ShogiHalfKaHmThreat.map_features(psv, |stm_idx, nstm_idx| {
+    if let Some(tp) = threat_profile {
+        ShogiHalfKaHmThreat::new(tp).map_features(psv, |stm_idx, nstm_idx| {
             stm_features.push(stm_idx);
             nstm_features.push(nstm_idx);
         });
@@ -1513,29 +1542,25 @@ impl QuantisedNetwork {
         };
 
         // Threat block (i8 raw, after PSQT)
-        let threat_weights = if has_threat {
-            use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
+        // Threat dims を arch_str からパースして正しいバイト数を読む
+        let threat_dims = if has_threat {
+            // "Threat=NNNNN" から次元数を抽出
+            arch_str
+                .split(',')
+                .find_map(|part| part.strip_prefix("Threat="))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let threat_weights = if has_threat && threat_dims > 0 {
+            // ThreatProfile= がある場合は profile id (u32 LE) を読み飛ばす
             if arch_str.contains("ThreatProfile=") {
-                // 新モデル: profile id (u32 LE) を読んで検証
                 f.read_exact(&mut buf4)?;
                 let model_profile_id = u32::from_le_bytes(buf4);
-                if model_profile_id != THREAT_PROFILE_ID {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Threat profile mismatch: model={model_profile_id}, engine={THREAT_PROFILE_ID}"),
-                    ));
-                }
-            } else if THREAT_PROFILE_ID != 0 {
-                // 旧モデル (ThreatProfile= なし) は profile 0 のみ許可
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Old model (no ThreatProfile) requires engine profile 0, \
-                         but engine has profile {THREAT_PROFILE_ID}"
-                    ),
-                ));
+                println!("Threat profile id: {model_profile_id}");
             }
-            let count = THREAT_DIMENSIONS * l0_size;
+            let count = threat_dims * l0_size;
             let mut weights = vec![0i8; count];
             let slice = unsafe { std::slice::from_raw_parts_mut(weights.as_mut_ptr() as *mut u8, count) };
             f.read_exact(slice)?;
@@ -1636,6 +1661,7 @@ fn run_integer_forward(
     l0_size: usize,
     l1_size: usize,
     l2_size: usize,
+    threat_profile: Option<ThreatProfile>,
 ) {
     let l1_effective = l1_size - 1;
     let l2_in_dim = l1_effective * 2;
@@ -1665,10 +1691,10 @@ fn run_integer_forward(
         let sfen = board_to_sfen(&decoded, psv.game_ply());
         let bucket = bucket_impl.bucket(&psv) as usize;
         // HalfKA features のみ (Threat は別途処理)
-        let (stm_features, nstm_features) = get_active_features(&psv, false);
+        let (stm_features, nstm_features) = get_active_features(&psv, None);
         // Threat features (has_threat の場合のみ)
         let (stm_threat, nstm_threat) = if net.has_threat {
-            let (all_stm, all_nstm) = get_active_features(&psv, true);
+            let (all_stm, all_nstm) = get_active_features(&psv, threat_profile);
             // Threat features = index >= halfka_dim の部分
             let halfka_dim = ShogiHalfKA_hm.num_inputs();
             let t_stm: Vec<usize> = all_stm.into_iter().filter(|&i| i >= halfka_dim).collect();

@@ -40,7 +40,7 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
-    game::inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, THREAT_DIMENSIONS},
+    game::inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
     game::outputs::{
         SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
         SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -242,9 +242,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     psqt: bool,
 
-    /// Enable Threat concatenated input (placeholder for future implementation)
+    /// Enable Threat concatenated input
     #[arg(long, default_value_t = false)]
     threat: bool,
+
+    /// Threat exclusion profile (full, same-class, same-class-major-pawn, cross-side)
+    #[arg(long, default_value = "full")]
+    threat_profile: String,
 
     /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
@@ -965,7 +969,7 @@ fn build_layerstack_save_format(
     l2_out: usize,
     fv_scale: i32,
     psqt: bool,
-    threat: bool,
+    threat_profile: Option<ThreatProfile>,
 ) -> Vec<SavedFormat> {
     use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
 
@@ -979,12 +983,13 @@ fn build_layerstack_save_format(
 
     // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
     let psqt_part = if psqt { format!("PSQT={},", NUM_BUCKETS) } else { String::new() };
-    let threat_part = if threat {
-        use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
-        if THREAT_PROFILE_ID == 0 {
-            format!("Threat={THREAT_DIMENSIONS},")
+    let threat_part = if let Some(tp) = threat_profile {
+        let threat_dims = input_size - halfka_dim;
+        let pid = tp.profile_id();
+        if pid == 0 {
+            format!("Threat={threat_dims},")
         } else {
-            format!("Threat={THREAT_DIMENSIONS},ThreatProfile={THREAT_PROFILE_ID},")
+            format!("Threat={threat_dims},ThreatProfile={pid},")
         }
     } else {
         String::new()
@@ -1104,7 +1109,7 @@ fn build_layerstack_save_format(
     // ---- Threat weights (raw i8) ----
     // l0w の threat 部分 (feat halfka_dim..input_size) を i8 で書き出す。
     // レイアウト: i8[THREAT_DIMENSIONS × ft_out] (feature-major)
-    let threat_data = if threat {
+    let threat_data = if threat_profile.is_some() {
         let halfka_dim_for_threat = halfka_dim;
         let ft_out_for_threat = ft_out;
         let qa_for_threat = QA;
@@ -1271,13 +1276,12 @@ fn build_layerstack_save_format(
         formats.push(psqt);
     }
     if let Some(threat) = threat_data {
-        // profile id (u32 LE) を Threat weights の直前に書き込む
-        // rshogi 側で ThreatProfile= の有無から読み込みを判定する。
-        // profile 0 (full) でも ThreatProfile= なしで後方互換を維持するため、
-        // profile_id > 0 のときだけ書き込む（arch_str に ThreatProfile= がある場合のみ）
-        use bullet_lib::game::inputs::shogi_threat_exclusion::THREAT_PROFILE_ID;
-        if THREAT_PROFILE_ID != 0 {
-            formats.push(SavedFormat::custom(THREAT_PROFILE_ID.to_le_bytes().to_vec()));
+        // profile_id > 0 のときだけ profile id (u32 LE) を Threat weights の直前に書き込む
+        if let Some(tp) = threat_profile {
+            let pid = tp.profile_id();
+            if pid != 0 {
+                formats.push(SavedFormat::custom(pid.to_le_bytes().to_vec()));
+            }
         }
         formats.push(threat);
     }
@@ -1310,8 +1314,25 @@ fn main() {
     let l2_in = l1_effective * 2;
     let l2_out = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
-    let input_size = if args.threat {
-        ShogiHalfKaHmThreat.num_inputs() // 73305 + 216720 = 290025
+
+    // Threat profile の解決
+    let threat_profile = if args.threat {
+        let tp = ThreatProfile::from_cli(&args.threat_profile).unwrap_or_else(|| {
+            eprintln!(
+                "ERROR: Unknown threat profile '{}'. Available: {}",
+                args.threat_profile,
+                ThreatProfile::available()
+            );
+            std::process::exit(1);
+        });
+        Some(tp)
+    } else {
+        None
+    };
+
+    let input_size = if let Some(tp) = threat_profile {
+        let threat_input = ShogiHalfKaHmThreat::new(tp);
+        threat_input.num_inputs()
     } else {
         halfka_dim
     };
@@ -1335,8 +1356,9 @@ fn main() {
     println!("PSQT shortcut: {}", if args.psqt { "enabled" } else { "disabled" });
     println!(
         "Threat: {}",
-        if args.threat {
-            format!("enabled ({} dimensions, total input={})", THREAT_DIMENSIONS, input_size)
+        if let Some(tp) = threat_profile {
+            let threat_dims = input_size - halfka_dim;
+            format!("enabled (profile={tp}, {threat_dims} dimensions, total input={input_size})")
         } else {
             "disabled".to_string()
         }
@@ -1485,8 +1507,16 @@ fn main() {
     }
 
     // SavedFormat
-    let save_format =
-        build_layerstack_save_format(halfka_dim, input_size, ft_out, l1_out, l2_out, fv_scale, args.psqt, args.threat);
+    let save_format = build_layerstack_save_format(
+        halfka_dim,
+        input_size,
+        ft_out,
+        l1_out,
+        l2_out,
+        fv_scale,
+        args.psqt,
+        threat_profile,
+    );
 
     // Network builder
     let ft_out_c = ft_out;
@@ -1676,8 +1706,8 @@ fn main() {
         }};
     }
 
-    if args.threat {
-        run_optimizer!(ShogiHalfKaHmThreat);
+    if let Some(tp) = threat_profile {
+        run_optimizer!(ShogiHalfKaHmThreat::new(tp));
     } else {
         run_optimizer!(ShogiHalfKA_hm);
     }

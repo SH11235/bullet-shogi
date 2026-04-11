@@ -15,6 +15,7 @@ use super::SparseInputType;
 use super::shogi_halfka::{
     HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece,
 };
+use super::shogi_threat_exclusion::ThreatProfile;
 use crate::shogi::{
     PackedSfenValue, ShogiBoard,
     bona_piece::BonaPiece,
@@ -25,14 +26,8 @@ use crate::shogi::{
 // Threat 定数
 // =============================================================================
 
-/// Threat の総特徴量次元数 (profile 依存)
-pub const THREAT_DIMENSIONS: usize = PAIR_DATA.1;
-
 /// ThreatClass の数（King 除外）
 const NUM_THREAT_CLASSES: usize = 9;
-
-/// 連結後の総次元数
-const TOTAL_DIMENSIONS: usize = HALFKA_HM_DIMENSIONS + THREAT_DIMENSIONS;
 
 /// active threat features の最大数（安全側の上限）
 const MAX_ACTIVE_THREAT_FEATURES: usize = 320;
@@ -107,44 +102,39 @@ const NUM_PAIRS: usize = 2 * NUM_THREAT_CLASSES * 2 * NUM_THREAT_CLASSES; // 324
 /// 除外された pair の sentinel 値
 const EXCLUDED_PAIR_BASE: usize = usize::MAX;
 
-const fn build_pair_base() -> ([usize; NUM_PAIRS], usize) {
+/// 指定された profile で pair_base テーブルと THREAT_DIMENSIONS を構築 (runtime)
+fn build_pair_base(profile: ThreatProfile) -> ([usize; NUM_PAIRS], usize) {
     let mut table = [0usize; NUM_PAIRS];
     let mut cumulative = 0usize;
-    let mut attacker_side = 0usize;
-    while attacker_side < 2 {
-        let mut ac = 0usize;
-        while ac < NUM_THREAT_CLASSES {
-            let mut ds = 0usize;
-            while ds < 2 {
-                let mut dc = 0usize;
-                while dc < NUM_THREAT_CLASSES {
+    for attacker_side in 0..2 {
+        for ac in 0..NUM_THREAT_CLASSES {
+            for ds in 0..2 {
+                for dc in 0..NUM_THREAT_CLASSES {
                     let idx = attacker_side * 162 + ac * 18 + ds * 9 + dc;
-                    if super::shogi_threat_exclusion::is_excluded(attacker_side, ac, ds, dc) {
+                    if profile.is_excluded(attacker_side, ac, ds, dc) {
                         table[idx] = EXCLUDED_PAIR_BASE;
                     } else {
                         table[idx] = cumulative;
                         cumulative += ATTACKS_PER_COLOR[ac];
                     }
-                    dc += 1;
                 }
-                ds += 1;
             }
-            ac += 1;
         }
-        attacker_side += 1;
     }
     (table, cumulative)
 }
 
-const PAIR_DATA: ([usize; NUM_PAIRS], usize) = build_pair_base();
-
-static PAIR_BASE: [usize; NUM_PAIRS] = PAIR_DATA.0;
-
-/// pair_base を取得。除外された pair は None を返す。
+/// pair_base テーブルから値を取得。除外された pair は None を返す。
 #[inline]
-fn pair_base(attacker_side: usize, ac: ThreatClass, attacked_side: usize, dc: ThreatClass) -> Option<usize> {
+fn lookup_pair_base(
+    pair_base: &[usize; NUM_PAIRS],
+    attacker_side: usize,
+    ac: ThreatClass,
+    attacked_side: usize,
+    dc: ThreatClass,
+) -> Option<usize> {
     let idx = attacker_side * 162 + (ac as usize) * 18 + attacked_side * 9 + dc as usize;
-    let base = PAIR_BASE[idx];
+    let base = pair_base[idx];
     if base == EXCLUDED_PAIR_BASE { None } else { Some(base) }
 }
 
@@ -621,8 +611,18 @@ struct ThreatParams {
 
 /// Threat index を計算する。除外された pair は None を返す。
 #[inline]
-fn threat_index(params: &ThreatParams, from_offset_table: &FromOffsetTable) -> Option<usize> {
-    let base = pair_base(params.attacker_side, params.attacker_class, params.attacked_side, params.attacked_class)?;
+fn threat_index(
+    params: &ThreatParams,
+    pair_base_table: &[usize; NUM_PAIRS],
+    from_offset_table: &FromOffsetTable,
+) -> Option<usize> {
+    let base = lookup_pair_base(
+        pair_base_table,
+        params.attacker_side,
+        params.attacker_class,
+        params.attacked_side,
+        params.attacked_class,
+    )?;
     let pattern = attack_pattern_id(params.attacker_class, params.oriented_color);
     let from_off = from_offset_table.get(pattern, params.from_sq_n);
     let attack_ord =
@@ -638,15 +638,39 @@ fn threat_index(params: &ThreatParams, from_offset_table: &FromOffsetTable) -> O
 ///
 /// `SparseInputType` を実装し、HalfKA_hm 特徴量と Threat 特徴量を
 /// 連結した sparse input として提供する。
+///
+/// `ThreatProfile` で除外 pair を runtime 選択する。
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ShogiHalfKaHmThreat;
+#[derive(Clone, Debug)]
+pub struct ShogiHalfKaHmThreat {
+    profile: ThreatProfile,
+    pair_base: Box<[usize; NUM_PAIRS]>,
+    threat_dims: usize,
+}
+
+impl ShogiHalfKaHmThreat {
+    /// 指定 profile で構築
+    pub fn new(profile: ThreatProfile) -> Self {
+        let (pair_base, threat_dims) = build_pair_base(profile);
+        Self { profile, pair_base: Box::new(pair_base), threat_dims }
+    }
+
+    /// Threat 特徴量の次元数
+    pub fn threat_dimensions(&self) -> usize {
+        self.threat_dims
+    }
+
+    /// ThreatProfile を取得
+    pub fn profile(&self) -> ThreatProfile {
+        self.profile
+    }
+}
 
 impl SparseInputType for ShogiHalfKaHmThreat {
     type RequiredDataType = PackedSfenValue;
 
     fn num_inputs(&self) -> usize {
-        TOTAL_DIMENSIONS
+        HALFKA_HM_DIMENSIONS + self.threat_dims
     }
 
     fn max_active(&self) -> usize {
@@ -655,15 +679,18 @@ impl SparseInputType for ShogiHalfKaHmThreat {
 
     fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, f: F) {
         let board = ShogiBoard::from_packed_sfen(pos);
-        map_halfka_hm_threat_features(&board, f);
+        self.map_threat_features(&board, f);
     }
 
     fn shorthand(&self) -> String {
-        format!("shogi-{}x45hm+threat", TOTAL_DIMENSIONS)
+        format!("shogi-{}x45hm+threat", HALFKA_HM_DIMENSIONS + self.threat_dims)
     }
 
     fn description(&self) -> String {
-        format!("Shogi HalfKA_hm ({}) + Threat ({}) concatenated", HALFKA_HM_DIMENSIONS, THREAT_DIMENSIONS)
+        format!(
+            "Shogi HalfKA_hm ({}) + Threat ({}, profile={}) concatenated",
+            HALFKA_HM_DIMENSIONS, self.threat_dims, self.profile
+        )
     }
 }
 
@@ -671,86 +698,37 @@ impl SparseInputType for ShogiHalfKaHmThreat {
 // 特徴量列挙
 // =============================================================================
 
-/// HalfKA_hm + Threat の特徴量を列挙する
-fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
-    let stm = board.side_to_move;
-    let nstm = stm.opponent();
+impl ShogiHalfKaHmThreat {
+    /// HalfKA_hm + Threat の特徴量を列挙する
+    fn map_threat_features<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, mut f: F) {
+        let stm = board.side_to_move;
+        let nstm = stm.opponent();
 
-    let stm_king_sq = board.king_square(stm);
-    let nstm_king_sq = board.king_square(nstm);
-    if !stm_king_sq.is_valid() || !nstm_king_sq.is_valid() {
-        return;
-    }
-
-    // -------------------------------------------------------
-    // Part 1: HalfKA_hm 特徴量（既存ロジック複製）
-    // -------------------------------------------------------
-
-    let stm_kb = king_bucket(stm_king_sq, stm);
-    let stm_hm = is_hm_mirror(stm_king_sq, stm);
-    let nstm_kb = king_bucket(nstm_king_sq, nstm);
-    let nstm_hm = is_hm_mirror(nstm_king_sq, nstm);
-
-    // 盤上の駒（王以外）
-    for &pt in &BOARD_PIECE_TYPES {
-        for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
-                let piece = Piece::new(color, pt);
-                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
-                let stm_packed = pack_bonapiece(stm_bp, stm_hm);
-                let stm_idx = halfka_index(stm_kb, stm_packed);
-
-                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
-                let nstm_packed = pack_bonapiece(nstm_bp, nstm_hm);
-                let nstm_idx = halfka_index(nstm_kb, nstm_packed);
-
-                f(stm_idx, nstm_idx);
-            }
+        let stm_king_sq = board.king_square(stm);
+        let nstm_king_sq = board.king_square(nstm);
+        if !stm_king_sq.is_valid() || !nstm_king_sq.is_valid() {
+            return;
         }
-    }
 
-    // 両方の玉の特徴量
-    {
-        let stm_king_sq_idx = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
-        let stm_friend_king_bp = king_bonapiece(stm_king_sq_idx, true);
-        let stm_friend_packed = pack_bonapiece(stm_friend_king_bp, stm_hm);
-        let stm_friend_idx = halfka_index(stm_kb, stm_friend_packed);
+        // -------------------------------------------------------
+        // Part 1: HalfKA_hm 特徴量（既存ロジック複製）
+        // -------------------------------------------------------
 
-        let nstm_king_sq_for_stm =
-            if stm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
-        let stm_enemy_king_bp = king_bonapiece(nstm_king_sq_for_stm, false);
-        let stm_enemy_packed = pack_bonapiece(stm_enemy_king_bp, stm_hm);
-        let stm_enemy_idx = halfka_index(stm_kb, stm_enemy_packed);
+        let stm_kb = king_bucket(stm_king_sq, stm);
+        let stm_hm = is_hm_mirror(stm_king_sq, stm);
+        let nstm_kb = king_bucket(nstm_king_sq, nstm);
+        let nstm_hm = is_hm_mirror(nstm_king_sq, nstm);
 
-        let nstm_king_sq_idx = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
-        let nstm_friend_king_bp = king_bonapiece(nstm_king_sq_idx, true);
-        let nstm_friend_packed = pack_bonapiece(nstm_friend_king_bp, nstm_hm);
-        let nstm_friend_idx = halfka_index(nstm_kb, nstm_friend_packed);
-
-        let stm_king_sq_for_nstm =
-            if nstm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
-        let nstm_enemy_king_bp = king_bonapiece(stm_king_sq_for_nstm, false);
-        let nstm_enemy_packed = pack_bonapiece(nstm_enemy_king_bp, nstm_hm);
-        let nstm_enemy_idx = halfka_index(nstm_kb, nstm_enemy_packed);
-
-        f(stm_friend_idx, nstm_friend_idx);
-        f(stm_enemy_idx, nstm_enemy_idx);
-    }
-
-    // 手駒の特徴量
-    for owner in [Color::Black, Color::White] {
-        for &pt in &HAND_PIECE_TYPES {
-            let count = board.hand(owner).count(pt);
-            if count == 0 {
-                continue;
-            }
-            for i in 1..=count {
-                let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
-                if stm_bp != BonaPiece::ZERO {
+        // 盤上の駒（王以外）
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in board.pieces(color, pt) {
+                    let piece = Piece::new(color, pt);
+                    let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
                     let stm_packed = pack_bonapiece(stm_bp, stm_hm);
                     let stm_idx = halfka_index(stm_kb, stm_packed);
 
-                    let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                    let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
                     let nstm_packed = pack_bonapiece(nstm_bp, nstm_hm);
                     let nstm_idx = halfka_index(nstm_kb, nstm_packed);
 
@@ -758,110 +736,164 @@ fn map_halfka_hm_threat_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
                 }
             }
         }
-    }
 
-    // -------------------------------------------------------
-    // Part 2: Threat 特徴量
-    // -------------------------------------------------------
+        // 両方の玉の特徴量
+        {
+            let stm_king_sq_idx = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
+            let stm_friend_king_bp = king_bonapiece(stm_king_sq_idx, true);
+            let stm_friend_packed = pack_bonapiece(stm_friend_king_bp, stm_hm);
+            let stm_friend_idx = halfka_index(stm_kb, stm_friend_packed);
 
-    let from_offset_table = &*FROM_OFFSET_TABLE;
-    let occ = Occupied::from_board(board);
+            let nstm_king_sq_for_stm =
+                if stm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+            let stm_enemy_king_bp = king_bonapiece(nstm_king_sq_for_stm, false);
+            let stm_enemy_packed = pack_bonapiece(stm_enemy_king_bp, stm_hm);
+            let stm_enemy_idx = halfka_index(stm_kb, stm_enemy_packed);
 
-    // STM perspective
-    let stm_friend = stm;
+            let nstm_king_sq_idx =
+                if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+            let nstm_friend_king_bp = king_bonapiece(nstm_king_sq_idx, true);
+            let nstm_friend_packed = pack_bonapiece(nstm_friend_king_bp, nstm_hm);
+            let nstm_friend_idx = halfka_index(nstm_kb, nstm_friend_packed);
 
-    // NSTM perspective
-    let nstm_friend = nstm;
+            let stm_king_sq_for_nstm =
+                if nstm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
+            let nstm_enemy_king_bp = king_bonapiece(stm_king_sq_for_nstm, false);
+            let nstm_enemy_packed = pack_bonapiece(nstm_enemy_king_bp, nstm_hm);
+            let nstm_enemy_idx = halfka_index(nstm_kb, nstm_enemy_packed);
 
-    // 全盤上駒を列挙して threat pair を生成
-    for sq_raw in 0..81u8 {
-        let from_sq = Square(sq_raw);
-        let pc = board.piece_on(from_sq);
-        if pc.is_none() {
-            continue;
+            f(stm_friend_idx, nstm_friend_idx);
+            f(stm_enemy_idx, nstm_enemy_idx);
         }
-        let pt = pc.piece_type;
-        let attacker_color = pc.color;
 
-        // King は除外
-        if pt == PieceType::King {
-            continue;
-        }
+        // 手駒の特徴量
+        for owner in [Color::Black, Color::White] {
+            for &pt in &HAND_PIECE_TYPES {
+                let count = board.hand(owner).count(pt);
+                if count == 0 {
+                    continue;
+                }
+                for i in 1..=count {
+                    let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                    if stm_bp != BonaPiece::ZERO {
+                        let stm_packed = pack_bonapiece(stm_bp, stm_hm);
+                        let stm_idx = halfka_index(stm_kb, stm_packed);
 
-        let attacker_class = match ThreatClass::from_piece_type(pt) {
-            Some(c) => c,
-            None => continue,
-        };
+                        let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                        let nstm_packed = pack_bonapiece(nstm_bp, nstm_hm);
+                        let nstm_idx = halfka_index(nstm_kb, nstm_packed);
 
-        // 実盤面上の攻撃先を列挙
-        for_each_attack(pt, attacker_color, from_sq, &occ, |to_sq| {
-            let target_pc = board.piece_on(to_sq);
-            if target_pc.is_none() {
-                return;
+                        f(stm_idx, nstm_idx);
+                    }
+                }
             }
-            let target_pt = target_pc.piece_type;
-            let target_color = target_pc.color;
+        }
+
+        // -------------------------------------------------------
+        // Part 2: Threat 特徴量
+        // -------------------------------------------------------
+
+        let from_offset_table = &*FROM_OFFSET_TABLE;
+        let occ = Occupied::from_board(board);
+
+        // STM perspective
+        let stm_friend = stm;
+
+        // NSTM perspective
+        let nstm_friend = nstm;
+
+        // 全盤上駒を列挙して threat pair を生成
+        for sq_raw in 0..81u8 {
+            let from_sq = Square(sq_raw);
+            let pc = board.piece_on(from_sq);
+            if pc.is_none() {
+                continue;
+            }
+            let pt = pc.piece_type;
+            let attacker_color = pc.color;
 
             // King は除外
-            if target_pt == PieceType::King {
-                return;
+            if pt == PieceType::King {
+                continue;
             }
 
-            let attacked_class = match ThreatClass::from_piece_type(target_pt) {
+            let attacker_class = match ThreatClass::from_piece_type(pt) {
                 Some(c) => c,
-                None => return,
+                None => continue,
             };
 
-            // --- STM perspective ---
-            let stm_attacker_side = if attacker_color == stm_friend { 0 } else { 1 };
-            let stm_attacked_side = if target_color == stm_friend { 0 } else { 1 };
-            let stm_from_n = normalize_sq(from_sq, stm, stm_hm);
-            let stm_to_n = normalize_sq(to_sq, stm, stm_hm);
-            let stm_oriented_color = if stm == Color::Black { attacker_color } else { attacker_color.opponent() };
-            let stm_threat_idx = threat_index(
-                &ThreatParams {
-                    attacker_side: stm_attacker_side,
-                    attacker_class,
-                    oriented_color: stm_oriented_color,
-                    attacked_side: stm_attacked_side,
-                    attacked_class,
-                    from_sq_n: stm_from_n,
-                    to_sq_n: stm_to_n,
-                },
-                from_offset_table,
-            );
-            let Some(stm_threat_idx) = stm_threat_idx else {
-                return; // excluded pair
-            };
-            debug_assert!(stm_threat_idx < THREAT_DIMENSIONS);
-            let stm_idx = HALFKA_HM_DIMENSIONS + stm_threat_idx;
+            // 実盤面上の攻撃先を列挙
+            for_each_attack(pt, attacker_color, from_sq, &occ, |to_sq| {
+                let target_pc = board.piece_on(to_sq);
+                if target_pc.is_none() {
+                    return;
+                }
+                let target_pt = target_pc.piece_type;
+                let target_color = target_pc.color;
 
-            // --- NSTM perspective ---
-            let nstm_attacker_side = if attacker_color == nstm_friend { 0 } else { 1 };
-            let nstm_attacked_side = if target_color == nstm_friend { 0 } else { 1 };
-            let nstm_from_n = normalize_sq(from_sq, nstm, nstm_hm);
-            let nstm_to_n = normalize_sq(to_sq, nstm, nstm_hm);
-            let nstm_oriented_color = if nstm == Color::Black { attacker_color } else { attacker_color.opponent() };
-            let nstm_threat_idx = threat_index(
-                &ThreatParams {
-                    attacker_side: nstm_attacker_side,
-                    attacker_class,
-                    oriented_color: nstm_oriented_color,
-                    attacked_side: nstm_attacked_side,
-                    attacked_class,
-                    from_sq_n: nstm_from_n,
-                    to_sq_n: nstm_to_n,
-                },
-                from_offset_table,
-            );
-            let Some(nstm_threat_idx) = nstm_threat_idx else {
-                return; // excluded pair
-            };
-            debug_assert!(nstm_threat_idx < THREAT_DIMENSIONS);
-            let nstm_idx = HALFKA_HM_DIMENSIONS + nstm_threat_idx;
+                // King は除外
+                if target_pt == PieceType::King {
+                    return;
+                }
 
-            f(stm_idx, nstm_idx);
-        });
+                let attacked_class = match ThreatClass::from_piece_type(target_pt) {
+                    Some(c) => c,
+                    None => return,
+                };
+
+                // --- STM perspective ---
+                let stm_attacker_side = if attacker_color == stm_friend { 0 } else { 1 };
+                let stm_attacked_side = if target_color == stm_friend { 0 } else { 1 };
+                let stm_from_n = normalize_sq(from_sq, stm, stm_hm);
+                let stm_to_n = normalize_sq(to_sq, stm, stm_hm);
+                let stm_oriented_color = if stm == Color::Black { attacker_color } else { attacker_color.opponent() };
+                let stm_threat_idx = threat_index(
+                    &ThreatParams {
+                        attacker_side: stm_attacker_side,
+                        attacker_class,
+                        oriented_color: stm_oriented_color,
+                        attacked_side: stm_attacked_side,
+                        attacked_class,
+                        from_sq_n: stm_from_n,
+                        to_sq_n: stm_to_n,
+                    },
+                    &self.pair_base,
+                    from_offset_table,
+                );
+                let Some(stm_threat_idx) = stm_threat_idx else {
+                    return; // excluded pair
+                };
+                debug_assert!(stm_threat_idx < self.threat_dims);
+                let stm_idx = HALFKA_HM_DIMENSIONS + stm_threat_idx;
+
+                // --- NSTM perspective ---
+                let nstm_attacker_side = if attacker_color == nstm_friend { 0 } else { 1 };
+                let nstm_attacked_side = if target_color == nstm_friend { 0 } else { 1 };
+                let nstm_from_n = normalize_sq(from_sq, nstm, nstm_hm);
+                let nstm_to_n = normalize_sq(to_sq, nstm, nstm_hm);
+                let nstm_oriented_color = if nstm == Color::Black { attacker_color } else { attacker_color.opponent() };
+                let nstm_threat_idx = threat_index(
+                    &ThreatParams {
+                        attacker_side: nstm_attacker_side,
+                        attacker_class,
+                        oriented_color: nstm_oriented_color,
+                        attacked_side: nstm_attacked_side,
+                        attacked_class,
+                        from_sq_n: nstm_from_n,
+                        to_sq_n: nstm_to_n,
+                    },
+                    &self.pair_base,
+                    from_offset_table,
+                );
+                let Some(nstm_threat_idx) = nstm_threat_idx else {
+                    return; // excluded pair
+                };
+                debug_assert!(nstm_threat_idx < self.threat_dims);
+                let nstm_idx = HALFKA_HM_DIMENSIONS + nstm_threat_idx;
+
+                f(stm_idx, nstm_idx);
+            });
+        }
     }
 }
 
@@ -874,30 +906,41 @@ mod tests {
     use super::*;
     use crate::shogi::types::PieceType;
 
+    fn full_input() -> ShogiHalfKaHmThreat {
+        ShogiHalfKaHmThreat::new(ThreatProfile::Full)
+    }
+
     #[test]
     fn test_total_dimensions() {
-        let input = ShogiHalfKaHmThreat;
-        assert_eq!(input.num_inputs(), HALFKA_HM_DIMENSIONS + THREAT_DIMENSIONS);
+        let input = full_input();
+        assert_eq!(input.num_inputs(), HALFKA_HM_DIMENSIONS + 216_720);
+    }
+
+    #[test]
+    fn test_cross_side_dimensions() {
+        let input = ShogiHalfKaHmThreat::new(ThreatProfile::CrossSide);
+        assert_eq!(input.threat_dimensions(), 96_320);
     }
 
     #[test]
     fn test_max_active() {
-        let input = ShogiHalfKaHmThreat;
+        let input = full_input();
         assert_eq!(input.max_active(), 40 + 320);
     }
 
     #[test]
     fn test_pair_base_dimensions() {
-        // 最後の non-excluded pair の base + attacks_per_color == THREAT_DIMENSIONS
+        let input = full_input();
+        // 最後の non-excluded pair の base + attacks_per_color == threat_dims
         let mut last_base = 0usize;
         let mut last_ac = 0usize;
-        for (i, &base) in PAIR_BASE.iter().enumerate() {
+        for (i, &base) in input.pair_base.iter().enumerate() {
             if base != EXCLUDED_PAIR_BASE && base >= last_base {
                 last_base = base;
                 last_ac = (i % 162) / 18;
             }
         }
-        assert_eq!(last_base + ATTACKS_PER_COLOR[last_ac], THREAT_DIMENSIONS);
+        assert_eq!(last_base + ATTACKS_PER_COLOR[last_ac], input.threat_dimensions());
     }
 
     #[test]
@@ -959,6 +1002,7 @@ mod tests {
 
     #[test]
     fn test_threat_index_range() {
+        let input = full_input();
         let from_offset_table = FromOffsetTable::new();
         let all_classes = [
             ThreatClass::Pawn,
@@ -992,11 +1036,12 @@ mod tests {
                                             from_sq_n: sq,
                                             to_sq_n: to,
                                         },
+                                        &input.pair_base,
                                         &from_offset_table,
                                     );
                                     if let Some(idx) = idx {
                                         assert!(
-                                            idx < THREAT_DIMENSIONS,
+                                            idx < input.threat_dimensions(),
                                             "index {} out of range for class={:?} color={:?} sq={} to={}",
                                             idx,
                                             class,
@@ -1070,17 +1115,19 @@ mod tests {
         let mut halfka_count = 0usize;
         let mut threat_count = 0usize;
 
-        map_halfka_hm_threat_features(&board, |stm_idx, nstm_idx| {
+        let input = full_input();
+        let total_dims = input.num_inputs();
+        input.map_threat_features(&board, |stm_idx, nstm_idx| {
             if stm_idx < HALFKA_HM_DIMENSIONS {
                 halfka_count += 1;
             } else {
                 threat_count += 1;
-                assert!(stm_idx < TOTAL_DIMENSIONS, "stm threat index out of range: {stm_idx}");
+                assert!(stm_idx < total_dims, "stm threat index out of range: {stm_idx}");
             }
             if nstm_idx < HALFKA_HM_DIMENSIONS {
                 // HalfKA 部分
             } else {
-                assert!(nstm_idx < TOTAL_DIMENSIONS, "nstm threat index out of range: {nstm_idx}");
+                assert!(nstm_idx < total_dims, "nstm threat index out of range: {nstm_idx}");
             }
         });
 
@@ -1102,14 +1149,15 @@ mod tests {
         };
 
         let mut count = 0;
-        map_halfka_hm_threat_features(&board, |_, _| count += 1);
+        let input = full_input();
+        input.map_threat_features(&board, |_, _| count += 1);
         assert_eq!(count, 0);
     }
 
     #[test]
     fn test_shorthand() {
-        let input = ShogiHalfKaHmThreat;
-        let expected = format!("shogi-{}x45hm+threat", HALFKA_HM_DIMENSIONS + THREAT_DIMENSIONS);
+        let input = full_input();
+        let expected = format!("shogi-{}x45hm+threat", input.num_inputs());
         assert_eq!(input.shorthand(), expected);
     }
 
@@ -1176,7 +1224,8 @@ mod tests {
         board.board[Square::new(5, 0).index()] = Piece::new(Color::White, PieceType::Gold);
 
         let mut stm_threat_indices = Vec::new();
-        map_halfka_hm_threat_features(&board, |stm_idx, _nstm_idx| {
+        let input = full_input();
+        input.map_threat_features(&board, |stm_idx, _nstm_idx| {
             if stm_idx >= HALFKA_HM_DIMENSIONS {
                 stm_threat_indices.push(stm_idx - HALFKA_HM_DIMENSIONS);
             }

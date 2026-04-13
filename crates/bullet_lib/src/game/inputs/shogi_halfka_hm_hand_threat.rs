@@ -20,8 +20,8 @@ use super::shogi_halfka::{
     HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece,
 };
 use super::shogi_halfka_hm_threat::{
-    FROM_OFFSET_TABLE, NUM_THREAT_CLASSES, Occupied, ThreatClass, attack_pattern_id,
-    compute_attack_order, normalize_sq,
+    ATTACK_ORDER_TABLE, AttackOrderTable, FROM_OFFSET_TABLE, NUM_THREAT_CLASSES, Occupied,
+    ThreatClass, attack_pattern_id, normalize_sq,
 };
 use crate::shogi::{
     PackedSfenValue, ShogiBoard,
@@ -207,11 +207,12 @@ fn is_legal_drop_rank(hand_class: HandThreatClass, color: Color, sq: Square) -> 
     }
 }
 
-/// `color` が `file` の列に Pawn を持っているか (二歩判定)
-fn has_pawn_on_file(board: &ShogiBoard, color: Color, file: u8) -> bool {
+/// `color` が `sq.file()` の列に Pawn (非成り) を持っているか (二歩判定)
+fn has_pawn_on_file(board: &ShogiBoard, color: Color, sq: Square) -> bool {
+    let file = sq.file();
     for rank in 0..9u8 {
-        let sq = Square::new(file, rank);
-        let pc = board.piece_on(sq);
+        let s = Square::new(file, rank);
+        let pc = board.piece_on(s);
         if !pc.is_none() && pc.color == color && pc.piece_type == PieceType::Pawn {
             return true;
         }
@@ -248,6 +249,8 @@ fn for_each_drop_attack<F: FnMut(Square)>(
 // =============================================================================
 
 /// HandThreat index を計算
+///
+/// `attack_order` は O(1) LUT lookup (`ATTACK_ORDER_TABLE`) を使用する。
 #[inline]
 fn hand_threat_index(
     drop_owner: usize,
@@ -263,13 +266,15 @@ fn hand_threat_index(
     let pattern = attack_pattern_id(hand_class.as_board_class(), oriented_color);
     let from_offset_table = &*FROM_OFFSET_TABLE;
     let from_off = from_offset_table.get(pattern, drop_sq_n);
-    let attack_ord = compute_attack_order(
-        hand_class.as_board_class(),
-        oriented_color,
-        drop_sq_n,
-        attack_to_sq_n,
+    let attack_ord = ATTACK_ORDER_TABLE.get(pattern, drop_sq_n, attack_to_sq_n);
+    debug_assert_ne!(
+        attack_ord,
+        AttackOrderTable::INVALID,
+        "hand_threat attack_order: to_sq {} not attacked by pattern {pattern} at {}",
+        attack_to_sq_n.0,
+        drop_sq_n.0
     );
-    base + from_off + attack_ord
+    base + from_off + attack_ord as usize
 }
 
 // =============================================================================
@@ -447,7 +452,7 @@ impl ShogiHalfKaHmHandThreat {
                     }
                     // (3) 二歩
                     if hand_class == HandThreatClass::Pawn
-                        && has_pawn_on_file(board, drop_color, drop_sq.file())
+                        && has_pawn_on_file(board, drop_color, drop_sq)
                     {
                         continue;
                     }
@@ -670,6 +675,93 @@ mod tests {
             1,
             "minimal position should produce exactly 1 hand threat feature"
         );
+    }
+
+    /// Snapshot regression test for optimization verification
+    ///
+    /// DLSuisho15b_deduped_shuffled.bin から 1000 局面を読み、各局面の
+    /// HandThreat feature (sorted) を snapshot ファイルに dump する。
+    ///
+    /// ## Usage
+    ///
+    /// ```bash
+    /// # 最適化前に baseline snapshot を取る
+    /// cd /mnt/nvme1/development/bullet-shogi
+    /// cargo test -p bullet_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
+    /// cp /tmp/hand_threat_snapshot.txt /tmp/hand_threat_snapshot_before.txt
+    ///
+    /// # 最適化実装
+    ///
+    /// # 最適化後に snapshot を再生成して diff
+    /// cargo test -p bullet_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
+    /// diff /tmp/hand_threat_snapshot_before.txt /tmp/hand_threat_snapshot.txt
+    /// # 差分が 0 行なら bit-exact 同一
+    /// ```
+    ///
+    /// 出力形式 (per position):
+    /// ```
+    /// pos N: K features
+    ///   stm_offset nstm_offset  (HALFKA_HM_DIMENSIONS を差し引いた HandThreat 内部 index)
+    ///   ...
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_snapshot_hand_threat_corpus() {
+        use crate::shogi::PackedSfenValue;
+        use std::fs::File;
+        use std::io::{Read, Write};
+
+        const PACK_PATH: &str =
+            "/mnt/nvme1/development/bullet-shogi/data/DLSuisho15b_deduped_shuffled.bin";
+        const NUM_POSITIONS: usize = 1000;
+        const SNAPSHOT_PATH: &str = "/tmp/hand_threat_snapshot.txt";
+
+        let mut file = File::open(PACK_PATH)
+            .unwrap_or_else(|e| panic!("failed to open {PACK_PATH}: {e}"));
+
+        let input = ShogiHalfKaHmHandThreat::new();
+        let mut dump = String::new();
+        let mut total_features = 0usize;
+        let mut positions_with_features = 0usize;
+
+        for pos_idx in 0..NUM_POSITIONS {
+            let mut buf = [0u8; 40];
+            if file.read_exact(&mut buf).is_err() {
+                eprintln!("EOF at position {pos_idx}");
+                break;
+            }
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut().copy_from_slice(&buf);
+
+            // HandThreat features のみ抽出して sort
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            input.map_features(&psv, |stm_idx, nstm_idx| {
+                if stm_idx >= HALFKA_HM_DIMENSIONS {
+                    pairs.push((stm_idx - HALFKA_HM_DIMENSIONS, nstm_idx - HALFKA_HM_DIMENSIONS));
+                }
+            });
+            pairs.sort();
+
+            dump.push_str(&format!("pos {}: {} features\n", pos_idx, pairs.len()));
+            for (stm_off, nstm_off) in &pairs {
+                dump.push_str(&format!("  {} {}\n", stm_off, nstm_off));
+            }
+
+            total_features += pairs.len();
+            if !pairs.is_empty() {
+                positions_with_features += 1;
+            }
+        }
+
+        let mut out = File::create(SNAPSHOT_PATH)
+            .unwrap_or_else(|e| panic!("failed to create {SNAPSHOT_PATH}: {e}"));
+        out.write_all(dump.as_bytes()).expect("write snapshot");
+
+        eprintln!(
+            "Snapshot written: {} positions, {} with features, {} total features",
+            NUM_POSITIONS, positions_with_features, total_features
+        );
+        eprintln!("File: {SNAPSHOT_PATH}");
     }
 
     #[test]

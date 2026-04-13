@@ -391,10 +391,82 @@ impl FromOffsetTable {
 pub(super) static FROM_OFFSET_TABLE: LazyLock<FromOffsetTable> = LazyLock::new(FromOffsetTable::new);
 
 // =============================================================================
-// attack_order 計算
+// attack_order LUT (O(1) lookup)
+// =============================================================================
+
+/// attack_order の事前計算 LUT (rshogi の ATTACK_ORDER_TABLE と同設計)
+///
+/// `data[attack_pattern][from_sq][to_sq]` = 空盤面上で from_sq の駒が to_sq を攻撃する際の
+/// 0-indexed 順位 (raw 昇順)。攻撃しない (from, to) ペアは `INVALID` (u8::MAX)。
+///
+/// サイズ: 14 × 81 × 81 = 91,854 bytes ≈ 90 KiB
+///
+/// LazyLock で初回アクセス時に 1 度だけ構築。以降は `get()` が O(1) lookup。
+pub(super) struct AttackOrderTable {
+    data: [[[u8; 81]; 81]; NUM_ATTACK_PATTERNS],
+}
+
+impl AttackOrderTable {
+    pub(super) const INVALID: u8 = u8::MAX;
+
+    pub(super) fn new() -> Self {
+        let all_classes: [ThreatClass; NUM_THREAT_CLASSES] = [
+            ThreatClass::Pawn,
+            ThreatClass::Lance,
+            ThreatClass::Knight,
+            ThreatClass::Silver,
+            ThreatClass::GoldLike,
+            ThreatClass::Bishop,
+            ThreatClass::Rook,
+            ThreatClass::Horse,
+            ThreatClass::Dragon,
+        ];
+
+        let mut data = [[[Self::INVALID; 81]; 81]; NUM_ATTACK_PATTERNS];
+        for &class in &all_classes {
+            // Black (先手) pattern
+            {
+                let pattern = class as usize;
+                Self::fill_pattern(&mut data[pattern], class, Color::Black);
+            }
+            // White (後手) 方向性駒は別エントリ
+            if is_directional(class) {
+                let pattern = NUM_THREAT_CLASSES + class as usize;
+                Self::fill_pattern(&mut data[pattern], class, Color::White);
+            }
+        }
+        Self { data }
+    }
+
+    fn fill_pattern(table: &mut [[u8; 81]; 81], class: ThreatClass, color: Color) {
+        for from_raw in 0..81u8 {
+            let (targets, count) = attacks_empty_board(class, color, Square(from_raw));
+            for (order, &to_raw) in targets.iter().take(count).enumerate() {
+                table[from_raw as usize][to_raw as usize] = order as u8;
+            }
+        }
+    }
+
+    /// O(1) で attack_order を取得
+    #[inline]
+    pub(super) fn get(&self, pattern: usize, from_sq: Square, to_sq: Square) -> u8 {
+        self.data[pattern][from_sq.0 as usize][to_sq.0 as usize]
+    }
+}
+
+/// 遅延初期化された `AttackOrderTable` シングルトン
+pub(super) static ATTACK_ORDER_TABLE: LazyLock<AttackOrderTable> = LazyLock::new(AttackOrderTable::new);
+
+// =============================================================================
+// attack_order 計算 (legacy、テスト互換用)
 // =============================================================================
 
 /// 空盤面上で from_sq の駒が to_sq を攻撃するときの、raw 昇順での順位
+///
+/// **注意**: ホットパスでは `ATTACK_ORDER_TABLE.get(...)` を直接使うこと。
+/// この関数は毎回 `attacks_empty_board` を再計算するため遅い。
+/// 既存のテストコードと `threat_index` 内の legacy path との互換維持のためだけに残している。
+#[allow(dead_code)]
 pub(super) fn compute_attack_order(class: ThreatClass, color: Color, from_sq: Square, to_sq: Square) -> usize {
     let (targets, count) = attacks_empty_board(class, color, from_sq);
     let to_raw = to_sq.0;
@@ -610,6 +682,8 @@ struct ThreatParams {
 }
 
 /// Threat index を計算する。除外された pair は None を返す。
+///
+/// `attack_order` は O(1) LUT lookup (`ATTACK_ORDER_TABLE`) を使用する。
 #[inline]
 fn threat_index(
     params: &ThreatParams,
@@ -625,9 +699,15 @@ fn threat_index(
     )?;
     let pattern = attack_pattern_id(params.attacker_class, params.oriented_color);
     let from_off = from_offset_table.get(pattern, params.from_sq_n);
-    let attack_ord =
-        compute_attack_order(params.attacker_class, params.oriented_color, params.from_sq_n, params.to_sq_n);
-    Some(base + from_off + attack_ord)
+    let attack_ord = ATTACK_ORDER_TABLE.get(pattern, params.from_sq_n, params.to_sq_n);
+    debug_assert_ne!(
+        attack_ord,
+        AttackOrderTable::INVALID,
+        "attack_order: to_sq {} not attacked by pattern {pattern} at {}",
+        params.to_sq_n.0,
+        params.from_sq_n.0
+    );
+    Some(base + from_off + attack_ord as usize)
 }
 
 // =============================================================================

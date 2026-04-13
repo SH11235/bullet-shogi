@@ -27,7 +27,7 @@ use crate::shogi::{
 // =============================================================================
 
 /// ThreatClass の数（King 除外）
-const NUM_THREAT_CLASSES: usize = 9;
+pub(super) const NUM_THREAT_CLASSES: usize = 9;
 
 /// active threat features の最大数（安全側の上限）
 const MAX_ACTIVE_THREAT_FEATURES: usize = 320;
@@ -42,7 +42,7 @@ const MAX_ACTIVE_TOTAL: usize = MAX_ACTIVE_FEATURES + MAX_ACTIVE_THREAT_FEATURES
 /// Threat 駒種分類（King 除外、9 family）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-enum ThreatClass {
+pub(super) enum ThreatClass {
     Pawn = 0,
     Lance = 1,
     Knight = 2,
@@ -57,7 +57,7 @@ enum ThreatClass {
 impl ThreatClass {
     /// PieceType から ThreatClass への変換。King は None。
     #[inline]
-    fn from_piece_type(pt: PieceType) -> Option<Self> {
+    pub(super) fn from_piece_type(pt: PieceType) -> Option<Self> {
         match pt {
             PieceType::Pawn => Some(Self::Pawn),
             PieceType::Lance => Some(Self::Lance),
@@ -143,11 +143,11 @@ fn lookup_pair_base(
 // =============================================================================
 
 /// Attack pattern の総数: 9(Black) + 5(White の方向性駒)
-const NUM_ATTACK_PATTERNS: usize = 14;
+pub(super) const NUM_ATTACK_PATTERNS: usize = 14;
 
 /// 方向性駒かどうか
 #[inline]
-fn is_directional(class: ThreatClass) -> bool {
+pub(super) fn is_directional(class: ThreatClass) -> bool {
     matches!(
         class,
         ThreatClass::Pawn | ThreatClass::Lance | ThreatClass::Knight | ThreatClass::Silver | ThreatClass::GoldLike
@@ -156,7 +156,7 @@ fn is_directional(class: ThreatClass) -> bool {
 
 /// attack_pattern_id: 方向性駒は色別、非方向性駒は色不問
 #[inline]
-fn attack_pattern_id(class: ThreatClass, oriented_color: Color) -> usize {
+pub(super) fn attack_pattern_id(class: ThreatClass, oriented_color: Color) -> usize {
     if oriented_color == Color::White && is_directional(class) {
         NUM_THREAT_CLASSES + class as usize // 9..13
     } else {
@@ -170,7 +170,7 @@ fn attack_pattern_id(class: ThreatClass, oriented_color: Color) -> usize {
 
 /// 空盤面上の攻撃先マスを raw 値昇順で返す。
 /// 返り値: (マスの配列, マス数)
-fn attacks_empty_board(class: ThreatClass, color: Color, from: Square) -> ([u8; 36], usize) {
+pub(super) fn attacks_empty_board(class: ThreatClass, color: Color, from: Square) -> ([u8; 36], usize) {
     let mut targets = [0u8; 36];
     let mut count = 0;
     let file = from.file() as i8;
@@ -335,12 +335,12 @@ fn attacks_empty_board(class: ThreatClass, color: Color, from: Square) -> ([u8; 
 // =============================================================================
 
 /// 全 attack pattern の from_offset テーブル
-struct FromOffsetTable {
+pub(super) struct FromOffsetTable {
     data: [[usize; 81]; NUM_ATTACK_PATTERNS],
 }
 
 impl FromOffsetTable {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let all_classes: [ThreatClass; NUM_THREAT_CLASSES] = [
             ThreatClass::Pawn,
             ThreatClass::Lance,
@@ -382,20 +382,20 @@ impl FromOffsetTable {
     }
 
     #[inline]
-    fn get(&self, pattern: usize, sq_n: Square) -> usize {
+    pub(super) fn get(&self, pattern: usize, sq_n: Square) -> usize {
         self.data[pattern][sq_n.index()]
     }
 }
 
 /// 遅延初期化された `FromOffsetTable` シングルトン
-static FROM_OFFSET_TABLE: LazyLock<FromOffsetTable> = LazyLock::new(FromOffsetTable::new);
+pub(super) static FROM_OFFSET_TABLE: LazyLock<FromOffsetTable> = LazyLock::new(FromOffsetTable::new);
 
 // =============================================================================
 // attack_order 計算
 // =============================================================================
 
 /// 空盤面上で from_sq の駒が to_sq を攻撃するときの、raw 昇順での順位
-fn compute_attack_order(class: ThreatClass, color: Color, from_sq: Square, to_sq: Square) -> usize {
+pub(super) fn compute_attack_order(class: ThreatClass, color: Color, from_sq: Square, to_sq: Square) -> usize {
     let (targets, count) = attacks_empty_board(class, color, from_sq);
     let to_raw = to_sq.0;
     for (i, &target) in targets.iter().enumerate().take(count) {
@@ -411,12 +411,12 @@ fn compute_attack_order(class: ThreatClass, color: Color, from_sq: Square, to_sq
 // =============================================================================
 
 /// occupied bitset: 81 マス分のビットマップ
-struct Occupied {
+pub(super) struct Occupied {
     bits: [u64; 2], // bits[0]: sq 0..63, bits[1]: sq 64..80
 }
 
 impl Occupied {
-    fn from_board(board: &ShogiBoard) -> Self {
+    pub(super) fn from_board(board: &ShogiBoard) -> Self {
         let mut bits = [0u64; 2];
         for sq in 0..81u8 {
             if board.board[sq as usize].is_some() {
@@ -431,13 +431,13 @@ impl Occupied {
     }
 
     #[inline]
-    fn is_occupied(&self, sq: u8) -> bool {
+    pub(super) fn is_occupied(&self, sq: u8) -> bool {
         if sq < 64 { (self.bits[0] >> sq) & 1 != 0 } else { (self.bits[1] >> (sq - 64)) & 1 != 0 }
     }
 }
 
 /// 実盤面上の攻撃先マスを列挙し、コールバックを呼ぶ
-fn for_each_attack<F: FnMut(Square)>(pt: PieceType, color: Color, from: Square, occ: &Occupied, mut callback: F) {
+pub(super) fn for_each_attack<F: FnMut(Square)>(pt: PieceType, color: Color, from: Square, occ: &Occupied, mut callback: F) {
     let file = from.file() as i8;
     let rank = from.rank() as i8;
 
@@ -589,7 +589,7 @@ fn for_each_attack<F: FnMut(Square)>(pt: PieceType, color: Color, from: Square, 
 
 /// マスを perspective 基準 + HM mirror で正規化
 #[inline]
-fn normalize_sq(sq: Square, perspective: Color, hm_mirror: bool) -> Square {
+pub(super) fn normalize_sq(sq: Square, perspective: Color, hm_mirror: bool) -> Square {
     let sq_n = if perspective == Color::Black { sq } else { sq.inverse() };
     if hm_mirror { sq_n.mirror_file() } else { sq_n }
 }

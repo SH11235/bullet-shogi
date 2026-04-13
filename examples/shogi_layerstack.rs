@@ -1427,6 +1427,17 @@ fn main() {
             "disabled".to_string()
         }
     );
+    println!(
+        "HandThreat: {}",
+        if use_hand_threat {
+            let hand_threat_dims = input_size - halfka_dim;
+            format!(
+                "enabled (案 A full drop-attack pair, {hand_threat_dims} dimensions, total input={input_size})"
+            )
+        } else {
+            "disabled".to_string()
+        }
+    );
     println!("Buckets: {}", NUM_BUCKETS);
     println!("Bucket mode: {}", args.bucket_mode_name());
     if let Some(bounds) = ply_bounds {

@@ -40,7 +40,7 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
-    game::inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
+    game::inputs::{ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
     game::outputs::{
         SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
         SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -249,6 +249,13 @@ struct Args {
     /// Threat exclusion profile (full, same-class, same-class-major-pawn, cross-side)
     #[arg(long, default_value = "full")]
     threat_profile: String,
+
+    /// Enable HandThreat concatenated input (案 A: full drop-attack pair, 121,104 dims)
+    ///
+    /// `--threat` とは排他。両方指定した場合はエラーで終了する。
+    /// profile なし (v95 PoC 版)。
+    #[arg(long, default_value_t = false)]
+    hand_threat: bool,
 
     /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
@@ -970,6 +977,7 @@ fn build_layerstack_save_format(
     fv_scale: i32,
     psqt: bool,
     threat_profile: Option<ThreatProfile>,
+    hand_threat: bool,
 ) -> Vec<SavedFormat> {
     use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
 
@@ -994,10 +1002,19 @@ fn build_layerstack_save_format(
     } else {
         String::new()
     };
+    // HandThreat (案 A): dims 固定 121,104。rshogi 側 loader は
+    // `HandThreat={dims},` を検出して u32 dims + i8 weights を読み込む。
+    let hand_threat_part = if hand_threat {
+        let hand_threat_dims = input_size - halfka_dim;
+        format!("HandThreat={hand_threat_dims},")
+    } else {
+        String::new()
+    };
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
          {psqt_part}\
          {threat_part}\
+         {hand_threat_part}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -1124,6 +1141,35 @@ fn build_layerstack_save_format(
                     let threat_start = halfka_dim_for_threat * ft_out_for_threat;
                     let mut bytes: Vec<u8> = Vec::new();
                     for &v in &l0w.values[threat_start..] {
+                        let q = (qa_f * v as f64).round().clamp(-128.0, 127.0) as i8;
+                        bytes.push(q as u8);
+                    }
+
+                    bytes.iter().map(|&b| (b as i8) as f32).collect()
+                })
+                .quantise::<i8>(1),
+        )
+    } else {
+        None
+    };
+
+    // ---- HandThreat weights (raw i8) ----
+    // l0w の HandThreat 部分 (feat halfka_dim..input_size) を i8 で書き出す。
+    // --threat と --hand-threat は排他なので、同時に存在しない。
+    // レイアウト: i8[HAND_THREAT_DIMENSIONS × ft_out] (feature-major)
+    let hand_threat_data = if hand_threat {
+        let halfka_dim_for_ht = halfka_dim;
+        let ft_out_for_ht = ft_out;
+        let qa_for_ht = QA;
+        Some(
+            SavedFormat::empty()
+                .transform(move |graph, _| {
+                    let l0w = graph.get("l0w");
+                    let qa_f = qa_for_ht as f64;
+
+                    let ht_start = halfka_dim_for_ht * ft_out_for_ht;
+                    let mut bytes: Vec<u8> = Vec::new();
+                    for &v in &l0w.values[ht_start..] {
                         let q = (qa_f * v as f64).round().clamp(-128.0, 127.0) as i8;
                         bytes.push(q as u8);
                     }
@@ -1285,6 +1331,13 @@ fn build_layerstack_save_format(
         }
         formats.push(threat);
     }
+    if let Some(ht) = hand_threat_data {
+        // HandThreat dims (u32 LE) を weights の直前に書き込む
+        // v95 では 121,104 固定だが、将来の profile 追加に備えて明示化
+        let ht_dims = (input_size - halfka_dim) as u32;
+        formats.push(SavedFormat::custom(ht_dims.to_le_bytes().to_vec()));
+        formats.push(ht);
+    }
     formats.push(layerstack_data);
     formats
 }
@@ -1315,6 +1368,12 @@ fn main() {
     let l2_out = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
 
+    // --threat と --hand-threat は排他 (v95 PoC では同時利用不可)
+    if args.threat && args.hand_threat {
+        eprintln!("ERROR: --threat と --hand-threat は同時に指定できません (v95 PoC 版)");
+        std::process::exit(1);
+    }
+
     // Threat profile の解決
     let threat_profile = if args.threat {
         let tp = ThreatProfile::from_cli(&args.threat_profile).unwrap_or_else(|| {
@@ -1330,9 +1389,14 @@ fn main() {
         None
     };
 
+    let use_hand_threat = args.hand_threat;
+
     let input_size = if let Some(tp) = threat_profile {
         let threat_input = ShogiHalfKaHmThreat::new(tp);
         threat_input.num_inputs()
+    } else if use_hand_threat {
+        let hand_threat_input = ShogiHalfKaHmHandThreat::new();
+        hand_threat_input.num_inputs()
     } else {
         halfka_dim
     };
@@ -1516,6 +1580,7 @@ fn main() {
         fv_scale,
         args.psqt,
         threat_profile,
+        use_hand_threat,
     );
 
     // Network builder
@@ -1708,6 +1773,8 @@ fn main() {
 
     if let Some(tp) = threat_profile {
         run_optimizer!(ShogiHalfKaHmThreat::new(tp));
+    } else if use_hand_threat {
+        run_optimizer!(ShogiHalfKaHmHandThreat::new());
     } else {
         run_optimizer!(ShogiHalfKA_hm);
     }

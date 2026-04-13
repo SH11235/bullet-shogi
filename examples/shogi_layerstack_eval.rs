@@ -32,7 +32,7 @@ use std::{
 use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::dataloader::PreparedBatchDevice};
 use bullet_lib::{
     game::{
-        inputs::{ShogiHalfKA_hm, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
+        inputs::{ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
         outputs::{
             OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
             SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -128,6 +128,12 @@ struct Args {
     /// Threat exclusion profile (full, same-class, same-class-major-pawn, cross-side)
     #[arg(long, default_value = "full")]
     threat_profile: String,
+
+    /// Enable HandThreat concatenated input (案 A, 121,104 dims)
+    ///
+    /// `--threat` とは排他
+    #[arg(long, default_value_t = false)]
+    hand_threat: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -554,6 +560,12 @@ fn main() {
     let l2_input = l1_effective * 2;
     let l2_size = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs();
+
+    if args.threat && args.hand_threat {
+        eprintln!("ERROR: --threat と --hand-threat は同時に指定できません");
+        std::process::exit(1);
+    }
+
     let threat_profile = if args.threat {
         Some(ThreatProfile::from_cli(&args.threat_profile).unwrap_or_else(|| {
             eprintln!(
@@ -566,7 +578,14 @@ fn main() {
     } else {
         None
     };
-    let input_size = if let Some(tp) = threat_profile { ShogiHalfKaHmThreat::new(tp).num_inputs() } else { halfka_dim };
+    let use_hand_threat = args.hand_threat;
+    let input_size = if let Some(tp) = threat_profile {
+        ShogiHalfKaHmThreat::new(tp).num_inputs()
+    } else if use_hand_threat {
+        ShogiHalfKaHmHandThreat::new().num_inputs()
+    } else {
+        halfka_dim
+    };
     let l1_input_dim = l0_size;
 
     // Integer golden forward mode: quantised.bin のみで整数演算 forward、trainer 不要
@@ -1460,6 +1479,8 @@ struct QuantisedNetwork {
     psqt_biases: Vec<i32>,
     psqt_weights: Vec<i32>,
     threat_weights: Vec<i8>,
+    has_hand_threat: bool,
+    hand_threat_weights: Vec<i8>,
     l1_biases: Vec<i32>,
     l1_weights: Vec<i8>,
     l2_biases: Vec<i32>,
@@ -1488,7 +1509,22 @@ impl QuantisedNetwork {
         f.read_exact(&mut arch_buf)?;
         let arch_str = String::from_utf8_lossy(&arch_buf).to_string();
         let has_psqt = arch_str.contains("PSQT=");
-        let has_threat = arch_str.contains("Threat=");
+        // `Threat=` は `HandThreat=` の substring にもマッチするため、単独の
+        // "Threat=" 検出時は HandThreat= を除外する
+        let has_hand_threat = arch_str.contains("HandThreat=");
+        let has_threat = {
+            let mut s = arch_str.as_str();
+            let mut found = false;
+            while let Some(pos) = s.find("Threat=") {
+                let starts_at = pos == 0 || !s[..pos].ends_with("Hand");
+                if starts_at {
+                    found = true;
+                    break;
+                }
+                s = &s[pos + 1..];
+            }
+            found
+        };
         // FT weights / PSQT は HalfKA 部分のみ (Threat は別ブロック)
         // arch_str から自動判定し、CLI --threat フラグに依存しない
         let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
@@ -1569,6 +1605,34 @@ impl QuantisedNetwork {
             Vec::new()
         };
 
+        // HandThreat block (i8 raw, after Threat)
+        // arch_str の "HandThreat=NNNNN" と binary の u32 dims を突合
+        let hand_threat_weights = if has_hand_threat {
+            let arch_hand_threat_dims = arch_str
+                .split(',')
+                .find_map(|part| part.strip_prefix("HandThreat="))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            f.read_exact(&mut buf4)?;
+            let binary_hand_threat_dims = u32::from_le_bytes(buf4) as usize;
+            if binary_hand_threat_dims != arch_hand_threat_dims {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "HandThreat dims mismatch: arch_str={arch_hand_threat_dims}, binary={binary_hand_threat_dims}"
+                    ),
+                ));
+            }
+            println!("HandThreat dims: {binary_hand_threat_dims}");
+            let count = binary_hand_threat_dims * l0_size;
+            let mut weights = vec![0i8; count];
+            let slice = unsafe { std::slice::from_raw_parts_mut(weights.as_mut_ptr() as *mut u8, count) };
+            f.read_exact(slice)?;
+            weights
+        } else {
+            Vec::new()
+        };
+
         // LayerStack per-bucket: [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
         let l1_effective = l1_size - 1;
         let l2_in_dim = l1_effective * 2;
@@ -1641,6 +1705,8 @@ impl QuantisedNetwork {
             psqt_biases,
             psqt_weights,
             threat_weights,
+            has_hand_threat,
+            hand_threat_weights,
             l1_biases,
             l1_weights,
             l2_biases,
@@ -1690,7 +1756,7 @@ fn run_integer_forward(
         let decoded = psv.decode();
         let sfen = board_to_sfen(&decoded, psv.game_ply());
         let bucket = bucket_impl.bucket(&psv) as usize;
-        // HalfKA features のみ (Threat は別途処理)
+        // HalfKA features のみ (Threat / HandThreat は別途処理)
         let (stm_features, nstm_features) = get_active_features(&psv, None);
         // Threat features (has_threat の場合のみ)
         let (stm_threat, nstm_threat) = if net.has_threat {
@@ -1703,12 +1769,35 @@ fn run_integer_forward(
         } else {
             (Vec::new(), Vec::new())
         };
+        // HandThreat features (has_hand_threat の場合のみ)
+        let (stm_hand_threat, nstm_hand_threat) = if net.has_hand_threat {
+            let input = ShogiHalfKaHmHandThreat::new();
+            let mut stm_all: Vec<usize> = Vec::new();
+            let mut nstm_all: Vec<usize> = Vec::new();
+            input.map_features(&psv, |stm_idx, nstm_idx| {
+                stm_all.push(stm_idx);
+                nstm_all.push(nstm_idx);
+            });
+            let halfka_dim = ShogiHalfKA_hm.num_inputs();
+            let ht_stm: Vec<usize> = stm_all.into_iter().filter(|&i| i >= halfka_dim).collect();
+            let ht_nstm: Vec<usize> = nstm_all.into_iter().filter(|&i| i >= halfka_dim).collect();
+            (ht_stm, ht_nstm)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         println!("=== Integer Golden Forward (sample {}) ===", offset + sample_idx as u64);
         println!("SFEN: {}", sfen);
         println!("bucket_index: {}", bucket);
         if net.has_threat {
             println!("HalfKA features: {}, Threat features: {}", stm_features.len(), stm_threat.len());
+        }
+        if net.has_hand_threat {
+            println!(
+                "HalfKA features: {}, HandThreat features: {}",
+                stm_features.len(),
+                stm_hand_threat.len()
+            );
         }
 
         // --- 1. Feature Transformer accumulation (i16) ---
@@ -1739,6 +1828,23 @@ fn run_integer_forward(
                 let threat_idx = feat - halfka_dim;
                 for i in 0..l0_size {
                     acc_nstm[i] = acc_nstm[i].wrapping_add(net.threat_weights[threat_idx * l0_size + i] as i16);
+                }
+            }
+        }
+
+        // HandThreat weights: i8 → i16 sign-extended add
+        if net.has_hand_threat {
+            let halfka_dim = ShogiHalfKA_hm.num_inputs();
+            for &feat in &stm_hand_threat {
+                let ht_idx = feat - halfka_dim;
+                for i in 0..l0_size {
+                    acc_stm[i] = acc_stm[i].wrapping_add(net.hand_threat_weights[ht_idx * l0_size + i] as i16);
+                }
+            }
+            for &feat in &nstm_hand_threat {
+                let ht_idx = feat - halfka_dim;
+                for i in 0..l0_size {
+                    acc_nstm[i] = acc_nstm[i].wrapping_add(net.hand_threat_weights[ht_idx * l0_size + i] as i16);
                 }
             }
         }

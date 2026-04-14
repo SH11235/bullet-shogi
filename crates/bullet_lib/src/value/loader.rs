@@ -204,27 +204,40 @@ where
 
                             for i in 0..chunk_len {
                                 let pos = &data_chunk[i];
-                                let mut j = 0;
+                                // STM と NSTM は独立カウンタで管理: 非対称 feature
+                                // (HandThreat defensive 等) で |STM_active| != |NSTM_active|
+                                // を許可するため。symmetric な input type は
+                                // map_features_split の default impl 経由で
+                                // 両側同時に進むので従来挙動と一致する。
+                                let mut j_stm: usize = 0;
+                                let mut j_nstm: usize = 0;
                                 let sparse_offset = max_active * i;
 
-                                inp.map_features(pos, |our, opp| {
-                                    assert!(
-                                        our < input_size && opp < input_size,
-                                        "Input feature index exceeded input size!"
-                                    );
-
-                                    stm_chunk[sparse_offset + j] = our as i32;
-                                    nstm_chunk[sparse_offset + j] = opp as i32;
-
-                                    j += 1;
+                                inp.map_features_split(pos, |our_opt, opp_opt| {
+                                    if let Some(our) = our_opt {
+                                        assert!(our < input_size, "STM feature index exceeded input size!");
+                                        stm_chunk[sparse_offset + j_stm] = our as i32;
+                                        j_stm += 1;
+                                    }
+                                    if let Some(opp) = opp_opt {
+                                        assert!(opp < input_size, "NSTM feature index exceeded input size!");
+                                        nstm_chunk[sparse_offset + j_nstm] = opp as i32;
+                                        j_nstm += 1;
+                                    }
                                 });
 
-                                for j in j..max_active {
+                                // STM / NSTM の未使用スロットを -1 で埋める (独立)
+                                for j in j_stm..max_active {
                                     stm_chunk[sparse_offset + j] = -1;
+                                }
+                                for j in j_nstm..max_active {
                                     nstm_chunk[sparse_offset + j] = -1;
                                 }
 
-                                assert!(j <= max_active, "More inputs provided than the specified maximum!");
+                                assert!(
+                                    j_stm <= max_active && j_nstm <= max_active,
+                                    "More inputs provided than the specified maximum!"
+                                );
 
                                 buckets_chunk[i] = i32::from(out.bucket(pos));
                                 weights_chunk[i] = weight_getter.map_or(1.0, |w| w(pos));

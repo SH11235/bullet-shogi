@@ -32,7 +32,10 @@ use std::{
 use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::dataloader::PreparedBatchDevice};
 use bullet_lib::{
     game::{
-        inputs::{ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
+        inputs::{
+            ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
+            ShogiHalfKaHmThreat, SparseInputType, ThreatProfile,
+        },
         outputs::{
             OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
             SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -129,11 +132,15 @@ struct Args {
     #[arg(long, default_value = "full")]
     threat_profile: String,
 
-    /// Enable HandThreat concatenated input (案 A, 121,104 dims)
+    /// Enable HandThreat concatenated input (full pair, 121,104 dims)
     ///
     /// `--threat` とは排他
     #[arg(long, default_value_t = false)]
     hand_threat: bool,
+
+    /// Enable HandThreat defensive variant (30,276 dims, 非対称 emission)
+    #[arg(long, default_value_t = false)]
+    hand_threat_defensive: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -561,8 +568,14 @@ fn main() {
     let l2_size = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs();
 
-    if args.threat && args.hand_threat {
-        eprintln!("ERROR: --threat と --hand-threat は同時に指定できません");
+    let ht_flag_count = [args.threat, args.hand_threat, args.hand_threat_defensive]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if ht_flag_count > 1 {
+        eprintln!(
+            "ERROR: --threat / --hand-threat / --hand-threat-defensive は同時に指定できません"
+        );
         std::process::exit(1);
     }
 
@@ -579,10 +592,13 @@ fn main() {
         None
     };
     let use_hand_threat = args.hand_threat;
+    let use_hand_threat_defensive = args.hand_threat_defensive;
     let input_size = if let Some(tp) = threat_profile {
         ShogiHalfKaHmThreat::new(tp).num_inputs()
     } else if use_hand_threat {
         ShogiHalfKaHmHandThreat::new().num_inputs()
+    } else if use_hand_threat_defensive {
+        ShogiHalfKaHmHandThreatDefensive::new().num_inputs()
     } else {
         halfka_dim
     };
@@ -611,6 +627,7 @@ fn main() {
             l1_size,
             l2_size,
             threat_profile,
+            use_hand_threat_defensive,
         );
         return;
     }
@@ -1728,6 +1745,7 @@ fn run_integer_forward(
     l1_size: usize,
     l2_size: usize,
     threat_profile: Option<ThreatProfile>,
+    use_hand_threat_defensive: bool,
 ) {
     let l1_effective = l1_size - 1;
     let l2_in_dim = l1_effective * 2;
@@ -1771,16 +1789,36 @@ fn run_integer_forward(
         };
         // HandThreat features (has_hand_threat の場合のみ)
         let (stm_hand_threat, nstm_hand_threat) = if net.has_hand_threat {
-            let input = ShogiHalfKaHmHandThreat::new();
-            let mut stm_all: Vec<usize> = Vec::new();
-            let mut nstm_all: Vec<usize> = Vec::new();
-            input.map_features(&psv, |stm_idx, nstm_idx| {
-                stm_all.push(stm_idx);
-                nstm_all.push(nstm_idx);
-            });
             let halfka_dim = ShogiHalfKA_hm.num_inputs();
-            let ht_stm: Vec<usize> = stm_all.into_iter().filter(|&i| i >= halfka_dim).collect();
-            let ht_nstm: Vec<usize> = nstm_all.into_iter().filter(|&i| i >= halfka_dim).collect();
+            let mut ht_stm: Vec<usize> = Vec::new();
+            let mut ht_nstm: Vec<usize> = Vec::new();
+            if use_hand_threat_defensive {
+                // defensive: 非対称 emission を map_features_split 経由で取得
+                let input = ShogiHalfKaHmHandThreatDefensive::new();
+                input.map_features_split(&psv, |stm_opt, nstm_opt| {
+                    if let Some(i) = stm_opt
+                        && i >= halfka_dim
+                    {
+                        ht_stm.push(i);
+                    }
+                    if let Some(i) = nstm_opt
+                        && i >= halfka_dim
+                    {
+                        ht_nstm.push(i);
+                    }
+                });
+            } else {
+                // full pair: 既存 symmetric 経路
+                let input = ShogiHalfKaHmHandThreat::new();
+                input.map_features(&psv, |stm_idx, nstm_idx| {
+                    if stm_idx >= halfka_dim {
+                        ht_stm.push(stm_idx);
+                    }
+                    if nstm_idx >= halfka_dim {
+                        ht_nstm.push(nstm_idx);
+                    }
+                });
+            }
             (ht_stm, ht_nstm)
         } else {
             (Vec::new(), Vec::new())

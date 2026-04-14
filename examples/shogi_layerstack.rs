@@ -40,7 +40,10 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
-    game::inputs::{ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmThreat, SparseInputType, ThreatProfile},
+    game::inputs::{
+        ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
+        ShogiHalfKaHmThreat, SparseInputType, ThreatProfile,
+    },
     game::outputs::{
         SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
         SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
@@ -250,12 +253,19 @@ struct Args {
     #[arg(long, default_value = "full")]
     threat_profile: String,
 
-    /// Enable HandThreat concatenated input (案 A: full drop-attack pair, 121,104 dims)
+    /// Enable HandThreat concatenated input (full drop-attack pair, 121,104 dims)
     ///
     /// `--threat` とは排他。両方指定した場合はエラーで終了する。
     /// profile なし (v95 PoC 版)。
     #[arg(long, default_value_t = false)]
     hand_threat: bool,
+
+    /// Enable HandThreat defensive variant (30,276 dims, 非対称 emission)
+    ///
+    /// `--hand-threat` と `--threat` 両方と排他。drop_owner=enemy かつ
+    /// attacked_side=friend のみ符号化する防御 feature。
+    #[arg(long, default_value_t = false)]
+    hand_threat_defensive: bool,
 
     /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
@@ -1368,9 +1378,13 @@ fn main() {
     let l2_out = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
 
-    // --threat と --hand-threat は排他 (v95 PoC では同時利用不可)
-    if args.threat && args.hand_threat {
-        eprintln!("ERROR: --threat と --hand-threat は同時に指定できません (v95 PoC 版)");
+    // --threat / --hand-threat / --hand-threat-defensive は相互排他
+    let ht_flags = [args.threat, args.hand_threat, args.hand_threat_defensive];
+    let ht_count = ht_flags.iter().filter(|&&b| b).count();
+    if ht_count > 1 {
+        eprintln!(
+            "ERROR: --threat / --hand-threat / --hand-threat-defensive は同時に指定できません"
+        );
         std::process::exit(1);
     }
 
@@ -1390,6 +1404,7 @@ fn main() {
     };
 
     let use_hand_threat = args.hand_threat;
+    let use_hand_threat_defensive = args.hand_threat_defensive;
 
     let input_size = if let Some(tp) = threat_profile {
         let threat_input = ShogiHalfKaHmThreat::new(tp);
@@ -1397,6 +1412,9 @@ fn main() {
     } else if use_hand_threat {
         let hand_threat_input = ShogiHalfKaHmHandThreat::new();
         hand_threat_input.num_inputs()
+    } else if use_hand_threat_defensive {
+        let input = ShogiHalfKaHmHandThreatDefensive::new();
+        input.num_inputs()
     } else {
         halfka_dim
     };
@@ -1582,6 +1600,10 @@ fn main() {
     }
 
     // SavedFormat
+    // HandThreat block: full pair と defensive は quantised.bin 上の layout が同一
+    // (arch_str の HandThreat={dims} でサイズを表現するだけ) なので、どちらの
+    // case でも hand_threat=true 扱いで書き出せる。
+    let save_format_hand_threat = use_hand_threat || use_hand_threat_defensive;
     let save_format = build_layerstack_save_format(
         halfka_dim,
         input_size,
@@ -1591,7 +1613,7 @@ fn main() {
         fv_scale,
         args.psqt,
         threat_profile,
-        use_hand_threat,
+        save_format_hand_threat,
     );
 
     // Network builder
@@ -1786,6 +1808,8 @@ fn main() {
         run_optimizer!(ShogiHalfKaHmThreat::new(tp));
     } else if use_hand_threat {
         run_optimizer!(ShogiHalfKaHmHandThreat::new());
+    } else if use_hand_threat_defensive {
+        run_optimizer!(ShogiHalfKaHmHandThreatDefensive::new());
     } else {
         run_optimizer!(ShogiHalfKA_hm);
     }

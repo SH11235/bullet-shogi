@@ -30,11 +30,24 @@ use crate::{
     },
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum InitSettings {
     Zeroed,
-    Normal { mean: f32, stdev: f32 },
-    Uniform { mean: f32, stdev: f32 },
+    Normal {
+        mean: f32,
+        stdev: f32,
+    },
+    Uniform {
+        mean: f32,
+        stdev: f32,
+    },
+    /// 各重みを明示的な値で初期化する。
+    ///
+    /// `values.len()` は対応する重みテンソルの単一バッチサイズと一致する必要がある。
+    /// レイアウトはテンソル内部の保存順（bullet では列優先）に従う。
+    Const {
+        values: Vec<f32>,
+    },
 }
 
 #[derive(Default)]
@@ -169,19 +182,25 @@ where
         let graph = ir.compile(device).unwrap();
 
         for (id, init_data) in self.init_data.lock().unwrap().iter() {
-            match *init_data {
+            match init_data {
                 InitSettings::Zeroed => {}
                 InitSettings::Normal { mean, stdev } => graph
                     .get(GraphNodeId::new(graph.weight_idx(id).unwrap(), GraphNodeIdTy::Values))
                     .unwrap()
                     .dense_mut()
-                    .seed_random(mean, stdev, true)
+                    .seed_random(*mean, *stdev, true)
                     .unwrap(),
                 InitSettings::Uniform { mean, stdev } => graph
                     .get(GraphNodeId::new(graph.weight_idx(id).unwrap(), GraphNodeIdTy::Values))
                     .unwrap()
                     .dense_mut()
-                    .seed_random(mean, stdev, false)
+                    .seed_random(*mean, *stdev, false)
+                    .unwrap(),
+                InitSettings::Const { values } => graph
+                    .get(GraphNodeId::new(graph.weight_idx(id).unwrap(), GraphNodeIdTy::Values))
+                    .unwrap()
+                    .dense_mut()
+                    .load_from_slice(None, values)
                     .unwrap(),
             };
         }

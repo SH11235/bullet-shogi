@@ -20,7 +20,10 @@ pub use ataxx147::{Ataxx98, Ataxx147};
 pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
-pub use shogi_halfka::{FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, ShogiHalfKA, ShogiHalfKA_hm};
+pub use shogi_halfka::{
+    FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA,
+    ShogiHalfKA_hm,
+};
 pub use shogi_halfka_hm_hand_count::{HAND_COUNT_DIMS, ShogiHalfKaHmHandCount};
 pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
 pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;

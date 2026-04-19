@@ -103,6 +103,16 @@ enum BucketMode {
     Progress8KPAbs,
 }
 
+/// PSQT ショートカット層の初期化方式
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum PsqtInit {
+    /// ゼロ初期化 (v87/v88 互換、学習初期は PSQT なしと等価)
+    #[default]
+    Zeroed,
+    /// 駒の Material 値で初期化 (Stockfish 風、学習開始から有効な prior)
+    Material,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "shogi_layerstack")]
 #[command(about = "Shogi LayerStack NNUE training script")]
@@ -244,6 +254,15 @@ struct Args {
     /// Enable PSQT shortcut layer
     #[arg(long, default_value_t = false)]
     psqt: bool,
+
+    /// PSQT 重みの初期化方式 (`zeroed` / `material`)
+    ///
+    /// - `zeroed`: 0 で初期化（従来動作、v87/v88 互換）
+    /// - `material`: 駒の Material 値で初期化（Stockfish 風の prior）
+    ///
+    /// `--psqt` が指定されていない場合は無視される。
+    #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
+    psqt_init: PsqtInit,
 
     /// Enable Threat concatenated input
     #[arg(long, default_value_t = false)]
@@ -1041,6 +1060,145 @@ fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32
 }
 
 // =============================================================================
+// PSQT Material 初期化
+// =============================================================================
+
+/// 駒種別 Material 値（centipawn）
+///
+/// 将棋の標準的な駒価値。成駒は生駒 × 1.2 倍で扱う。
+/// 玉は評価値に寄与しないため 0。
+///
+/// 生駒: 歩=100, 香=300, 桂=320, 銀=500, 金=550, 角=850, 飛=1000
+/// 成駒: 馬=1020 (角×1.2), 龍=1200 (飛×1.2)
+///       成歩/成香/成桂/成銀 は BonaPiece 上で Gold と同一スロットに統合される
+///       ため Gold の 550 を割り当てる（区別不能）
+mod psqt_material {
+    pub const PAWN_CP: f32 = 100.0;
+    pub const LANCE_CP: f32 = 300.0;
+    pub const KNIGHT_CP: f32 = 320.0;
+    pub const SILVER_CP: f32 = 500.0;
+    pub const GOLD_CP: f32 = 550.0;
+    pub const BISHOP_CP: f32 = 850.0;
+    pub const ROOK_CP: f32 = 1000.0;
+    pub const HORSE_CP: f32 = BISHOP_CP * 1.2; // 1020
+    pub const DRAGON_CP: f32 = ROOK_CP * 1.2; // 1200
+}
+
+/// packed BonaPiece (0..1629) → Material 値（centipawn、friend=+, enemy=-） のルックアップを構築
+///
+/// BonaPiece レイアウト (bullet_lib::shogi::bona_piece)：
+/// - 手駒: 1..=89 (未使用スロットあり)
+/// - 盤上駒: 90..=1547 (各駒種 × 2色 × 81マス)
+/// - 王: 1548..=1628 (friend/enemy は pack 後同一平面)
+///
+/// pack_bonapiece 処理後の packed 値を想定：生の BonaPiece ではなく、
+/// shogi_halfka.rs::pack_bonapiece を通した後の値（E_KING は 1548 に丸め込まれる）。
+fn build_packed_bp_material_table() -> [f32; bullet_lib::game::inputs::PIECE_INPUTS] {
+    use bullet_lib::shogi::bona_piece::{
+        E_BISHOP, E_DRAGON, E_GOLD, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK,
+        E_HAND_SILVER, E_HORSE, E_KNIGHT, E_LANCE, E_PAWN, E_ROOK, E_SILVER, F_BISHOP, F_DRAGON, F_GOLD, F_HAND_BISHOP,
+        F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_HORSE, F_KNIGHT, F_LANCE,
+        F_PAWN, F_ROOK, F_SILVER,
+    };
+    use psqt_material::*;
+
+    let mut table = [0.0f32; bullet_lib::game::inputs::PIECE_INPUTS];
+
+    // 手駒スロット
+    // friend の手駒: +material × 枚数分のスロットを連番で埋める
+    // enemy の手駒: -material
+    let fill = |table: &mut [f32], base: u16, count: u16, value: f32| {
+        for i in 0..count {
+            table[(base + i) as usize] = value;
+        }
+    };
+
+    // 手駒（最大枚数: 歩18, 香/桂/銀/金4, 角/飛2）
+    fill(&mut table, F_HAND_PAWN, 18, PAWN_CP);
+    fill(&mut table, E_HAND_PAWN, 18, -PAWN_CP);
+    fill(&mut table, F_HAND_LANCE, 4, LANCE_CP);
+    fill(&mut table, E_HAND_LANCE, 4, -LANCE_CP);
+    fill(&mut table, F_HAND_KNIGHT, 4, KNIGHT_CP);
+    fill(&mut table, E_HAND_KNIGHT, 4, -KNIGHT_CP);
+    fill(&mut table, F_HAND_SILVER, 4, SILVER_CP);
+    fill(&mut table, E_HAND_SILVER, 4, -SILVER_CP);
+    fill(&mut table, F_HAND_GOLD, 4, GOLD_CP);
+    fill(&mut table, E_HAND_GOLD, 4, -GOLD_CP);
+    fill(&mut table, F_HAND_BISHOP, 2, BISHOP_CP);
+    fill(&mut table, E_HAND_BISHOP, 2, -BISHOP_CP);
+    fill(&mut table, F_HAND_ROOK, 2, ROOK_CP);
+    fill(&mut table, E_HAND_ROOK, 2, -ROOK_CP);
+
+    // 盤上駒（各駒種で 81 マス分連続）
+    fill(&mut table, F_PAWN, 81, PAWN_CP);
+    fill(&mut table, E_PAWN, 81, -PAWN_CP);
+    fill(&mut table, F_LANCE, 81, LANCE_CP);
+    fill(&mut table, E_LANCE, 81, -LANCE_CP);
+    fill(&mut table, F_KNIGHT, 81, KNIGHT_CP);
+    fill(&mut table, E_KNIGHT, 81, -KNIGHT_CP);
+    fill(&mut table, F_SILVER, 81, SILVER_CP);
+    fill(&mut table, E_SILVER, 81, -SILVER_CP);
+    // Gold スロットは成歩/成香/成桂/成銀も同じ slot に統合される（区別不能）
+    fill(&mut table, F_GOLD, 81, GOLD_CP);
+    fill(&mut table, E_GOLD, 81, -GOLD_CP);
+    fill(&mut table, F_BISHOP, 81, BISHOP_CP);
+    fill(&mut table, E_BISHOP, 81, -BISHOP_CP);
+    fill(&mut table, F_HORSE, 81, HORSE_CP);
+    fill(&mut table, E_HORSE, 81, -HORSE_CP);
+    fill(&mut table, F_ROOK, 81, ROOK_CP);
+    fill(&mut table, E_ROOK, 81, -ROOK_CP);
+    fill(&mut table, F_DRAGON, 81, DRAGON_CP);
+    fill(&mut table, E_DRAGON, 81, -DRAGON_CP);
+
+    // 王は両側とも 0（評価値に寄与しない）
+    // F_KING..E_KING+81 は既に 0 で初期化済み
+
+    table
+}
+
+/// PSQT 重みの Material 初期値を計算
+///
+/// `psqtw` の shape は `(NUM_BUCKETS, input_size)`（列優先）。
+/// 列ごと（feature ごと）に同じ Material 値を NUM_BUCKETS 個並べて返す。
+///
+/// feature index → packed BonaPiece へのマッピング：
+///   `feat = king_bucket * PIECE_INPUTS + packed_bp`（`halfka_index` 定義）
+///   `packed_bp = feat % PIECE_INPUTS` を King バケット横断で共有
+///
+/// `input_size > halfka_dim` の場合（Threat/HandThreat 結合時）、
+/// halfka 以外の特徴量は 0 で埋める。
+///
+/// `nnue2score_scale` は centipawn → 内部スケールへの変換係数（通常 `args.wrm_nnue2score`、
+/// デフォルト 600.0）。これで割ることで float 重みが訓練時の net_output スケールに揃う。
+fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score_scale: f32) -> Vec<f32> {
+    use bullet_lib::game::inputs::PIECE_INPUTS;
+
+    assert!(input_size >= halfka_dim, "input_size must be >= halfka_dim");
+    assert!(nnue2score_scale > 0.0, "nnue2score_scale must be positive");
+    assert_eq!(halfka_dim % PIECE_INPUTS, 0, "halfka_dim must be a multiple of PIECE_INPUTS");
+
+    let packed_material = build_packed_bp_material_table();
+    let num_king_buckets = halfka_dim / PIECE_INPUTS;
+
+    // 重み配列: input_size 個の列、各列に NUM_BUCKETS 個の値
+    let mut vals = vec![0.0f32; NUM_BUCKETS * input_size];
+
+    for kb in 0..num_king_buckets {
+        for (bp, &material) in packed_material.iter().enumerate() {
+            let feat = kb * PIECE_INPUTS + bp;
+            let value = material / nnue2score_scale;
+            let base = feat * NUM_BUCKETS;
+            for slot in vals.iter_mut().skip(base).take(NUM_BUCKETS) {
+                *slot = value;
+            }
+        }
+    }
+
+    // input_size > halfka_dim（Threat/HandThreat）部分は 0 のまま
+    vals
+}
+
+// =============================================================================
 // SavedFormat Construction
 // =============================================================================
 
@@ -1736,6 +1894,19 @@ fn main() {
     let l2_out_c = l2_out;
     let l2_in_c = l2_in;
     let use_psqt = args.psqt;
+
+    // PSQT 重みの初期化：
+    // - zeroed: Stockfish 未準拠。v87/v88 互換（学習初期は PSQT なしと等価）
+    // - material: 駒の cp 値 / wrm_nnue2score を初期値とする（学習開始から prior あり）
+    let psqt_init_settings: InitSettings = match (args.psqt, args.psqt_init) {
+        (false, _) | (true, PsqtInit::Zeroed) => InitSettings::Zeroed,
+        (true, PsqtInit::Material) => {
+            let scale = args.wrm_nnue2score;
+            println!("PSQT init: Material (centipawn 値 / {} を float 重みとして使用)", scale,);
+            let values = compute_psqt_material_values(halfka_dim, input_size, scale);
+            InitSettings::Const { values }
+        }
+    };
     let bucket_impl = match args.bucket_mode {
         BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
         BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
@@ -1850,12 +2021,12 @@ fn main() {
 
                 if use_psqt {
                     // PSQT shortcut: FT と同じ入力、出力 = バケット数
-                    // 学習初期に「PSQTなし」と等価にするため Zeroed で開始
+                    // 初期化方式は --psqt-init で制御（zeroed / material）
                     let psqt = Affine {
                         weights: builder.new_weights(
                             "psqtw",
                             Shape::new(NUM_BUCKETS, input_size),
-                            InitSettings::Zeroed,
+                            psqt_init_settings.clone(),
                         ),
                         bias: builder.new_weights("psqtb", Shape::new(NUM_BUCKETS, 1), InitSettings::Zeroed),
                     };

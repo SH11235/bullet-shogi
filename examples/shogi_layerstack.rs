@@ -1198,6 +1198,92 @@ fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score
     vals
 }
 
+#[cfg(test)]
+mod psqt_material_tests {
+    use super::*;
+    use bullet_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
+    use bullet_lib::shogi::bona_piece::{E_HAND_PAWN, E_PAWN, F_HAND_PAWN, F_KING, F_PAWN, F_ROOK};
+
+    #[test]
+    fn packed_bp_material_signs_and_magnitudes() {
+        let table = build_packed_bp_material_table();
+
+        // 友 (F_*) は正、敵 (E_*) は負
+        assert_eq!(table[F_PAWN as usize], psqt_material::PAWN_CP);
+        assert_eq!(table[E_PAWN as usize], -psqt_material::PAWN_CP);
+        assert_eq!(table[F_HAND_PAWN as usize], psqt_material::PAWN_CP);
+        assert_eq!(table[E_HAND_PAWN as usize], -psqt_material::PAWN_CP);
+        assert_eq!(table[F_ROOK as usize], psqt_material::ROOK_CP);
+        // 玉は評価値に寄与しない（pack 後は friend 側平面に統合）
+        assert_eq!(table[F_KING as usize], 0.0);
+
+        // 0 (ダミー) は常に 0
+        assert_eq!(table[0], 0.0);
+
+        // 手駒の枚数スロットは連番で同じ値
+        assert_eq!(table[(F_HAND_PAWN + 17) as usize], psqt_material::PAWN_CP); // 18枚目
+        assert_eq!(table[(F_HAND_PAWN + 18) as usize], 0.0); // 未使用スロット
+    }
+
+    #[test]
+    fn material_values_respect_layout_and_scale() {
+        const SCALE: f32 = 600.0;
+        let vals = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, SCALE);
+
+        assert_eq!(vals.len(), NUM_BUCKETS * HALFKA_HM_DIMENSIONS);
+
+        // 先手歩（F_PAWN=90, kb=0）の重み: PAWN_CP / SCALE が NUM_BUCKETS 個並ぶ
+        let feat_f_pawn = 0 * PIECE_INPUTS + F_PAWN as usize;
+        let expected_pawn = psqt_material::PAWN_CP / SCALE;
+        for bucket in 0..NUM_BUCKETS {
+            assert!((vals[feat_f_pawn * NUM_BUCKETS + bucket] - expected_pawn).abs() < 1e-6);
+        }
+
+        // 後手歩（E_PAWN, kb=44）の重みは負
+        let feat_e_pawn_top_kb = (NUM_KING_BUCKETS - 1) * PIECE_INPUTS + E_PAWN as usize;
+        let expected_e_pawn = -psqt_material::PAWN_CP / SCALE;
+        for bucket in 0..NUM_BUCKETS {
+            assert!((vals[feat_e_pawn_top_kb * NUM_BUCKETS + bucket] - expected_e_pawn).abs() < 1e-6);
+        }
+
+        // 玉スロットは 0（全バケット共通）
+        let feat_f_king = 0 * PIECE_INPUTS + F_KING as usize;
+        for bucket in 0..NUM_BUCKETS {
+            assert_eq!(vals[feat_f_king * NUM_BUCKETS + bucket], 0.0);
+        }
+    }
+
+    #[test]
+    fn material_values_zero_out_threat_tail() {
+        // input_size > halfka_dim の場合、halfka 以降は 0 のまま
+        const SCALE: f32 = 290.0;
+        let threat_dim = 5000;
+        let total = HALFKA_HM_DIMENSIONS + threat_dim;
+        let vals = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, total, SCALE);
+
+        assert_eq!(vals.len(), NUM_BUCKETS * total);
+
+        // halfka 以降は全て 0
+        for feat in HALFKA_HM_DIMENSIONS..total {
+            for bucket in 0..NUM_BUCKETS {
+                assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn material_values_scale_inverse_proportional() {
+        // scale を 2倍にしたら float 重みは 1/2 になる
+        let vals_600 = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, 600.0);
+        let vals_300 = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, 300.0);
+
+        let feat_f_pawn = F_PAWN as usize;
+        let v600 = vals_600[feat_f_pawn * NUM_BUCKETS];
+        let v300 = vals_300[feat_f_pawn * NUM_BUCKETS];
+        assert!((v300 - v600 * 2.0).abs() < 1e-4, "v300={v300}, v600={v600}");
+    }
+}
+
 // =============================================================================
 // SavedFormat Construction
 // =============================================================================
@@ -1897,12 +1983,29 @@ fn main() {
 
     // PSQT 重みの初期化：
     // - zeroed: Stockfish 未準拠。v87/v88 互換（学習初期は PSQT なしと等価）
-    // - material: 駒の cp 値 / wrm_nnue2score を初期値とする（学習開始から prior あり）
+    // - material: 駒の cp 値 / scale を初期値とする（学習開始から prior あり）
+    //
+    // スケール選択は学習損失モードに依存する：
+    // - WRM 損失 (`--wrm-in-scaling` 指定) : `scorenet = output * wrm_nnue2score` により
+    //   net_output は「cp / wrm_nnue2score」のスケールで収束するため、重みの divisor
+    //   は `wrm_nnue2score` を用いる。
+    // - それ以外 (sigmoid 損失) : 教師データの target は `args.scale` で cp から
+    //   内部スケールへ変換されているため、net_output は「cp / scale」のスケールで
+    //   収束する。divisor は `args.scale` を用いる。
+    //
+    // 注意: `--win-rate-model` を単独で有効化した場合（`--wrm-in-scaling` なし）、
+    // net_output は sigmoid を通して win-rate と比較される logit 空間となり、
+    // material 値を直接適用する意味が薄いが、挙動としては sigmoid 経路と同じ `args.scale`
+    // で割る（結果として小さな初期化となるが破綻はしない）。
     let psqt_init_settings: InitSettings = match (args.psqt, args.psqt_init) {
         (false, _) | (true, PsqtInit::Zeroed) => InitSettings::Zeroed,
         (true, PsqtInit::Material) => {
-            let scale = args.wrm_nnue2score;
-            println!("PSQT init: Material (centipawn 値 / {} を float 重みとして使用)", scale,);
+            let (scale, scale_label) = if args.wrm_in_scaling.is_some() {
+                (args.wrm_nnue2score, "wrm_nnue2score")
+            } else {
+                (args.scale as f32, "scale")
+            };
+            println!("PSQT init: Material (centipawn 値 / {scale} [{scale_label}] を float 重みとして使用)",);
             let values = compute_psqt_material_values(halfka_dim, input_size, scale);
             InitSettings::Const { values }
         }

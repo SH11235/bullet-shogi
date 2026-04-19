@@ -1989,14 +1989,36 @@ fn main() {
     // - WRM 損失 (`--wrm-in-scaling` 指定) : `scorenet = output * wrm_nnue2score` により
     //   net_output は「cp / wrm_nnue2score」のスケールで収束するため、重みの divisor
     //   は `wrm_nnue2score` を用いる。
-    // - それ以外 (sigmoid 損失) : 教師データの target は `args.scale` で cp から
-    //   内部スケールへ変換されているため、net_output は「cp / scale」のスケールで
-    //   収束する。divisor は `args.scale` を用いる。
+    // - 純 sigmoid 損失 (WRM 未指定) : 教師 target は `sigmoid(cp / args.scale)` で
+    //   与えられるため net_output は「cp / args.scale」スケールで収束する。
+    //   divisor は `args.scale` を用いる。
     //
-    // 注意: `--win-rate-model` を単独で有効化した場合（`--wrm-in-scaling` なし）、
-    // net_output は sigmoid を通して win-rate と比較される logit 空間となり、
-    // material 値を直接適用する意味が薄いが、挙動としては sigmoid 経路と同じ `args.scale`
-    // で割る（結果として小さな初期化となるが破綻はしない）。
+    // 許可しない組合せ（Codex review 指摘）：
+    // - `--psqt` + `--threat` / `--hand-threat` / `--hand-threat-defensive`
+    //   → PSQT 重みが `input_size` 次元で学習されるが、save format は先頭 `halfka_dim`
+    //      のみ書き出すため、Threat 尾部の学習済み重みが silently drop される。
+    //      rshogi 推論との不整合を避けるため組合せ禁止。
+    // - `--psqt-init material` + `--win-rate-model` without `--wrm-in-scaling`
+    //   → target は WRM 変換後、loss は sigmoid なので net_output は logit(WRM(cp))
+    //      空間となり `cp / args.scale` スケールの prior と整合しない。
+    if args.psqt && input_size > halfka_dim {
+        eprintln!(
+            "ERROR: --psqt と --threat / --hand-threat / --hand-threat-defensive の組合せは\n\
+             未対応です。PSQT 重みの Threat 尾部が量子化出力に含まれないため、学習と\n\
+             推論が乖離します。どちらか片方のみ指定してください。"
+        );
+        std::process::exit(1);
+    }
+    if matches!(args.psqt_init, PsqtInit::Material) && args.win_rate_model && args.wrm_in_scaling.is_none() {
+        eprintln!(
+            "ERROR: --psqt-init material は --win-rate-model 単独（--wrm-in-scaling 未指定）\n\
+             との組合せに非対応です。この場合 net_output は logit(WRM(cp)) 空間で収束するため\n\
+             centipawn / scale の prior と整合しません。--wrm-in-scaling を追加するか、\n\
+             --psqt-init zeroed を使用してください。"
+        );
+        std::process::exit(1);
+    }
+
     let psqt_init_settings: InitSettings = match (args.psqt, args.psqt_init) {
         (false, _) | (true, PsqtInit::Zeroed) => InitSettings::Zeroed,
         (true, PsqtInit::Material) => {

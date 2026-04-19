@@ -146,6 +146,8 @@ pub struct PreparedData<I: SparseInputType, O> {
     pub(crate) buckets: SparseInput,
     pub(crate) targets: DenseInput,
     pub(crate) weights: DenseInput,
+    /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき設定される。
+    pub(crate) hand_count: Option<DenseInput>,
 }
 
 impl<I, O> PreparedData<I, O>
@@ -174,6 +176,10 @@ where
         let input_size = input_getter.num_inputs();
         let output_size = if wdl { 3 } else { 1 };
         let sparse_size = max_active * batch_size;
+        let hand_count_dims = input_getter.hand_count_dims();
+
+        let hand_count_init =
+            hand_count_dims.map(|dims| DenseInput { value: vec![0.0; dims * batch_size], shape: Shape::new(dims, 1) });
 
         let mut prep = Self {
             input_getter,
@@ -184,9 +190,20 @@ where
             buckets: SparseInput { max_active: 1, value: vec![0; batch_size], shape: Shape::new(O::BUCKETS, 1) },
             targets: DenseInput { value: vec![0.0; output_size * batch_size], shape: Shape::new(output_size, 1) },
             weights: DenseInput { value: vec![0.0; batch_size], shape: Shape::new(1, 1) },
+            hand_count: hand_count_init,
         };
 
         let sparse_chunk_size = max_active * chunk_size;
+
+        // HandCount 用の並列チャンクを事前に materialise。Option は並列ループ内で扱う。
+        let hand_count_dim = hand_count_dims.unwrap_or(0);
+        let hand_count_chunk_size = hand_count_dim * chunk_size;
+        let num_chunks = batch_size.div_ceil(chunk_size);
+        let hand_count_slices: Vec<Option<&mut [f32]>> = if let Some(hc) = prep.hand_count.as_mut() {
+            hc.value.chunks_mut(hand_count_chunk_size).map(Some).collect()
+        } else {
+            (0..num_chunks).map(|_| None).collect()
+        };
 
         std::thread::scope(|s| {
             data.chunks(chunk_size)
@@ -195,15 +212,28 @@ where
                 .zip(prep.buckets.value.chunks_mut(chunk_size))
                 .zip(prep.targets.value.chunks_mut(output_size * chunk_size))
                 .zip(prep.weights.value.chunks_mut(chunk_size))
+                .zip(hand_count_slices.into_iter())
                 .for_each(
-                    |(((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk)| {
+                    |(
+                        (((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk),
+                        hand_count_chunk,
+                    )| {
                         let inp = &prep.input_getter;
                         let out = &prep.output_getter;
                         s.spawn(move || {
                             let chunk_len = data_chunk.len();
+                            let mut hand_count_chunk = hand_count_chunk;
 
                             for i in 0..chunk_len {
                                 let pos = &data_chunk[i];
+
+                                if let Some(hc_slice) = hand_count_chunk.as_deref_mut() {
+                                    let offset = hand_count_dim * i;
+                                    let end = offset + hand_count_dim;
+                                    // 事前に 0 で埋め済み。fill_hand_count は
+                                    // 書き込みのみで読まないので再初期化は不要。
+                                    inp.fill_hand_count(pos, &mut hc_slice[offset..end]);
+                                }
                                 // STM と NSTM は独立カウンタで管理: 非対称 feature
                                 // (HandThreat defensive 等) で |STM_active| != |NSTM_active|
                                 // を許可するため。symmetric な input type は

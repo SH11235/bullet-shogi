@@ -92,6 +92,11 @@ impl<I: SparseInputType, O> From<PreparedData<I, O>> for PreparedBatchHost {
         let weights = HostDenseMatrix::new(value, Some(batch_size), shape);
         let _ = host_data.inputs.insert("entry_weights".to_string(), HostMatrix::Dense(weights));
 
+        if let Some(DenseInput { value, shape }) = prepared_data.hand_count {
+            let hand_count = HostDenseMatrix::new(value, Some(batch_size), shape);
+            let _ = host_data.inputs.insert("hand_count".to_string(), HostMatrix::Dense(hand_count));
+        }
+
         host_data
     }
 }

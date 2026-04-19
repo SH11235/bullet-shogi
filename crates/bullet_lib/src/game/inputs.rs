@@ -5,6 +5,7 @@ mod chess_buckets;
 mod chess_buckets_mk;
 mod factorised;
 mod shogi_halfka;
+mod shogi_halfka_hm_hand_count;
 mod shogi_halfka_hm_hand_threat;
 mod shogi_halfka_hm_hand_threat_defensive;
 mod shogi_halfka_hm_threat;
@@ -20,6 +21,7 @@ pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
 pub use shogi_halfka::{FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, ShogiHalfKA, ShogiHalfKA_hm};
+pub use shogi_halfka_hm_hand_count::{HAND_COUNT_DIMS, ShogiHalfKaHmHandCount};
 pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
 pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;
 pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
@@ -90,6 +92,23 @@ pub trait SparseInputType: Clone + Send + Sync + 'static {
 
     /// Description of the input type
     fn description(&self) -> String;
+
+    /// Dense auxiliary input (`"hand_count"`) の次元数。
+    ///
+    /// `Some(dims)` を返すと、`PreparedData` は `hand_count` 用の dense 領域を
+    /// 確保し、サンプルごとに `fill_hand_count` を呼び出してトレーナ graph の
+    /// `"hand_count"` 入力ノードに渡す。
+    ///
+    /// 既定は `None`（HandCount dense 入力を使用しない）。
+    fn hand_count_dims(&self) -> Option<usize> {
+        None
+    }
+
+    /// Dense auxiliary input (`"hand_count"`) をサンプル分埋める。
+    ///
+    /// `out.len()` は `hand_count_dims().unwrap_or(0)` と一致する。
+    /// `hand_count_dims() == None` の input type では呼び出されないため既定は空実装。
+    fn fill_hand_count(&self, _pos: &Self::RequiredDataType, _out: &mut [f32]) {}
 
     fn is_factorised(&self) -> bool {
         false

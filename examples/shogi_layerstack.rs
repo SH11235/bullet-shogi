@@ -41,7 +41,7 @@ use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
     game::inputs::{
-        ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
+        ShogiHalfKA_hm, ShogiHalfKaHmHandCount, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
         ShogiHalfKaHmThreat, SparseInputType, ThreatProfile,
     },
     game::outputs::{
@@ -266,6 +266,15 @@ struct Args {
     /// attacked_side=friend のみ符号化する防御 feature。
     #[arg(long, default_value_t = false)]
     hand_threat_defensive: bool,
+
+    /// HandCount Dense Input を有効化する（L1 層の入力に 14 元の持ち駒 dense vector を concat）。
+    ///
+    /// `[stm 持ち駒 7 種, nstm 持ち駒 7 種] = 14 元` を FT 出力 (1536) の
+    /// 後ろに連結して L1 に渡す。sparse 特徴は HalfKA_hm と完全互換。
+    ///
+    /// `--threat` / `--hand-threat` / `--hand-threat-defensive` とは排他。
+    #[arg(long, default_value_t = false)]
+    hand_count_dense: bool,
 
     /// Progress parameter path: coeff JSON for progress8/progress8gikou, progress.bin for progress8kpabs
     #[arg(long)]
@@ -978,6 +987,11 @@ fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32
 /// LayerStack 量子化出力の SavedFormat を構築する
 ///
 /// rshogi NetworkLayerStacks::read() と完全互換のバイナリを生成。
+///
+/// `hand_count_dense_dims` が 0 より大きい場合、L1 重みは `ft_out + dims`
+/// の入力次元を持ち、先頭 `ft_out` が FT 出力、残り `dims` が HandCount dense の
+/// 貢献となる。`arch_str` に `HandCountDense=dims` を追加する。
+#[allow(clippy::too_many_arguments)]
 fn build_layerstack_save_format(
     halfka_dim: usize,
     input_size: usize,
@@ -988,6 +1002,7 @@ fn build_layerstack_save_format(
     psqt: bool,
     threat_profile: Option<ThreatProfile>,
     hand_threat: bool,
+    hand_count_dense_dims: usize,
 ) -> Vec<SavedFormat> {
     use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
 
@@ -1020,11 +1035,19 @@ fn build_layerstack_save_format(
     } else {
         String::new()
     };
+    // HandCount Dense (本機能): L1 入力に 14 元の持ち駒 dense vector を concat。
+    // rshogi 側は `HandCountDense={dims}` を検出して L1 重みを 14 行分追加で読む。
+    let hand_count_part = if hand_count_dense_dims > 0 {
+        format!("HandCountDense={hand_count_dense_dims},")
+    } else {
+        String::new()
+    };
     let arch_desc = format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
          {psqt_part}\
          {threat_part}\
          {hand_threat_part}\
+         {hand_count_part}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -1213,6 +1236,7 @@ fn build_layerstack_save_format(
     let l2_in_captured = l2_in;
     let ft_out_for_ls = ft_out;
     let fc_hash_captured = fc_hash;
+    let hand_count_dense_dims_captured = hand_count_dense_dims;
     let layerstack_data = SavedFormat::empty()
         .transform(move |graph, _| {
             let l1w = graph.get("l1w");
@@ -1244,24 +1268,33 @@ fn build_layerstack_save_format(
 
                 // Weights: i8, scale = QB = 64
                 // bullet:
-                //   l1w  = [NUM_BUCKETS * l1_out, ft_out]
-                //   l1fw = [l1_out, ft_out] (shared factorized part)
-                //   weight[global_out * ft_out + in_idx] where global_out = bucket * l1_out + out_idx
-                // rshogi: row-major [l1_out × padded(ft_out)]
-                //   weight[out_idx * padded_in + in_idx]
-                let l1_padded_in = pad32(ft_out_for_ls);
+                //   l1w  = [NUM_BUCKETS * l1_out, ft_out + hand_count_dims]
+                //   l1fw = [l1_out, ft_out]   (shared factorized part; hand_count は共有化しない)
+                //   weight[global_out * (ft_out + hc) + in_idx] where
+                //   global_out = bucket * l1_out + out_idx
+                //   - in_idx < ft_out: FT 出力との結合部（bucket_w + shared_w）
+                //   - ft_out <= in_idx < ft_out + hc_dims: HandCount との結合部（bucket_w のみ）
+                //   - それ以上: padding
+                // rshogi: row-major [l1_out × padded(ft_out + hc)]
+                let l1_total_in = ft_out_for_ls + hand_count_dense_dims_captured;
+                let l1_padded_in = pad32(l1_total_in);
                 let l1_rows_total = NUM_BUCKETS * l1_out_captured;
                 for out_idx in 0..l1_out_captured {
                     let global_out = bucket * l1_out_captured + out_idx;
                     for in_idx in 0..l1_padded_in {
                         if in_idx < ft_out_for_ls {
                             // column-major indexing:
-                            // l1w  shape [NUM_BUCKETS*l1_out, ft_out]  -> in * rows + out
-                            // l1fw shape [l1_out, ft_out]              -> in * rows + out
+                            //   l1w  shape [NUM_BUCKETS*l1_out, ft_out + hc] -> in * rows + out
+                            //   l1fw shape [l1_out, ft_out]                  -> in * l1_out + out
                             let bucket_w = l1w.values[in_idx * l1_rows_total + global_out];
                             let shared_w = l1fw.values[in_idx * l1_out_captured + out_idx];
                             let w = bucket_w + shared_w;
                             let q = (qb_f * w as f64).round() as i8;
+                            output_bytes.push(q as u8);
+                        } else if in_idx < l1_total_in {
+                            // HandCount Dense 部: bucket_w のみ（共有なし）
+                            let bucket_w = l1w.values[in_idx * l1_rows_total + global_out];
+                            let q = (qb_f * bucket_w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
                             output_bytes.push(0u8); // padding
@@ -1378,12 +1411,12 @@ fn main() {
     let l2_out = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs(); // 73305
 
-    // --threat / --hand-threat / --hand-threat-defensive は相互排他
-    let ht_flags = [args.threat, args.hand_threat, args.hand_threat_defensive];
+    // --threat / --hand-threat / --hand-threat-defensive / --hand-count-dense は相互排他
+    let ht_flags = [args.threat, args.hand_threat, args.hand_threat_defensive, args.hand_count_dense];
     let ht_count = ht_flags.iter().filter(|&&b| b).count();
     if ht_count > 1 {
         eprintln!(
-            "ERROR: --threat / --hand-threat / --hand-threat-defensive は同時に指定できません"
+            "ERROR: --threat / --hand-threat / --hand-threat-defensive / --hand-count-dense は同時に指定できません"
         );
         std::process::exit(1);
     }
@@ -1405,6 +1438,7 @@ fn main() {
 
     let use_hand_threat = args.hand_threat;
     let use_hand_threat_defensive = args.hand_threat_defensive;
+    let use_hand_count_dense = args.hand_count_dense;
 
     let input_size = if let Some(tp) = threat_profile {
         let threat_input = ShogiHalfKaHmThreat::new(tp);
@@ -1416,8 +1450,14 @@ fn main() {
         let input = ShogiHalfKaHmHandThreatDefensive::new();
         input.num_inputs()
     } else {
+        // --hand-count-dense の場合も sparse 次元は HalfKA_hm と同じ (dense 14 元は
+        // 別経路)。
         halfka_dim
     };
+
+    // L1 層の入力次元は FT 出力 + （HandCount 有効時は +14）
+    let hand_count_dense_dims: usize = if use_hand_count_dense { bullet_lib::game::inputs::HAND_COUNT_DIMS } else { 0 };
+    let l1_input_dim = ft_out + hand_count_dense_dims;
 
     let optimizer_name = match args.optimizer {
         OptimizerType::AdamW => "AdamW",
@@ -1449,9 +1489,15 @@ fn main() {
         "HandThreat: {}",
         if use_hand_threat {
             let hand_threat_dims = input_size - halfka_dim;
-            format!(
-                "enabled (案 A full drop-attack pair, {hand_threat_dims} dimensions, total input={input_size})"
-            )
+            format!("enabled (案 A full drop-attack pair, {hand_threat_dims} dimensions, total input={input_size})")
+        } else {
+            "disabled".to_string()
+        }
+    );
+    println!(
+        "HandCount Dense: {}",
+        if use_hand_count_dense {
+            format!("enabled ({} dims concat to L1 input; L1 input dim = {})", hand_count_dense_dims, l1_input_dim)
         } else {
             "disabled".to_string()
         }
@@ -1614,6 +1660,7 @@ fn main() {
         args.psqt,
         threat_profile,
         save_format_hand_threat,
+        hand_count_dense_dims,
     );
 
     // Network builder
@@ -1689,13 +1736,17 @@ fn main() {
                 let l0 = builder.new_affine("l0", input_size, ft_out_c);
                 l0.init_with_effective_input_size(32);
 
+                // L1 入力次元: FT 出力 + （HandCount Dense 有効時は +14）
+                let l1_in_total = ft_out_c + hand_count_dense_dims;
+
                 // LayerStack layers:
-                // - l1: bucket-specific delta (zero init)
-                // - l1f: shared factorized part
+                // - l1: bucket-specific delta (zero init). 入力は [FT 出力 (ft_out_c) | HandCount (14)]
+                //   を concat した全体 (l1_in_total) 次元。
+                // - l1f: shared factorized part。FT 出力 (ft_out_c) のみに作用（HandCount は共有しない）
                 let l1 = Affine {
                     weights: builder.new_weights(
                         "l1w",
-                        Shape::new(NUM_BUCKETS * l1_out_c, ft_out_c),
+                        Shape::new(NUM_BUCKETS * l1_out_c, l1_in_total),
                         InitSettings::Zeroed,
                     ),
                     bias: builder.new_weights("l1b", Shape::new(NUM_BUCKETS * l1_out_c, 1), InitSettings::Zeroed),
@@ -1709,7 +1760,18 @@ fn main() {
                 let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
                 let combined = stm.concat(ntm);
 
-                let l1_out_t = l1.forward(combined).select(output_buckets) + l1f.forward(combined);
+                // HandCount Dense を有効にする場合、L1 入力に 14 元の dense vector を concat。
+                // `"hand_count"` という名前の dense 入力は ValueDataLoader が
+                // `ShogiHalfKaHmHandCount::fill_hand_count` を使って populate する。
+                let l1_input_full = if hand_count_dense_dims > 0 {
+                    let hand_count =
+                        builder.new_dense_input("hand_count", Shape::new(hand_count_dense_dims, 1));
+                    combined.concat(hand_count)
+                } else {
+                    combined
+                };
+
+                let l1_out_t = l1.forward(l1_input_full).select(output_buckets) + l1f.forward(combined);
                 let l1_main = l1_out_t.slice_rows(0, l1_effective_c);
                 let l1_skip = l1_out_t.slice_rows(l1_effective_c, l1_out_c);
 
@@ -1810,6 +1872,8 @@ fn main() {
         run_optimizer!(ShogiHalfKaHmHandThreat::new());
     } else if use_hand_threat_defensive {
         run_optimizer!(ShogiHalfKaHmHandThreatDefensive::new());
+    } else if use_hand_count_dense {
+        run_optimizer!(ShogiHalfKaHmHandCount);
     } else {
         run_optimizer!(ShogiHalfKA_hm);
     }

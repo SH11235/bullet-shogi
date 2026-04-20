@@ -225,6 +225,28 @@ fn is_promoted(pt: bullet_lib::shogi::PieceType) -> bool {
     )
 }
 
+/// PSV から HandCount Dense 入力を i16 で抽出する。
+///
+/// レイアウト: `[stm 7 種 (pawn..rook), nstm 7 種 (pawn..rook)] = 14 元`。
+/// rshogi 側 `hand_count::extract_hand_count` と同一順序。
+fn hand_count_from_psv(psv: &bullet_lib::shogi::PackedSfenValue, hc_dims: usize) -> Vec<i16> {
+    use bullet_lib::shogi::{ShogiBoard, types::HAND_PIECE_TYPES};
+    assert_eq!(
+        hc_dims,
+        2 * HAND_PIECE_TYPES.len(),
+        "hc_dims は stm 7 + nstm 7 = 14 を想定 (got {hc_dims})"
+    );
+    let board = ShogiBoard::from_packed_sfen(psv);
+    let stm = board.side_to_move;
+    let nstm = stm.opponent();
+    let mut out = vec![0i16; hc_dims];
+    for (i, &pt) in HAND_PIECE_TYPES.iter().enumerate() {
+        out[i] = i16::from(board.hand(stm).count(pt));
+        out[HAND_PIECE_TYPES.len() + i] = i16::from(board.hand(nstm).count(pt));
+    }
+    out
+}
+
 fn hand_to_sfen(black_hand: &bullet_lib::shogi::Hand, white_hand: &bullet_lib::shogi::Hand) -> String {
     use bullet_lib::shogi::PieceType;
 
@@ -1498,6 +1520,13 @@ struct QuantisedNetwork {
     threat_weights: Vec<i8>,
     has_hand_threat: bool,
     hand_threat_weights: Vec<i8>,
+    /// HandCountDense=N が arch_str にある場合、各 bucket の L1 重みを
+    /// `pad32(l0_size + N)` byte/row で読み込み、先頭 `l0_size` は `l1_weights` に、
+    /// 続く `N` は `hand_count_l1_weights` に格納する。
+    has_hand_count: bool,
+    hand_count_dims: usize,
+    /// row-major `[NUM_BUCKETS * l1_size][hand_count_dims]` (i8, scale QB=64)
+    hand_count_l1_weights: Vec<i8>,
     l1_biases: Vec<i32>,
     l1_weights: Vec<i8>,
     l2_biases: Vec<i32>,
@@ -1529,6 +1558,15 @@ impl QuantisedNetwork {
         // `Threat=` は `HandThreat=` の substring にもマッチするため、単独の
         // "Threat=" 検出時は HandThreat= を除外する
         let has_hand_threat = arch_str.contains("HandThreat=");
+        // HandCountDense=N: L1 入力に N 元の持ち駒 dense vector を concat する構成
+        let hand_count_dims = arch_str
+            .split(',')
+            .find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("HandCountDense=").and_then(|v| v.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let has_hand_count = hand_count_dims > 0;
         let has_threat = {
             let mut s = arch_str.as_str();
             let mut found = false;
@@ -1654,12 +1692,18 @@ impl QuantisedNetwork {
         let l1_effective = l1_size - 1;
         let l2_in_dim = l1_effective * 2;
         let l1_input_dim = l0_size;
-        let l1_padded_in = pad32(l1_input_dim);
+        // HandCountDense 有効時は L1 入力に hc_dims 元が concat されるため、
+        // per-row のバイト数は pad32(l0_size + hc_dims)。内訳:
+        //   [0..l0_size)                      : 通常の FT 由来 L1 主重み
+        //   [l0_size..l0_size + hc_dims)      : HandCount Dense 重み
+        //   [l0_size + hc_dims..l1_padded_in) : padding (0)
+        let l1_padded_in = pad32(l1_input_dim + hand_count_dims);
         let l2_padded_in = pad32(l2_in_dim);
         let out_padded_in = pad32(l2_size);
 
         let mut l1_biases = vec![0i32; NUM_BUCKETS * l1_size];
         let mut l1_weights = vec![0i8; NUM_BUCKETS * l1_size * l1_input_dim];
+        let mut hand_count_l1_weights = vec![0i8; NUM_BUCKETS * l1_size * hand_count_dims];
         let mut l2_biases = vec![0i32; NUM_BUCKETS * l2_size];
         let mut l2_weights = vec![0i8; NUM_BUCKETS * l2_size * l2_in_dim];
         let mut l3_biases = vec![0i32; NUM_BUCKETS];
@@ -1681,6 +1725,11 @@ impl QuantisedNetwork {
                 let global_out = bucket * l1_size + out_idx;
                 for in_idx in 0..l1_input_dim {
                     l1_weights[global_out * l1_input_dim + in_idx] = row[in_idx] as i8;
+                }
+                // HandCount Dense 部（存在時のみ）
+                for i in 0..hand_count_dims {
+                    hand_count_l1_weights[global_out * hand_count_dims + i] =
+                        row[l1_input_dim + i] as i8;
                 }
             }
 
@@ -1724,6 +1773,9 @@ impl QuantisedNetwork {
             threat_weights,
             has_hand_threat,
             hand_threat_weights,
+            has_hand_count,
+            hand_count_dims,
+            hand_count_l1_weights,
             l1_biases,
             l1_weights,
             l2_biases,
@@ -1913,6 +1965,27 @@ fn run_integer_forward(
             l1_out[out] = net.l1_biases[global_out];
             for in_idx in 0..l1_input_dim {
                 l1_out[out] += net.l1_weights[global_out * l1_input_dim + in_idx] as i32 * pp_out[in_idx] as i32;
+            }
+        }
+
+        // --- 3b. HandCount Dense contribution (has_hand_count 時のみ) ---
+        //
+        // FT 寄与は u8 input (scale QA=127) × i8 weight (scale QB=64) = scale 8128 で
+        // L1 出力に寄与する。HandCount 寄与は raw i16 (scale 1) × i8 weight (scale QB=64) =
+        // scale 64 で 127× 小さいため、× 127 を乗じて scale を揃える。
+        // この補正は rshogi 側 `LayerStackBucket::propagate_with_hand_count` と同じ方針。
+        if net.has_hand_count {
+            let hc_dims = net.hand_count_dims;
+            let hand_count = hand_count_from_psv(&psv, hc_dims);
+            println!("HandCount input (dims={}): {:?}", hc_dims, hand_count);
+            for out in 0..l1_size {
+                let global_out = bucket * l1_size + out;
+                let mut partial: i32 = 0;
+                for i in 0..hc_dims {
+                    let w = net.hand_count_l1_weights[global_out * hc_dims + i] as i32;
+                    partial += (hand_count[i] as i32) * w;
+                }
+                l1_out[out] += partial * 127;
             }
         }
 

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader, Write},
+    sync::Arc,
+};
 
 use crate::device::{Device, OperationError, tensor::DenseMatrix};
 
@@ -88,6 +93,21 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
             single.slow_params.load_from_slice(None, par)?;
         }
 
+        // Restore Ranger lookahead step counter. Missing file (older checkpoints)
+        // is tolerated and leaves step at 0 to preserve backward compatibility.
+        let step_path = format!("{path}/step_ranger.txt");
+        if let Ok(file) = File::open(&step_path) {
+            for line in BufReader::new(file).lines() {
+                let line = line.unwrap();
+                let mut split = line.split(',');
+                let id = split.next().unwrap().to_string();
+                let step: usize = split.next().unwrap().parse().unwrap();
+                if let Some(single) = map.get_mut(&id) {
+                    single.step = step;
+                }
+            }
+        }
+
         let mut map = map.iter_mut().map(|(id, single)| (id.clone(), &mut single.inner)).collect();
         S::load_from_checkpoint(&mut map, path, old_format)
     }
@@ -95,6 +115,11 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {
         let slow_params: Vec<_> = map.iter().map(|(id, single)| (id, &single.slow_params)).collect();
         utils::write_weights_to_file(&slow_params, &format!("{path}/slow.bin"))?;
+
+        let mut file = File::create(format!("{path}/step_ranger.txt")).unwrap();
+        for (id, single) in map.iter() {
+            writeln!(file, "{id},{}", single.step).unwrap();
+        }
 
         let map = map.iter().map(|(id, single)| (id.clone(), &single.inner)).collect();
         S::write_to_checkpoint(&map, path)

@@ -78,7 +78,6 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
         self.inner.set_params(params.inner);
         self.alpha = params.alpha;
         self.k = params.k;
-        self.step = 0;
     }
 
     fn load_from_checkpoint(

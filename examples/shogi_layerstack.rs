@@ -717,6 +717,21 @@ fn get_timestamp() -> (String, String) {
     (id_ts, date)
 }
 
+/// `prior` (resume 元 experiment.json から引き継いだ history) と
+/// `current` (現在 process の log.txt を parse した history) を superbatch でマージ。
+/// 同一 superbatch が両方にある場合は current を採用する。
+fn merge_loss_histories(prior: &[LossEntry], current: &[LossEntry]) -> Vec<LossEntry> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<usize, f64> = BTreeMap::new();
+    for entry in prior {
+        map.insert(entry.superbatch, entry.loss);
+    }
+    for entry in current {
+        map.insert(entry.superbatch, entry.loss);
+    }
+    map.into_iter().map(|(superbatch, loss)| LossEntry { superbatch, loss }).collect()
+}
+
 fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
     use std::collections::BTreeMap;
     let content = match std::fs::read_to_string(log_path) {
@@ -780,6 +795,9 @@ struct ExperimentContext {
     training_start: std::time::Instant,
     /// データファイルの総局面数（初期化時に計算、以後不変）
     positions: u64,
+    /// resume 時に既存 experiment.json から引き継いだ history。
+    /// build_experiment_log() で現在 process の history とマージされる。
+    prior_history: Vec<LossEntry>,
 }
 
 impl ExperimentContext {
@@ -816,6 +834,7 @@ impl ExperimentContext {
             commit,
             training_start: std::time::Instant::now(),
             positions,
+            prior_history: Vec::new(),
         }
     }
 
@@ -825,7 +844,11 @@ impl ExperimentContext {
             .cloned()
             .unwrap_or_else(|| format!("{}-{}", self.net_id, self.superbatches));
         let log_path = self.output_dir.join(&latest_checkpoint).join("log.txt");
-        let history = parse_loss_history(&log_path);
+        let current_history = parse_loss_history(&log_path);
+        // resume 時は過去 run の history を引き継いだ上で、現在 process の history を上書き合成する。
+        // log.txt は checkpoint 単位で current process の error_record から書き直されるため、
+        // prior_history を持っていないと sb 1..=resume_point の loss が experiment.json から消える。
+        let history = merge_loss_histories(&self.prior_history, &current_history);
 
         let checkpoints = collect_checkpoints(&self.output_dir, &self.net_id);
 
@@ -881,13 +904,8 @@ impl ExperimentContext {
         Ok(())
     }
 
-    /// resume 時に既存 experiment.json から experiment_id / date を引き継ぐ。
-    ///
-    /// `ExperimentContext::new()` は呼ばれるたびに新しい timestamp ベースの
-    /// experiment_id を生成するため、resume 時にそのまま `write_experiment_json`
-    /// すると過去 run の experiment.json を別 ID で上書きしてしまい、
-    /// 履歴が分断される。本メソッドは resume 元の experiment.json を読んで
-    /// id / date を引き継ぐことで、resume が同一実験の続きとして記録されるようにする。
+    /// resume 時に既存 experiment.json から experiment_id / date / history を引き継ぐ。
+    /// 詳細は shogi_simple.rs の同名メソッドのコメント参照。
     fn inherit_resume_experiment_id(&mut self) {
         let json_path = self.output_dir.join(&self.net_id).join("experiment.json");
         if !json_path.exists() {
@@ -911,6 +929,26 @@ impl ExperimentContext {
         if let Some(date) = existing.get("date").and_then(|v| v.as_str()) {
             if !date.is_empty() {
                 self.experiment_date = date.to_string();
+            }
+        }
+        if let Some(arr) = existing.get("history").and_then(|v| v.as_array()) {
+            let mut history: Vec<LossEntry> = arr
+                .iter()
+                .filter_map(|entry| {
+                    let sb = entry.get("superbatch").and_then(|v| v.as_u64())? as usize;
+                    let loss = entry.get("loss").and_then(|v| v.as_f64())?;
+                    Some(LossEntry { superbatch: sb, loss })
+                })
+                .collect();
+            history.sort_by_key(|e| e.superbatch);
+            if !history.is_empty() {
+                println!(
+                    "Inheriting {} history entries from previous run (sb {} .. {})",
+                    history.len(),
+                    history.first().unwrap().superbatch,
+                    history.last().unwrap().superbatch,
+                );
+                self.prior_history = history;
             }
         }
     }

@@ -21,7 +21,7 @@
 //! 4. Batch:   batch_size に分割してコールバックへ
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::mpsc;
 
 use crate::shogi::packed_sfen::PackedSfenValue;
@@ -565,59 +565,51 @@ impl PackedSfenValue {
 // =============================================================================
 
 /// .pack ファイルのバイト列カーソル
+/// .pack ファイルを逐次的に読むカーソル。
+/// 多 GB 規模の corpus でも全量メモリにロードしないようストリーム読み出しする。
 struct PackCursor {
-    data: Vec<u8>,
-    pos: usize,
+    reader: BufReader<File>,
+    eof: bool,
 }
 
 impl PackCursor {
-    fn new(data: Vec<u8>) -> Self {
-        Self { data, pos: 0 }
+    fn new(reader: BufReader<File>) -> Self {
+        Self { reader, eof: false }
     }
 
-    fn eof(&self) -> bool {
-        self.pos >= self.data.len()
-    }
-
-    fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
+    /// 次の 1 byte を peek してファイル終端かを判定する。
+    /// `&mut self` なのは BufReader の内部バッファを fill する必要があるため。
+    fn eof(&mut self) -> bool {
+        if self.eof {
+            return true;
+        }
+        match self.reader.fill_buf() {
+            Ok([]) | Err(_) => {
+                self.eof = true;
+                true
+            }
+            Ok(_) => false,
+        }
     }
 
     fn read_u8(&mut self) -> Option<u8> {
-        if self.remaining() < 1 {
-            return None;
-        }
-        let v = self.data[self.pos];
-        self.pos += 1;
-        Some(v)
+        let mut buf = [0u8; 1];
+        self.reader.read_exact(&mut buf).ok().map(|_| buf[0])
     }
 
     fn read_u16(&mut self) -> Option<u16> {
-        if self.remaining() < 2 {
-            return None;
-        }
-        let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Some(v)
+        let mut buf = [0u8; 2];
+        self.reader.read_exact(&mut buf).ok().map(|_| u16::from_le_bytes(buf))
     }
 
     fn read_i16(&mut self) -> Option<i16> {
-        if self.remaining() < 2 {
-            return None;
-        }
-        let v = i16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Some(v)
+        let mut buf = [0u8; 2];
+        self.reader.read_exact(&mut buf).ok().map(|_| i16::from_le_bytes(buf))
     }
 
     fn read_bytes_32(&mut self) -> Option<[u8; 32]> {
-        if self.remaining() < 32 {
-            return None;
-        }
         let mut buf = [0u8; 32];
-        buf.copy_from_slice(&self.data[self.pos..self.pos + 32]);
-        self.pos += 32;
-        Some(buf)
+        self.reader.read_exact(&mut buf).ok().map(|_| buf)
     }
 }
 
@@ -780,17 +772,15 @@ where
 
             'dataloading: loop {
                 for file_path in &file_paths {
-                    let file = match File::open(file_path) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-                    let mut reader = BufReader::new(file);
-                    let mut data = Vec::new();
-                    if reader.read_to_end(&mut data).is_err() {
-                        continue;
-                    }
-
-                    let mut cursor = PackCursor::new(data);
+                    // データセット指定ミス (パス typo / 権限なし) は fail-fast。
+                    // silent な continue だと reader loop が無限化し、学習スレッドが
+                    // batch を永遠に待ってハングするため。
+                    let file = File::open(file_path).unwrap_or_else(|e| {
+                        panic!("Failed to open .pack file {file_path:?}: {e}");
+                    });
+                    // 多 GB のコーパスでも OOM しないよう BufReader 経由で逐次読みする。
+                    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+                    let mut cursor = PackCursor::new(reader);
 
                     while !cursor.eof() {
                         let game = match read_one_game(&mut cursor) {

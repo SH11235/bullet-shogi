@@ -78,10 +78,12 @@ struct Args {
     #[arg(long)]
     command: Option<String>,
 
-    /// 出力ファイルパス (指定しなければ checkpoint_dir/experiment.json)
-    /// 学習側 (shogi_simple / shogi_layerstack) は output_dir/net_id/experiment.json
-    /// に書き出すので、checkpoint_dir = output_dir/net_id を渡す前提で
-    /// その直下の experiment.json を上書きするのがデフォルト動作。
+    /// 出力ファイルパス。指定しない場合は --checkpoint-dir の渡し方で決まる:
+    ///   --checkpoint-dir が学習の --output と同じ root の場合 (例: checkpoints):
+    ///     → checkpoint_dir/<net_id>/experiment.json
+    ///   --checkpoint-dir が実験固有ディレクトリの場合 (例: checkpoints/v63 で末尾が net_id と一致):
+    ///     → checkpoint_dir/experiment.json
+    /// いずれの場合も学習側の write_experiment_json と同じパスに書き戻すよう調整される。
     #[arg(long, short)]
     output: Option<PathBuf>,
 
@@ -345,11 +347,23 @@ fn main() {
 
     let json = serde_json::to_string_pretty(&experiment).expect("Failed to serialize JSON");
 
-    // 学習側の write_experiment_json は output_dir/net_id/experiment.json に書く。
-    // recover ツールには checkpoint_dir = output_dir/net_id (例: checkpoints/v63) を
-    // 渡す前提なので、デフォルト出力は checkpoint_dir 直下の experiment.json とする。
-    // (以前は checkpoint_dir.join(&name) で v63 を二重ネストしていたバグを修正。)
-    let output_path = args.output.unwrap_or_else(|| args.checkpoint_dir.join("experiment.json"));
+    // 学習側の write_experiment_json は output_dir.join(net_id).join("experiment.json")
+    // に書く (例: --output checkpoints --net-id v63 → checkpoints/v63/experiment.json)。
+    // recover の --checkpoint-dir は呼び出し方によって 2 つの粒度がありうる:
+    //   1) 学習の --output と同じ root (例: checkpoints) を渡すケース
+    //      → 出力は checkpoint_dir/<net_id>/experiment.json
+    //   2) 実験固有ディレクトリ (例: checkpoints/v63) を渡すケース
+    //      → 出力は checkpoint_dir/experiment.json
+    // checkpoint_dir 末尾の component が net_id と一致するかで判定する。
+    let output_path = args.output.unwrap_or_else(|| {
+        let dir_already_experiment_root =
+            args.checkpoint_dir.file_name().map(|s| s == name.as_str()).unwrap_or(false);
+        if dir_already_experiment_root {
+            args.checkpoint_dir.join("experiment.json")
+        } else {
+            args.checkpoint_dir.join(&name).join("experiment.json")
+        }
+    });
 
     // Check if file already exists
     if output_path.exists() && !args.force {

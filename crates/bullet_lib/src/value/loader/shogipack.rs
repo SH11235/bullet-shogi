@@ -767,17 +767,37 @@ where
         let buffer_size = self.buffer_size;
         let filter = self.filter.clone();
 
-        // ===== Resume support (consume-and-drop) =====
-        // .pack は可変長レコード + filter + shuffle のため、bit-exact な seek が
-        // 原理的に困難。expander 段で start_batch * batch_size 個の filter 通過
-        // position を読み飛ばすことで、resume 後に既消費分の position が
-        // 重複学習されることを防ぐ。shuffle 順序は fresh run と一致しないが、
-        // shuffle buffer 程度の範囲でブレるだけで NN 学習にとってはノイズ未満。
+        // ===== Resume support (consume-and-drop, best-effort) =====
+        //
+        // .pack は (1) 可変長レコード (2) caller 提供 filter (3) shuffle buffer の
+        // 3 要素により bit-exact な seek が原理的に不可能。本実装は expander 段で
+        // start_batch * batch_size 個の filter 通過 position を input 順序で
+        // 読み飛ばす "best-effort consume-and-drop" を採用している。
+        //
+        // **既知の限界**: shuffle buffer (= buffer_size 個の position) 単位で見ると、
+        // fresh run は buffer 内の random subset を emit しているのに対し、
+        // resume run は buffer の先頭 N 個を input 順序で drop する。このため
+        // 境界 1 shuffle window 分の position について、
+        //   - fresh で emit 済み (= 学習済み) のうち一部が resume でも emit される (重複学習)
+        //   - fresh で未 emit のうち一部が resume の skip 対象に入って drop される (永久 skip)
+        // という現象が起きる。影響は最大 1 shuffle buffer 分 (~256k〜数 M position) に
+        // 限定され、データセット全体の 0.01〜0.1% スケールのため学習結果への影響は
+        // 軽微 (NN にとってはノイズ未満) と判断して受容している。
+        //
+        // **完全な bit-exact resume が必要な場合**: .pack を事前に .psv に展開して
+        // DirectSequentialDataLoader (固定長レコード前提なので byte 単位で seek 可) で
+        // 読むこと。これが現在の主要な学習パスでもある。
+        //
+        // **本 loader を実学習で多用するなら**: shuffle 段の RNG seed を引数化して
+        // post-shuffle skip に切り替える、もしくは shuffle window 境界で checkpoint
+        // を保存する設計に refactor する必要がある。詳細議論は PR #12 review thread 参照。
         let positions_to_skip = start_batch.saturating_mul(batch_size);
         if positions_to_skip > 0 {
-            println!(
-                "[ShogiPackLoader] start_batch={start_batch} (skip {positions_to_skip} positions). \
-                Note: .pack resume is deterministic on the skip boundary but NOT bit-exact w.r.t. shuffle order.",
+            eprintln!(
+                "[ShogiPackLoader] WARNING: start_batch={start_batch} (skip {positions_to_skip} positions). \n\
+                .pack resume is BEST-EFFORT, NOT bit-exact: ~1 shuffle buffer worth of positions \n\
+                near the resume boundary will be partially replayed and partially never seen. \n\
+                For bit-exact resume, preprocess .pack to .psv and use DirectSequentialDataLoader.",
             );
         }
 
@@ -842,6 +862,13 @@ where
 
         std::thread::spawn(move || {
             let mut skipped: usize = 0;
+            // filter 全弾き等で「filter を通過する position が 0 の sweep」が連続したら
+            // 設定ミス or 空データセットと判断し panic で fail-fast。silent な hang は
+            // debug 不能なため。"filter 通過数" で判定するので resume の skip 中
+            // (positions_to_skip 消化中) でも誤発火しない。
+            let mut filter_accepted_in_sweep: usize = 0;
+            let mut consecutive_empty_sweeps: usize = 0;
+            const MAX_EMPTY_SWEEPS: usize = 2;
 
             'dataloading: while let Ok(games) = reader_rx.recv() {
                 if expand_stop_rx.try_recv().unwrap_or(false) {
@@ -857,6 +884,7 @@ where
                         if !filter(&psv) {
                             continue;
                         }
+                        filter_accepted_in_sweep += 1;
                         if skipped < positions_to_skip {
                             skipped += 1;
                             continue;
@@ -871,6 +899,21 @@ where
                     reader_stop_tx.send(true).ok();
                     break 'dataloading;
                 }
+
+                if is_sweep_end {
+                    if filter_accepted_in_sweep == 0 {
+                        consecutive_empty_sweeps += 1;
+                        if consecutive_empty_sweeps >= MAX_EMPTY_SWEEPS {
+                            panic!(
+                                "ShogiPackLoader: filter accepted 0 positions in {MAX_EMPTY_SWEEPS} consecutive \
+                                sweeps. Filter is too restrictive or the .pack corpus contains no usable data.",
+                            );
+                        }
+                    } else {
+                        consecutive_empty_sweeps = 0;
+                    }
+                    filter_accepted_in_sweep = 0;
+                }
             }
         });
 
@@ -881,18 +924,12 @@ where
         let (shuffle_tx, shuffle_rx) = mpsc::sync_channel::<Vec<PackedSfenValue>>(0);
         let (shuffle_stop_tx, shuffle_stop_rx) = mpsc::sync_channel::<bool>(1);
 
+        // Note: filter 全弾きの fail-fast 検知は expander 段で行う (filter 通過数で判定するため)。
         std::thread::spawn(move || {
             let mut shuffle_buffer = Vec::with_capacity(buffer_size);
-            // filter 全弾き等で「1 sweep 通して 0 position」が連続するとハング検知用。
-            // 2 連続で空 sweep だったら filter 設定ミス or 空データセットと判断し panic する。
-            // (skip 中の sweep は除外: positions_to_skip を消化中は accepted=0 でも正常動作)
-            let mut accepted_in_current_sweep: usize = 0;
-            let mut consecutive_empty_sweeps: usize = 0;
-            const MAX_EMPTY_SWEEPS: usize = 2;
 
             'dataloading: while let Ok(positions) = expand_rx.recv() {
                 let is_sweep_end = positions.is_empty();
-                accepted_in_current_sweep += positions.len();
                 for entry in positions {
                     shuffle_buffer.push(entry);
 
@@ -920,22 +957,6 @@ where
                     shuffle_buffer = Vec::with_capacity(buffer_size);
                 }
 
-                if is_sweep_end {
-                    if accepted_in_current_sweep == 0 {
-                        consecutive_empty_sweeps += 1;
-                        if consecutive_empty_sweeps >= MAX_EMPTY_SWEEPS {
-                            // ここで panic することで reader の無限ループに対する fail-fast を実現する。
-                            // silent に block すると学習が無言でハングし debug が困難なため。
-                            panic!(
-                                "ShogiPackLoader: filter accepted 0 positions in {MAX_EMPTY_SWEEPS} consecutive \
-                                sweeps. Filter is too restrictive or the .pack corpus contains no usable data.",
-                            );
-                        }
-                    } else {
-                        consecutive_empty_sweeps = 0;
-                    }
-                    accepted_in_current_sweep = 0;
-                }
             }
         });
 

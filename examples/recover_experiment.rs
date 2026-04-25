@@ -78,7 +78,10 @@ struct Args {
     #[arg(long)]
     command: Option<String>,
 
-    /// 出力ファイルパス (指定しなければ checkpoint_dir/net_id/experiment.json)
+    /// 出力ファイルパス (指定しなければ checkpoint_dir/experiment.json)
+    /// 学習側 (shogi_simple / shogi_layerstack) は output_dir/net_id/experiment.json
+    /// に書き出すので、checkpoint_dir = output_dir/net_id を渡す前提で
+    /// その直下の experiment.json を上書きするのがデフォルト動作。
     #[arg(long, short)]
     output: Option<PathBuf>,
 
@@ -342,10 +345,11 @@ fn main() {
 
     let json = serde_json::to_string_pretty(&experiment).expect("Failed to serialize JSON");
 
-    let output_path = args.output.unwrap_or_else(|| {
-        let dir = args.checkpoint_dir.join(&name);
-        dir.join("experiment.json")
-    });
+    // 学習側の write_experiment_json は output_dir/net_id/experiment.json に書く。
+    // recover ツールには checkpoint_dir = output_dir/net_id (例: checkpoints/v63) を
+    // 渡す前提なので、デフォルト出力は checkpoint_dir 直下の experiment.json とする。
+    // (以前は checkpoint_dir.join(&name) で v63 を二重ネストしていたバグを修正。)
+    let output_path = args.output.unwrap_or_else(|| args.checkpoint_dir.join("experiment.json"));
 
     // Check if file already exists
     if output_path.exists() && !args.force {

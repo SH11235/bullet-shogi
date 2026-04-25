@@ -757,12 +757,7 @@ where
         None
     }
 
-    fn map_batches<F: FnMut(&[PackedSfenValue]) -> bool>(
-        &self,
-        start_batch: usize,
-        batch_size: usize,
-        mut f: F,
-    ) {
+    fn map_batches<F: FnMut(&[PackedSfenValue]) -> bool>(&self, start_batch: usize, batch_size: usize, mut f: F) {
         let file_paths = self.file_paths.clone();
         let buffer_size = self.buffer_size;
         let filter = self.filter.clone();
@@ -956,7 +951,6 @@ where
 
                     shuffle_buffer = Vec::with_capacity(buffer_size);
                 }
-
             }
         });
 

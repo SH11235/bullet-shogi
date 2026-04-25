@@ -868,8 +868,7 @@ impl ExperimentContext {
             .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
             .unwrap_or((None, None));
 
-        let training_time_seconds =
-            self.prior_training_seconds.saturating_add(self.training_start.elapsed().as_secs());
+        let training_time_seconds = self.prior_training_seconds.saturating_add(self.training_start.elapsed().as_secs());
         let (_, last_updated_at) = get_timestamp();
 
         ExperimentLog {
@@ -936,10 +935,8 @@ impl ExperimentContext {
                 self.experiment_date = date.to_string();
             }
         }
-        if let Some(secs) = existing
-            .get("results")
-            .and_then(|v| v.get("training_time_seconds"))
-            .and_then(|v| v.as_u64())
+        if let Some(secs) =
+            existing.get("results").and_then(|v| v.get("training_time_seconds")).and_then(|v| v.as_u64())
         {
             if secs > 0 {
                 println!("Inheriting prior training time: {} seconds", secs);

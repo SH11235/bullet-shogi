@@ -31,8 +31,8 @@ use super::shogi_halfka::{
     HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece,
 };
 use super::shogi_halfka_hm_threat::{
-    ATTACK_ORDER_TABLE, AttackOrderTable, FROM_OFFSET_TABLE, NUM_THREAT_CLASSES, Occupied,
-    ThreatClass, attack_pattern_id, normalize_sq,
+    ATTACK_ORDER_TABLE, AttackOrderTable, FROM_OFFSET_TABLE, NUM_THREAT_CLASSES, Occupied, ThreatClass,
+    attack_pattern_id, normalize_sq,
 };
 use crate::shogi::{
     PackedSfenValue, ShogiBoard,
@@ -69,9 +69,7 @@ const HAND_TO_BOARD_CLASS: [ThreatClass; HAND_NUM_CLASSES] = [
 ///
 /// = [72, 324, 112, 328, 416, 816, 1296]
 /// 合計 = 3,364
-const HAND_ATTACKS_PER_COLOR: [usize; HAND_NUM_CLASSES] = [
-    72, 324, 112, 328, 416, 816, 1296,
-];
+const HAND_ATTACKS_PER_COLOR: [usize; HAND_NUM_CLASSES] = [72, 324, 112, 328, 416, 816, 1296];
 
 // =============================================================================
 // HandThreatClass
@@ -156,10 +154,7 @@ static HAND_PAIR_BASE: [usize; HAND_NUM_PAIRS] = HAND_PAIR_DATA.0;
 pub const HAND_THREAT_DIMENSIONS: usize = HAND_PAIR_DATA.1;
 
 const _HAND_THREAT_DIMENSIONS_CHECK: () = {
-    assert!(
-        HAND_THREAT_DIMENSIONS == 30_276,
-        "HAND_THREAT_DIMENSIONS (defensive) must be 30,276"
-    );
+    assert!(HAND_THREAT_DIMENSIONS == 30_276, "HAND_THREAT_DIMENSIONS (defensive) must be 30,276");
 };
 
 /// defensive: (hc, ac) → base offset
@@ -216,10 +211,10 @@ fn for_each_drop_attack<F: FnMut(Square)>(
     color: Color,
     from: Square,
     occ: &Occupied,
-    mut callback: F,
+    callback: F,
 ) {
     let pt = hand_class.as_piece_type();
-    super::shogi_halfka_hm_threat::for_each_attack(pt, color, from, occ, |sq| callback(sq));
+    super::shogi_halfka_hm_threat::for_each_attack(pt, color, from, occ, callback);
 }
 
 // =============================================================================
@@ -292,18 +287,14 @@ impl SparseInputType for ShogiHalfKaHmHandThreatDefensive {
     /// このメソッドは通常の訓練経路からは呼ばれない。ただし snapshot test 等の
     /// 外部ツールが map_features を直接呼ぶ場合のために panic ではなく
     /// HalfKA 部分のみを emit する "best-effort" 挙動にする。
-    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, f: F) {
         let board = ShogiBoard::from_packed_sfen(pos);
-        self.map_halfka_hm_features(&board, |stm, nstm| f(stm, nstm));
+        self.map_halfka_hm_features(&board, f);
         // HandThreat は defensive では非対称なので symmetric f() では正確に
         // emit できない。呼び出し側は map_features_split を使うべき。
     }
 
-    fn map_features_split<F: FnMut(Option<usize>, Option<usize>)>(
-        &self,
-        pos: &Self::RequiredDataType,
-        mut f: F,
-    ) {
+    fn map_features_split<F: FnMut(Option<usize>, Option<usize>)>(&self, pos: &Self::RequiredDataType, mut f: F) {
         let board = ShogiBoard::from_packed_sfen(pos);
         // HalfKA_hm 部分は対称なので両側 Some で emit
         self.map_halfka_hm_features(&board, |stm, nstm| f(Some(stm), Some(nstm)));
@@ -420,11 +411,7 @@ impl ShogiHalfKaHmHandThreatDefensive {
     ///   `Some(nstm_hand_idx)` で emit。stm 側は None。
     ///
     /// target は friend side のみ。
-    fn map_hand_threat_features_defensive<F: FnMut(Option<usize>, Option<usize>)>(
-        &self,
-        board: &ShogiBoard,
-        mut f: F,
-    ) {
+    fn map_hand_threat_features_defensive<F: FnMut(Option<usize>, Option<usize>)>(&self, board: &ShogiBoard, mut f: F) {
         let stm = board.side_to_move;
         let nstm = stm.opponent();
 
@@ -473,9 +460,7 @@ impl ShogiHalfKaHmHandThreatDefensive {
                     if !is_legal_drop_rank(hand_class, drop_color, drop_sq) {
                         continue;
                     }
-                    if hand_class == HandThreatClass::Pawn
-                        && has_pawn_on_file(board, drop_color, drop_sq)
-                    {
+                    if hand_class == HandThreatClass::Pawn && has_pawn_on_file(board, drop_color, drop_sq) {
                         continue;
                     }
 
@@ -503,15 +488,8 @@ impl ShogiHalfKaHmHandThreatDefensive {
                             }
                             let drop_n = normalize_sq(drop_sq, stm, stm_hm);
                             let to_n = normalize_sq(to_sq, stm, stm_hm);
-                            let oriented =
-                                if stm == Color::Black { drop_color } else { drop_color.opponent() };
-                            let hand_idx = hand_threat_index(
-                                hand_class,
-                                oriented,
-                                attacked_class,
-                                drop_n,
-                                to_n,
-                            );
+                            let oriented = if stm == Color::Black { drop_color } else { drop_color.opponent() };
+                            let hand_idx = hand_threat_index(hand_class, oriented, attacked_class, drop_n, to_n);
                             debug_assert!(hand_idx < HAND_THREAT_DIMENSIONS);
                             f(Some(HALFKA_HM_DIMENSIONS + hand_idx), None);
                         } else {
@@ -521,15 +499,8 @@ impl ShogiHalfKaHmHandThreatDefensive {
                             }
                             let drop_n = normalize_sq(drop_sq, nstm, nstm_hm);
                             let to_n = normalize_sq(to_sq, nstm, nstm_hm);
-                            let oriented =
-                                if nstm == Color::Black { drop_color } else { drop_color.opponent() };
-                            let hand_idx = hand_threat_index(
-                                hand_class,
-                                oriented,
-                                attacked_class,
-                                drop_n,
-                                to_n,
-                            );
+                            let oriented = if nstm == Color::Black { drop_color } else { drop_color.opponent() };
+                            let hand_idx = hand_threat_index(hand_class, oriented, attacked_class, drop_n, to_n);
                             debug_assert!(hand_idx < HAND_THREAT_DIMENSIONS);
                             f(None, Some(HALFKA_HM_DIMENSIONS + hand_idx));
                         }

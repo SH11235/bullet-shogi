@@ -79,11 +79,7 @@ pub trait SparseInputType: Clone + Send + Sync + 'static {
     /// Input types that need asymmetric features (e.g. HandThreat defensive)
     /// must override this method and leave `map_features` calling a single-
     /// purpose symmetric emission (or panic).
-    fn map_features_split<F: FnMut(Option<usize>, Option<usize>)>(
-        &self,
-        pos: &Self::RequiredDataType,
-        mut f: F,
-    ) {
+    fn map_features_split<F: FnMut(Option<usize>, Option<usize>)>(&self, pos: &Self::RequiredDataType, mut f: F) {
         self.map_features(pos, |stm, nstm| f(Some(stm), Some(nstm)));
     }
 

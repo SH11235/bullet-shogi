@@ -107,7 +107,7 @@ fn build_pair_base(profile: ThreatProfile) -> ([usize; NUM_PAIRS], usize) {
     let mut table = [0usize; NUM_PAIRS];
     let mut cumulative = 0usize;
     for attacker_side in 0..2 {
-        for ac in 0..NUM_THREAT_CLASSES {
+        for (ac, &attacks) in ATTACKS_PER_COLOR.iter().enumerate().take(NUM_THREAT_CLASSES) {
             for ds in 0..2 {
                 for dc in 0..NUM_THREAT_CLASSES {
                     let idx = attacker_side * 162 + ac * 18 + ds * 9 + dc;
@@ -115,7 +115,7 @@ fn build_pair_base(profile: ThreatProfile) -> ([usize; NUM_PAIRS], usize) {
                         table[idx] = EXCLUDED_PAIR_BASE;
                     } else {
                         table[idx] = cumulative;
-                        cumulative += ATTACKS_PER_COLOR[ac];
+                        cumulative += attacks;
                     }
                 }
             }
@@ -509,7 +509,13 @@ impl Occupied {
 }
 
 /// 実盤面上の攻撃先マスを列挙し、コールバックを呼ぶ
-pub(super) fn for_each_attack<F: FnMut(Square)>(pt: PieceType, color: Color, from: Square, occ: &Occupied, mut callback: F) {
+pub(super) fn for_each_attack<F: FnMut(Square)>(
+    pt: PieceType,
+    color: Color,
+    from: Square,
+    occ: &Occupied,
+    mut callback: F,
+) {
     let file = from.file() as i8;
     let rank = from.rank() as i8;
 

@@ -20,8 +20,8 @@ use super::shogi_halfka::{
     HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece,
 };
 use super::shogi_halfka_hm_threat::{
-    ATTACK_ORDER_TABLE, AttackOrderTable, FROM_OFFSET_TABLE, NUM_THREAT_CLASSES, Occupied,
-    ThreatClass, attack_pattern_id, normalize_sq,
+    ATTACK_ORDER_TABLE, AttackOrderTable, FROM_OFFSET_TABLE, NUM_THREAT_CLASSES, Occupied, ThreatClass,
+    attack_pattern_id, normalize_sq,
 };
 use crate::shogi::{
     PackedSfenValue, ShogiBoard,
@@ -163,19 +163,11 @@ static HAND_PAIR_BASE: [usize; HAND_NUM_PAIRS] = HAND_PAIR_DATA.0;
 pub const HAND_THREAT_DIMENSIONS: usize = HAND_PAIR_DATA.1;
 
 const _HAND_THREAT_DIMENSIONS_CHECK: () = {
-    assert!(
-        HAND_THREAT_DIMENSIONS == 121_104,
-        "HAND_THREAT_DIMENSIONS must be 121,104"
-    );
+    assert!(HAND_THREAT_DIMENSIONS == 121_104, "HAND_THREAT_DIMENSIONS must be 121,104");
 };
 
 #[inline]
-fn hand_pair_base(
-    drop_owner: usize,
-    hc: HandThreatClass,
-    attacked_side: usize,
-    ac: ThreatClass,
-) -> usize {
+fn hand_pair_base(drop_owner: usize, hc: HandThreatClass, attacked_side: usize, ac: ThreatClass) -> usize {
     let idx = drop_owner * 126 + (hc as usize) * 18 + attacked_side * 9 + ac as usize;
     HAND_PAIR_BASE[idx]
 }
@@ -233,7 +225,7 @@ fn for_each_drop_attack<F: FnMut(Square)>(
     color: Color,
     from: Square,
     occ: &Occupied,
-    mut callback: F,
+    callback: F,
 ) {
     // drop 駒は PieceType::{Pawn,Lance,...,Rook} で、成り前の駒。
     // shogi_halfka_hm_threat の for_each_attack はスライダー occupied を考慮するが、
@@ -241,7 +233,7 @@ fn for_each_drop_attack<F: FnMut(Square)>(
     //
     // 実際には shogi_halfka_hm_threat::for_each_attack を流用すればよい:
     let pt = hand_class.as_piece_type();
-    super::shogi_halfka_hm_threat::for_each_attack(pt, color, from, occ, |sq| callback(sq));
+    super::shogi_halfka_hm_threat::for_each_attack(pt, color, from, occ, callback);
 }
 
 // =============================================================================
@@ -320,10 +312,7 @@ impl SparseInputType for ShogiHalfKaHmHandThreat {
     }
 
     fn description(&self) -> String {
-        format!(
-            "Shogi HalfKA_hm ({}) + HandThreat ({}) concatenated",
-            HALFKA_HM_DIMENSIONS, HAND_THREAT_DIMENSIONS
-        )
+        format!("Shogi HalfKA_hm ({}) + HandThreat ({}) concatenated", HALFKA_HM_DIMENSIONS, HAND_THREAT_DIMENSIONS)
     }
 }
 
@@ -451,9 +440,7 @@ impl ShogiHalfKaHmHandThreat {
                         continue;
                     }
                     // (3) 二歩
-                    if hand_class == HandThreatClass::Pawn
-                        && has_pawn_on_file(board, drop_color, drop_sq)
-                    {
+                    if hand_class == HandThreatClass::Pawn && has_pawn_on_file(board, drop_color, drop_sq) {
                         continue;
                     }
 
@@ -480,8 +467,7 @@ impl ShogiHalfKaHmHandThreat {
                         let stm_attacked_side = if target_color == stm { 0 } else { 1 };
                         let stm_drop_n = normalize_sq(drop_sq, stm, stm_hm);
                         let stm_to_n = normalize_sq(to_sq, stm, stm_hm);
-                        let stm_oriented =
-                            if stm == Color::Black { drop_color } else { drop_color.opponent() };
+                        let stm_oriented = if stm == Color::Black { drop_color } else { drop_color.opponent() };
                         let stm_hand_idx = hand_threat_index(
                             stm_drop_owner,
                             hand_class,
@@ -499,8 +485,7 @@ impl ShogiHalfKaHmHandThreat {
                         let nstm_attacked_side = if target_color == nstm { 0 } else { 1 };
                         let nstm_drop_n = normalize_sq(drop_sq, nstm, nstm_hm);
                         let nstm_to_n = normalize_sq(to_sq, nstm, nstm_hm);
-                        let nstm_oriented =
-                            if nstm == Color::Black { drop_color } else { drop_color.opponent() };
+                        let nstm_oriented = if nstm == Color::Black { drop_color } else { drop_color.opponent() };
                         let nstm_hand_idx = hand_threat_index(
                             nstm_drop_owner,
                             hand_class,
@@ -589,14 +574,8 @@ mod tests {
 
     #[test]
     fn test_hand_to_board_class_mapping() {
-        assert_eq!(
-            HandThreatClass::Pawn.as_board_class() as usize,
-            ThreatClass::Pawn as usize
-        );
-        assert_eq!(
-            HandThreatClass::Gold.as_board_class() as usize,
-            ThreatClass::GoldLike as usize
-        );
+        assert_eq!(HandThreatClass::Pawn.as_board_class() as usize, ThreatClass::Pawn as usize);
+        assert_eq!(HandThreatClass::Gold.as_board_class() as usize, ThreatClass::GoldLike as usize);
     }
 
     /// Cross-validation 用: 特定局面の HandThreat indices を sorted Vec で返す
@@ -609,10 +588,7 @@ mod tests {
         let mut pairs = Vec::new();
         input.map_hand_threat_features(board, |stm_idx, nstm_idx| {
             if stm_idx >= HALFKA_HM_DIMENSIONS {
-                pairs.push((
-                    stm_idx - HALFKA_HM_DIMENSIONS,
-                    nstm_idx - HALFKA_HM_DIMENSIONS,
-                ));
+                pairs.push((stm_idx - HALFKA_HM_DIMENSIONS, nstm_idx - HALFKA_HM_DIMENSIONS));
             }
         });
         pairs.sort();
@@ -654,8 +630,7 @@ mod tests {
         let board = build_minimal_pawn_drop_position();
         let pairs = collect_hand_threat_only(&board);
 
-        let mut file = std::fs::File::create("/tmp/hand_threat_golden_minimal.txt")
-            .expect("create golden file");
+        let mut file = std::fs::File::create("/tmp/hand_threat_golden_minimal.txt").expect("create golden file");
         for (stm, nstm) in &pairs {
             writeln!(file, "{} {}", stm, nstm).expect("write line");
         }
@@ -670,11 +645,7 @@ mod tests {
     fn test_minimal_position_has_one_hand_threat() {
         let board = build_minimal_pawn_drop_position();
         let pairs = collect_hand_threat_only(&board);
-        assert_eq!(
-            pairs.len(),
-            1,
-            "minimal position should produce exactly 1 hand threat feature"
-        );
+        assert_eq!(pairs.len(), 1, "minimal position should produce exactly 1 hand threat feature");
     }
 
     /// Snapshot regression test for optimization verification
@@ -711,13 +682,11 @@ mod tests {
         use std::fs::File;
         use std::io::{Read, Write};
 
-        const PACK_PATH: &str =
-            "/mnt/nvme1/development/bullet-shogi/data/DLSuisho15b_deduped_shuffled.bin";
+        const PACK_PATH: &str = "/mnt/nvme1/development/bullet-shogi/data/DLSuisho15b_deduped_shuffled.bin";
         const NUM_POSITIONS: usize = 1000;
         const SNAPSHOT_PATH: &str = "/tmp/hand_threat_snapshot.txt";
 
-        let mut file = File::open(PACK_PATH)
-            .unwrap_or_else(|e| panic!("failed to open {PACK_PATH}: {e}"));
+        let mut file = File::open(PACK_PATH).unwrap_or_else(|e| panic!("failed to open {PACK_PATH}: {e}"));
 
         let input = ShogiHalfKaHmHandThreat::new();
         let mut dump = String::new();
@@ -753,8 +722,7 @@ mod tests {
             }
         }
 
-        let mut out = File::create(SNAPSHOT_PATH)
-            .unwrap_or_else(|e| panic!("failed to create {SNAPSHOT_PATH}: {e}"));
+        let mut out = File::create(SNAPSHOT_PATH).unwrap_or_else(|e| panic!("failed to create {SNAPSHOT_PATH}: {e}"));
         out.write_all(dump.as_bytes()).expect("write snapshot");
 
         eprintln!(

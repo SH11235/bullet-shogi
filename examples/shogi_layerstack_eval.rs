@@ -33,8 +33,8 @@ use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::datalo
 use bullet_lib::{
     game::{
         inputs::{
-            ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
-            ShogiHalfKaHmThreat, SparseInputType, ThreatProfile,
+            ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive, ShogiHalfKaHmThreat,
+            SparseInputType, ThreatProfile,
         },
         outputs::{
             OutputBuckets, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
@@ -231,11 +231,7 @@ fn is_promoted(pt: bullet_lib::shogi::PieceType) -> bool {
 /// rshogi 側 `hand_count::extract_hand_count` と同一順序。
 fn hand_count_from_psv(psv: &bullet_lib::shogi::PackedSfenValue, hc_dims: usize) -> Vec<i16> {
     use bullet_lib::shogi::{ShogiBoard, types::HAND_PIECE_TYPES};
-    assert_eq!(
-        hc_dims,
-        2 * HAND_PIECE_TYPES.len(),
-        "hc_dims は stm 7 + nstm 7 = 14 を想定 (got {hc_dims})"
-    );
+    assert_eq!(hc_dims, 2 * HAND_PIECE_TYPES.len(), "hc_dims は stm 7 + nstm 7 = 14 を想定 (got {hc_dims})");
     let board = ShogiBoard::from_packed_sfen(psv);
     let stm = board.side_to_move;
     let nstm = stm.opponent();
@@ -590,14 +586,9 @@ fn main() {
     let l2_size = args.l2;
     let halfka_dim = ShogiHalfKA_hm.num_inputs();
 
-    let ht_flag_count = [args.threat, args.hand_threat, args.hand_threat_defensive]
-        .iter()
-        .filter(|&&b| b)
-        .count();
+    let ht_flag_count = [args.threat, args.hand_threat, args.hand_threat_defensive].iter().filter(|&&b| b).count();
     if ht_flag_count > 1 {
-        eprintln!(
-            "ERROR: --threat / --hand-threat / --hand-threat-defensive は同時に指定できません"
-        );
+        eprintln!("ERROR: --threat / --hand-threat / --hand-threat-defensive は同時に指定できません");
         std::process::exit(1);
     }
 
@@ -1728,8 +1719,7 @@ impl QuantisedNetwork {
                 }
                 // HandCount Dense 部（存在時のみ）
                 for i in 0..hand_count_dims {
-                    hand_count_l1_weights[global_out * hand_count_dims + i] =
-                        row[l1_input_dim + i] as i8;
+                    hand_count_l1_weights[global_out * hand_count_dims + i] = row[l1_input_dim + i] as i8;
                 }
             }
 
@@ -1883,11 +1873,7 @@ fn run_integer_forward(
             println!("HalfKA features: {}, Threat features: {}", stm_features.len(), stm_threat.len());
         }
         if net.has_hand_threat {
-            println!(
-                "HalfKA features: {}, HandThreat features: {}",
-                stm_features.len(),
-                stm_hand_threat.len()
-            );
+            println!("HalfKA features: {}, HandThreat features: {}", stm_features.len(), stm_hand_threat.len());
         }
 
         // --- 1. Feature Transformer accumulation (i16) ---

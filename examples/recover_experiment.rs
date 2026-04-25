@@ -356,8 +356,7 @@ fn main() {
     //      → 出力は checkpoint_dir/experiment.json
     // checkpoint_dir 末尾の component が net_id と一致するかで判定する。
     let output_path = args.output.unwrap_or_else(|| {
-        let dir_already_experiment_root =
-            args.checkpoint_dir.file_name().map(|s| s == name.as_str()).unwrap_or(false);
+        let dir_already_experiment_root = args.checkpoint_dir.file_name().map(|s| s == name.as_str()).unwrap_or(false);
         if dir_already_experiment_root {
             args.checkpoint_dir.join("experiment.json")
         } else {

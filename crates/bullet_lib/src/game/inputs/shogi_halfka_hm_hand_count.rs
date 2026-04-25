@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn hand_piece_types_len_matches_half() {
         // HAND_PIECE_TYPES は 7 種（歩香桂銀金角飛）。
-        let pts: Vec<PieceType> = HAND_PIECE_TYPES.iter().copied().collect();
+        let pts: Vec<PieceType> = HAND_PIECE_TYPES.to_vec();
         assert_eq!(pts.len(), HAND_COUNT_DIMS / 2);
     }
 }

@@ -212,7 +212,7 @@ where
                 .zip(prep.buckets.value.chunks_mut(chunk_size))
                 .zip(prep.targets.value.chunks_mut(output_size * chunk_size))
                 .zip(prep.weights.value.chunks_mut(chunk_size))
-                .zip(hand_count_slices.into_iter())
+                .zip(hand_count_slices)
                 .for_each(
                     |(
                         (((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk),

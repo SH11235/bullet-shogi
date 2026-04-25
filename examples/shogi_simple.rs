@@ -644,25 +644,36 @@ impl ExperimentContext {
         Ok(())
     }
 
-    /// resume時に既存experiment.jsonが上書きされないことを確認する。
-    /// 既存ファイルのIDが今回と異なる場合（= 別の実験セッションの成果物）はエラーで中止。
-    fn check_resume_safety(&self) {
+    /// resume 時に既存 experiment.json から experiment_id / date を引き継ぐ。
+    ///
+    /// `ExperimentContext::new()` は呼ばれるたびに新しい timestamp ベースの
+    /// experiment_id を生成するため、resume 時にそのまま `write_experiment_json`
+    /// すると過去 run の experiment.json を別 ID で上書きしてしまい、
+    /// 履歴が分断される。本メソッドは resume 元の experiment.json を読んで
+    /// id / date を引き継ぐことで、resume が同一実験の続きとして記録されるようにする。
+    fn inherit_resume_experiment_id(&mut self) {
         let json_path = self.output_dir.join(&self.net_id).join("experiment.json");
-        if json_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&json_path) {
-                if let Ok(existing) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let existing_id = existing.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if !existing_id.is_empty() && existing_id != self.experiment_id {
-                        eprintln!(
-                            "ERROR: {} already contains a different experiment (id: {}).",
-                            json_path.display(),
-                            existing_id
-                        );
-                        eprintln!("Resume would overwrite the previous experiment's record.");
-                        eprintln!("Use a different --net-id or --output directory for the new run.");
-                        std::process::exit(1);
-                    }
-                }
+        if !json_path.exists() {
+            return;
+        }
+        let content = match std::fs::read_to_string(&json_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let existing: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        if let Some(id) = existing.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                println!("Inheriting experiment id from {}: {}", json_path.display(), id);
+                self.experiment_id = id.to_string();
+            }
+        }
+        if let Some(date) = existing.get("date").and_then(|v| v.as_str()) {
+            if !date.is_empty() {
+                self.experiment_date = date.to_string();
             }
         }
     }
@@ -988,7 +999,7 @@ fn main() {
     };
     let experiment_quantise_only = args.quantise_only;
     let experiment_fv_scale = (i32::from(args.qa) * i32::from(args.qb) + args.scale / 2) / args.scale;
-    let experiment_ctx = ExperimentContext::new(
+    let mut experiment_ctx = ExperimentContext::new(
         args.output.clone(),
         args.net_id.clone(),
         std::env::args().collect::<Vec<_>>().join(" "),
@@ -1020,6 +1031,12 @@ fn main() {
         lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
         save_rate: args.save_rate,
     };
+
+    // resume の場合は experiment_id を引き継ぐ。on_checkpoint_saved closure が
+    // experiment_ctx を不変借用する前に行う必要がある。
+    if !experiment_quantise_only && args.resume.is_some() {
+        experiment_ctx.inherit_resume_experiment_id();
+    }
 
     // Local settings
     let output_dir = args.output.to_str().unwrap_or("checkpoints");
@@ -1365,7 +1382,6 @@ fn main() {
                 println!("Done!");
             } else {
                 if let Some(ref resume_path) = args.resume {
-                    experiment_ctx.check_resume_safety();
                     let resume_str = resume_path.to_str().unwrap();
                     println!("Resuming from checkpoint: {}", resume_str);
                     $trainer.load_from_checkpoint(resume_str);

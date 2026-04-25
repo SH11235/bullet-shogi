@@ -757,12 +757,33 @@ where
         None
     }
 
-    fn map_batches<F: FnMut(&[PackedSfenValue]) -> bool>(&self, _: usize, batch_size: usize, mut f: F) {
+    fn map_batches<F: FnMut(&[PackedSfenValue]) -> bool>(
+        &self,
+        start_batch: usize,
+        batch_size: usize,
+        mut f: F,
+    ) {
         let file_paths = self.file_paths.clone();
         let buffer_size = self.buffer_size;
         let filter = self.filter.clone();
 
+        // ===== Resume support (consume-and-drop) =====
+        // .pack は可変長レコード + filter + shuffle のため、bit-exact な seek が
+        // 原理的に困難。expander 段で start_batch * batch_size 個の filter 通過
+        // position を読み飛ばすことで、resume 後に既消費分の position が
+        // 重複学習されることを防ぐ。shuffle 順序は fresh run と一致しないが、
+        // shuffle buffer 程度の範囲でブレるだけで NN 学習にとってはノイズ未満。
+        let positions_to_skip = start_batch.saturating_mul(batch_size);
+        if positions_to_skip > 0 {
+            println!(
+                "[ShogiPackLoader] start_batch={start_batch} (skip {positions_to_skip} positions). \
+                Note: .pack resume is deterministic on the skip boundary but NOT bit-exact w.r.t. shuffle order.",
+            );
+        }
+
         // ----- Stage 1: Reader (ファイル → RawGameData バッチ) -----
+        // 空の Vec は "1 sweep 完了 (= 全ファイル一周)" のマーカーとして downstream に流れ、
+        // shuffle 段の tail flush をトリガーする。
         let reader_buffer_size = 256;
         let (reader_tx, reader_rx) = mpsc::sync_channel::<Vec<RawGameData>>(8);
         let (reader_stop_tx, reader_stop_rx) = mpsc::sync_channel::<bool>(1);
@@ -798,38 +819,55 @@ where
                     }
                 }
 
-                // ファイル末尾の残りバッファを送信
+                // 1 sweep 完了。残りバッファを送信。
                 if !buffer.is_empty() {
                     if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err() {
                         break;
                     }
                     buffer = Vec::with_capacity(reader_buffer_size);
                 }
+                // sweep 終了マーカー (空 Vec)。小規模 corpus でも shuffle buffer が
+                // flush されるよう downstream に通知する。
+                if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(Vec::new()).is_err() {
+                    break;
+                }
             }
         });
 
         // ----- Stage 2: Expander (RawGameData → PackedSfenValue, フィルタ適用) -----
+        // 空 Vec の sweep 終了マーカーは expand せずそのまま downstream へ転送する。
+        // resume の skip カウンタもここで管理する。
         let (expand_tx, expand_rx) = mpsc::sync_channel::<Vec<PackedSfenValue>>(16);
         let (expand_stop_tx, expand_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
+            let mut skipped: usize = 0;
+
             'dataloading: while let Ok(games) = reader_rx.recv() {
                 if expand_stop_rx.try_recv().unwrap_or(false) {
                     reader_stop_tx.send(true).ok();
                     break 'dataloading;
                 }
 
+                let is_sweep_end = games.is_empty();
                 let mut positions = Vec::new();
                 for game in games {
                     let expanded = expand_game(game);
                     for psv in expanded {
-                        if filter(&psv) {
-                            positions.push(psv);
+                        if !filter(&psv) {
+                            continue;
                         }
+                        if skipped < positions_to_skip {
+                            skipped += 1;
+                            continue;
+                        }
+                        positions.push(psv);
                     }
                 }
 
-                if !positions.is_empty() && expand_tx.send(positions).is_err() {
+                // sweep 終了マーカーは空でも必ず流す (shuffle 段の tail flush 用)。
+                let send_needed = is_sweep_end || !positions.is_empty();
+                if send_needed && expand_tx.send(positions).is_err() {
                     reader_stop_tx.send(true).ok();
                     break 'dataloading;
                 }
@@ -837,6 +875,9 @@ where
         });
 
         // ----- Stage 3: Shuffle (バッファ蓄積 → Fisher-Yates シャッフル) -----
+        // 通常はバッファが buffer_size に達した時点で flush するが、
+        // 1 sweep 全体で buffer_size に満たない小規模 corpus の場合に学習が
+        // ハングしないよう、sweep 終了マーカー (空 Vec) を受けたら残バッファを flush する。
         let (shuffle_tx, shuffle_rx) = mpsc::sync_channel::<Vec<PackedSfenValue>>(0);
         let (shuffle_stop_tx, shuffle_stop_rx) = mpsc::sync_channel::<bool>(1);
 
@@ -844,6 +885,7 @@ where
             let mut shuffle_buffer = Vec::with_capacity(buffer_size);
 
             'dataloading: while let Ok(positions) = expand_rx.recv() {
+                let is_sweep_end = positions.is_empty();
                 for entry in positions {
                     shuffle_buffer.push(entry);
 
@@ -857,6 +899,18 @@ where
 
                         shuffle_buffer = Vec::with_capacity(buffer_size);
                     }
+                }
+
+                // tail flush: 1 sweep 通しても buffer_size に満たないケース対応。
+                if is_sweep_end && !shuffle_buffer.is_empty() {
+                    shuffle(&mut shuffle_buffer);
+
+                    if shuffle_stop_rx.try_recv().unwrap_or(false) || shuffle_tx.send(shuffle_buffer).is_err() {
+                        expand_stop_tx.send(true).ok();
+                        break 'dataloading;
+                    }
+
+                    shuffle_buffer = Vec::with_capacity(buffer_size);
                 }
             }
         });

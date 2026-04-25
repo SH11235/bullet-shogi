@@ -883,9 +883,16 @@ where
 
         std::thread::spawn(move || {
             let mut shuffle_buffer = Vec::with_capacity(buffer_size);
+            // filter 全弾き等で「1 sweep 通して 0 position」が連続するとハング検知用。
+            // 2 連続で空 sweep だったら filter 設定ミス or 空データセットと判断し panic する。
+            // (skip 中の sweep は除外: positions_to_skip を消化中は accepted=0 でも正常動作)
+            let mut accepted_in_current_sweep: usize = 0;
+            let mut consecutive_empty_sweeps: usize = 0;
+            const MAX_EMPTY_SWEEPS: usize = 2;
 
             'dataloading: while let Ok(positions) = expand_rx.recv() {
                 let is_sweep_end = positions.is_empty();
+                accepted_in_current_sweep += positions.len();
                 for entry in positions {
                     shuffle_buffer.push(entry);
 
@@ -911,6 +918,23 @@ where
                     }
 
                     shuffle_buffer = Vec::with_capacity(buffer_size);
+                }
+
+                if is_sweep_end {
+                    if accepted_in_current_sweep == 0 {
+                        consecutive_empty_sweeps += 1;
+                        if consecutive_empty_sweeps >= MAX_EMPTY_SWEEPS {
+                            // ここで panic することで reader の無限ループに対する fail-fast を実現する。
+                            // silent に block すると学習が無言でハングし debug が困難なため。
+                            panic!(
+                                "ShogiPackLoader: filter accepted 0 positions in {MAX_EMPTY_SWEEPS} consecutive \
+                                sweeps. Filter is too restrictive or the .pack corpus contains no usable data.",
+                            );
+                        }
+                    } else {
+                        consecutive_empty_sweeps = 0;
+                    }
+                    accepted_in_current_sweep = 0;
                 }
             }
         });

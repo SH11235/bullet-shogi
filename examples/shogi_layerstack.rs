@@ -798,6 +798,9 @@ struct ExperimentContext {
     /// resume 時に既存 experiment.json から引き継いだ history。
     /// build_experiment_log() で現在 process の history とマージされる。
     prior_history: Vec<LossEntry>,
+    /// resume 時に既存 experiment.json から引き継いだ累積学習時間 (秒)。
+    /// build_experiment_log() で現在 process の経過時間に加算される。
+    prior_training_seconds: u64,
 }
 
 impl ExperimentContext {
@@ -835,6 +838,7 @@ impl ExperimentContext {
             training_start: std::time::Instant::now(),
             positions,
             prior_history: Vec::new(),
+            prior_training_seconds: 0,
         }
     }
 
@@ -864,7 +868,8 @@ impl ExperimentContext {
             .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
             .unwrap_or((None, None));
 
-        let training_time_seconds = self.training_start.elapsed().as_secs();
+        let training_time_seconds =
+            self.prior_training_seconds.saturating_add(self.training_start.elapsed().as_secs());
         let (_, last_updated_at) = get_timestamp();
 
         ExperimentLog {
@@ -929,6 +934,16 @@ impl ExperimentContext {
         if let Some(date) = existing.get("date").and_then(|v| v.as_str()) {
             if !date.is_empty() {
                 self.experiment_date = date.to_string();
+            }
+        }
+        if let Some(secs) = existing
+            .get("results")
+            .and_then(|v| v.get("training_time_seconds"))
+            .and_then(|v| v.as_u64())
+        {
+            if secs > 0 {
+                println!("Inheriting prior training time: {} seconds", secs);
+                self.prior_training_seconds = secs;
             }
         }
         if let Some(arr) = existing.get("history").and_then(|v| v.as_array()) {

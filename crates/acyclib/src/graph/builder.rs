@@ -201,7 +201,7 @@ where
                     .unwrap()
                     .dense_mut()
                     .load_from_slice(None, values)
-                    .unwrap(),
+                    .expect("InitSettings::Const: load_from_slice failed (size mismatch?)"),
             };
         }
 

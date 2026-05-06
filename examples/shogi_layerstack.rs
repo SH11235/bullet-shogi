@@ -1202,7 +1202,11 @@ fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score
 mod psqt_material_tests {
     use super::*;
     use bullet_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
-    use bullet_lib::shogi::bona_piece::{E_HAND_PAWN, E_PAWN, F_HAND_PAWN, F_KING, F_PAWN, F_ROOK};
+    use bullet_lib::shogi::bona_piece::{
+        E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER, E_PAWN,
+        F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING, F_PAWN,
+        F_ROOK,
+    };
 
     #[test]
     fn packed_bp_material_signs_and_magnitudes() {
@@ -1214,15 +1218,52 @@ mod psqt_material_tests {
         assert_eq!(table[F_HAND_PAWN as usize], psqt_material::PAWN_CP);
         assert_eq!(table[E_HAND_PAWN as usize], -psqt_material::PAWN_CP);
         assert_eq!(table[F_ROOK as usize], psqt_material::ROOK_CP);
-        // 玉は評価値に寄与しない（pack 後は friend 側平面に統合）
-        assert_eq!(table[F_KING as usize], 0.0);
+
+        // 玉は評価値に寄与しない: pack 後は friend 側 81 マス平面に統合される。
+        // 全 81 スロットが 0 であることを確認。
+        for i in 0..81 {
+            assert_eq!(table[(F_KING + i) as usize], 0.0, "F_KING+{i}");
+        }
 
         // 0 (ダミー) は常に 0
         assert_eq!(table[0], 0.0);
+    }
 
-        // 手駒の枚数スロットは連番で同じ値
-        assert_eq!(table[(F_HAND_PAWN + 17) as usize], psqt_material::PAWN_CP); // 18枚目
-        assert_eq!(table[(F_HAND_PAWN + 18) as usize], 0.0); // 未使用スロット
+    /// 手駒の枚数スロット連番と境界（gap）の 0 を全駒種で検証。
+    /// BonaPiece レイアウト変更時の検出力を上げるための回帰テスト。
+    #[test]
+    fn hand_count_slots_and_gap_boundaries() {
+        use psqt_material::*;
+        let table = build_packed_bp_material_table();
+
+        // 各手駒駒種について：(F_base, E_base, count, value)
+        let cases: &[(u16, u16, u16, f32)] = &[
+            (F_HAND_PAWN, E_HAND_PAWN, 18, PAWN_CP),
+            (F_HAND_LANCE, E_HAND_LANCE, 4, LANCE_CP),
+            (F_HAND_KNIGHT, E_HAND_KNIGHT, 4, KNIGHT_CP),
+            (F_HAND_SILVER, E_HAND_SILVER, 4, SILVER_CP),
+            (F_HAND_GOLD, E_HAND_GOLD, 4, GOLD_CP),
+            (F_HAND_BISHOP, E_HAND_BISHOP, 2, BISHOP_CP),
+            (F_HAND_ROOK, E_HAND_ROOK, 2, ROOK_CP),
+        ];
+
+        for &(f_base, e_base, count, value) in cases {
+            // 友 / 敵: count 個の連続スロットが ±value、count 個目（0-index で count）は gap
+            for i in 0..count {
+                assert_eq!(table[(f_base + i) as usize], value, "F base={f_base} i={i}");
+                assert_eq!(table[(e_base + i) as usize], -value, "E base={e_base} i={i}");
+            }
+            // 友/敵の各駒種スロット直後は次の駒種までの gap (=0)。
+            // ただし E_HAND_ROOK+2 = 90 = F_PAWN（盤上）なので gap は手駒領域内 (<F_PAWN) のみ検証。
+            let f_gap = f_base + count;
+            let e_gap = e_base + count;
+            if f_gap < F_PAWN {
+                assert_eq!(table[f_gap as usize], 0.0, "F gap base={f_base}");
+            }
+            if e_gap < F_PAWN {
+                assert_eq!(table[e_gap as usize], 0.0, "E gap base={e_base}");
+            }
+        }
     }
 
     #[test]
@@ -1267,6 +1308,64 @@ mod psqt_material_tests {
         for feat in HALFKA_HM_DIMENSIONS..total {
             for bucket in 0..NUM_BUCKETS {
                 assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0);
+            }
+        }
+    }
+
+    /// 実際の HandThreat / Threat (profile=0) 次元での tail 0 検証。
+    /// 構造体の `num_inputs()` を実値として使用し、定数仮定が崩れた場合の検出力を上げる。
+    #[test]
+    fn material_values_zero_tail_with_real_extension_dims() {
+        const SCALE: f32 = 600.0;
+        let halfka = ShogiHalfKA_hm.num_inputs();
+        assert_eq!(halfka, HALFKA_HM_DIMENSIONS);
+
+        // HandThreat (案 A)
+        {
+            let total = ShogiHalfKaHmHandThreat::new().num_inputs();
+            assert!(total > halfka, "HandThreat input dim must exceed halfka_dim");
+            let vals = compute_psqt_material_values(halfka, total, SCALE);
+            for feat in halfka..total {
+                for bucket in 0..NUM_BUCKETS {
+                    assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0, "HandThreat tail feat={feat}");
+                }
+            }
+        }
+
+        // HandThreat defensive
+        {
+            let total = ShogiHalfKaHmHandThreatDefensive::new().num_inputs();
+            assert!(total > halfka);
+            let vals = compute_psqt_material_values(halfka, total, SCALE);
+            for feat in halfka..total {
+                for bucket in 0..NUM_BUCKETS {
+                    assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0, "HandThreatDefensive tail feat={feat}");
+                }
+            }
+        }
+    }
+
+    /// 全 45 King バケット × 全 9 Output バケットで Material 値が一様であることを
+    /// 駒種ごとに検証。bucket 依存混入の回帰検出力を担保する。
+    #[test]
+    fn material_values_uniform_across_all_king_and_output_buckets() {
+        const SCALE: f32 = 600.0;
+        let vals = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, SCALE);
+        let table = build_packed_bp_material_table();
+
+        // 代表的な駒種：歩(F/E)・飛(F/E)・玉(F)・手駒歩(F/E)
+        let probes: &[u16] = &[F_PAWN, E_PAWN, F_ROOK, F_KING, F_HAND_PAWN, E_HAND_PAWN];
+        for &bp in probes {
+            let expected = table[bp as usize] / SCALE;
+            for kb in 0..NUM_KING_BUCKETS {
+                let feat = kb * PIECE_INPUTS + bp as usize;
+                for bucket in 0..NUM_BUCKETS {
+                    let v = vals[feat * NUM_BUCKETS + bucket];
+                    assert!(
+                        (v - expected).abs() < 1e-6,
+                        "non-uniform at bp={bp} kb={kb} bucket={bucket}: v={v} expected={expected}"
+                    );
+                }
             }
         }
     }
@@ -2020,14 +2119,18 @@ fn main() {
     }
 
     let psqt_init_settings: InitSettings = match (args.psqt, args.psqt_init) {
-        (false, _) | (true, PsqtInit::Zeroed) => InitSettings::Zeroed,
+        (false, _) => InitSettings::Zeroed,
+        (true, PsqtInit::Zeroed) => {
+            println!("PSQT init: Zeroed");
+            InitSettings::Zeroed
+        }
         (true, PsqtInit::Material) => {
             let (scale, scale_label) = if args.wrm_in_scaling.is_some() {
                 (args.wrm_nnue2score, "wrm_nnue2score")
             } else {
                 (args.scale as f32, "scale")
             };
-            println!("PSQT init: Material (centipawn 値 / {scale} [{scale_label}] を float 重みとして使用)",);
+            println!("PSQT init: Material (centipawn 値 / {scale} [{scale_label}] を float 重みとして使用)");
             let values = compute_psqt_material_values(halfka_dim, input_size, scale);
             InitSettings::Const { values }
         }

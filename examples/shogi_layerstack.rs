@@ -260,7 +260,7 @@ struct Args {
     /// - `zeroed`: 0 で初期化（従来動作、v87/v88 互換）
     /// - `material`: 駒の Material 値で初期化（Stockfish 風の prior）
     ///
-    /// `--psqt` が指定されていない場合は無視される。
+    /// `--psqt` が必須（未指定で本フラグを使うと clap がエラーで終了する）。
     #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
     psqt_init: PsqtInit,
 
@@ -1084,7 +1084,8 @@ mod psqt_material {
     pub const DRAGON_CP: f32 = ROOK_CP * 1.2; // 1200
 }
 
-/// packed BonaPiece (0..1629) → Material 値（centipawn、friend=+, enemy=-） のルックアップを構築
+/// packed BonaPiece (0..=1628、計 PIECE_INPUTS=1629 要素) → Material 値
+/// （centipawn、friend=+, enemy=-）のルックアップを構築
 ///
 /// BonaPiece レイアウト (bullet_lib::shogi::bona_piece)：
 /// - 手駒: 1..=89 (未使用スロットあり)

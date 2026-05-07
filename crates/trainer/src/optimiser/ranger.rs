@@ -110,8 +110,10 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
         let device = self.slow_params.device();
         self.op = build_ranger_op(self.slow_params.size(), params.alpha).unwrap().compile(device)?;
         self.k = params.k;
-        // step は意図的にリセットしない: resume 時に set_params が呼ばれた場合でも
-        // load_from_checkpoint で復元した step を保持するため。
+        // `step` は意図的にリセットしない。set_params が `load_from_checkpoint`
+        // の後に呼ばれるパス (例: パラメータ調整付き resume) で、復元済みの
+        // lookahead step counter を維持するため。意図的に counter をクリアしたい
+        // 場合は `reset()` を使う。
         Ok(())
     }
 

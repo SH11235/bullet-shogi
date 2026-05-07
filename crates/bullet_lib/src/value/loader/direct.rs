@@ -38,12 +38,12 @@ impl DirectSequentialDataLoader {
         }
     }
 
-    /// Inter-file round-robin batch interleaving.
+    /// Inter-file round-robin batch interleaving (現状 no-op)。
     ///
-    /// 現状は no-op: caller が batch_size を持たない `map_chunks` trait の
-    /// 上で batch 単位 interleave を表現できないため。非デフォルト値で
-    /// 呼ばれた場合は stderr に WARNING を出して silent drop を防ぐ。
-    /// records 単位 interleave への置換は今後検討。
+    /// `DataLoader::map_chunks` は batch_size を引数に取らないため、ここで batch
+    /// 単位 interleave を表現する手段が無い。引数が default `usize::MAX` (= 切替
+    /// 無し) 以外で渡された場合は stderr に WARNING を出し、要求が静かに失われない
+    /// ようにしている。
     pub fn with_interleave_batches(self, interleave_batches: usize) -> Self {
         if interleave_batches != usize::MAX {
             eprintln!(

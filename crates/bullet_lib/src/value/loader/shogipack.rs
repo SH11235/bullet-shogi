@@ -955,9 +955,9 @@ where
         });
 
         // ----- Stage 4: Flush (shuffle buffer → コールバック) -----
-        // 新 trait `map_chunks` は flat record slice を渡す API なので、
-        // shuffle buffer 全体を 1 chunk として f に渡す。caller (load_and_map_batches)
-        // 側で batch_size 単位の再分割と stop 伝播を行う。
+        // shuffle buffer 全体を 1 chunk として callback `f` に渡す。
+        // batch 単位の分割は `DataLoader::map_chunks` の caller (load_and_map_batches)
+        // が `chunks_exact(batch_size)` で行うため、ここでは行わない。
         'dataloading: while let Ok(shuffle_buffer) = shuffle_rx.recv() {
             if f(&shuffle_buffer) {
                 shuffle_stop_tx.send(true).ok();

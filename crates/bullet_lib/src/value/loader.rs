@@ -170,9 +170,10 @@ pub struct PreparedData<I: SparseInputType, O> {
     pub(crate) buckets: Vec<i32>,
     pub(crate) targets: Vec<f32>,
     pub(crate) weights: Vec<f32>,
-    /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき設定される。
-    /// レイアウトは hand_count_dim × batch_size の flat Vec (列方向 = batch index)。
-    /// dim 情報は consumer 側 (model definition) が保持する前提。
+    /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき
+    /// `Some(hand_count_dim * batch_size)` 長の flat Vec を保持する (列方向 = batch index)。
+    /// 次元数 (`hand_count_dim`) はここでは持たず、consumer (model 定義側) が
+    /// `input_getter.hand_count_dims()` から取得する前提。
     pub(crate) hand_count: Option<Vec<f32>>,
 }
 

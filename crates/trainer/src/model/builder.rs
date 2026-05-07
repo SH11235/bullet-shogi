@@ -33,6 +33,10 @@ use bullet_gpu::{
 
 use crate::model::{Model, Shape, rng};
 
+/// 重みテンソルの初期化方式。
+///
+/// `Const` バリアントが `Vec<f32>` を内部に持つため、enum 全体は `Copy` を実装しない
+/// (`Clone` のみ)。`Copy` を期待していたコードは `.clone()` への置換が必要。
 #[derive(Clone, Debug)]
 pub enum InitSettings {
     Zeroed,
@@ -40,8 +44,9 @@ pub enum InitSettings {
     Uniform { mean: f32, stdev: f32 },
     /// 各重みを明示的な値で初期化する。
     ///
-    /// `values.len()` は対応する重みテンソルの単一バッチサイズと一致する必要がある。
-    /// レイアウトはテンソル内部の保存順（bullet では列優先）に従う。
+    /// `values.len()` は対応する重みテンソルの単一バッチサイズと一致する必要がある
+    /// (mismatch は `assert_eq!` で停止)。レイアウトはテンソル内部の保存順
+    /// (bullet では列優先) に従う。
     Const { values: Vec<f32> },
 }
 

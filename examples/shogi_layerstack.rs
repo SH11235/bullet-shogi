@@ -63,9 +63,9 @@ use bullet_lib::{
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 
-/// 旧 GraphWeights 互換のラッパ。`weight_view(graph, "id").values` で Vec<f32> 直接 index と
-/// `.shape` アクセスを維持するため、新 ModelWeights API の ShapedTValue から
-/// f32 配列と shape を取り出して保持する。
+/// `ModelWeights::get` が返す `ShapedTValue` から f32 配列と shape を取り出して保持する
+/// ヘルパ。量子化保存の `transform` クロージャで重みを flat に走査するために使う。
+/// `TValue::I32` は想定外なので panic。
 struct WeightView {
     values: Vec<f32>,
     #[allow(dead_code)]

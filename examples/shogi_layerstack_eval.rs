@@ -49,9 +49,10 @@ use bullet_lib::{
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
-/// 旧 GraphWeights 互換のラッパ。`weight_view(weights, "id").values` での Vec<f32> 直接 index と
-/// `.shape` アクセスを維持するため、新 ModelWeights API の ShapedTValue から
-/// f32 配列と shape を取り出して保持する。
+/// `ModelWeights::get` が返す `ShapedTValue` から f32 配列と shape を取り出して保持する
+/// ヘルパ。`.values: Vec<f32>` は flat index アクセス用 (列優先)、`.shape` は
+/// 行列 layout の照会用。整数 forward / 量子化ダンプなど、量子化前の float 重みを
+/// 連続バッファとして走査したい箇所で使う。`TValue::I32` は想定外なので panic。
 struct WeightView {
     values: Vec<f32>,
     shape: bullet_lib::nn::Shape,
@@ -695,9 +696,7 @@ fn main() {
     }
     println!();
 
-    // Build network (same as training).
-    // Note: 旧 API の `.use_threads(1)` は削除された。新 trainer は LocalSettings 等で
-    // 設定する。eval のみで forward 1 回しか走らないため、ここでは指定不要。
+    // Build network (same as training). スレッド数の指定は不要 (eval は forward 1 回のみ)。
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(optimiser::Ranger)
@@ -1106,20 +1105,15 @@ fn main() {
 
         let host_data = trainer.state.prepare(std::slice::from_ref(&psv), 1, 1.0, 1.0);
 
-        // 新 API での single-batch forward inference:
-        // 1. Model から device を取り、stream を作成
-        // 2. forward の prealloc (batch_size=1)
-        // 3. host_data → device へ転送 (TensorMap)
-        // 4. 出力 TensorMap を確保
-        // 5. forward 実行 → sync
-        // 6. 出力テンソルを host へ読み戻し
+        // 1 サンプルだけ Model::forward を回して network 出力を読み出す。
+        //   set_fwd_batch_size(1) で forward 用バッファを確保 → host バッチを device に転送
+        //   → 出力 TensorMap を確保 → forward 実行 → SyncOnValue::value() で stream 同期。
         let model = &mut trainer.optimiser.model;
         model.set_fwd_batch_size(1).unwrap();
         let device = model.device();
         let stream = device.new_stream().unwrap();
         let inputs_tensors = host_data.to_device(&device).unwrap();
         let outputs_tensors = model.make_forward_output_tensors(1).unwrap();
-        // SyncOnValue::value() consumes & syncs; forward の戻り値 (Function ref) は破棄。
         model
             .forward(&stream, &inputs_tensors, &outputs_tensors)
             .unwrap()

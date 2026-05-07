@@ -16,6 +16,8 @@ pub unsafe trait CanBeDirectlySequentiallyLoaded: Copy + 'static {}
 #[derive(Clone)]
 pub struct DirectSequentialDataLoader {
     file_paths: Vec<String>,
+    shuffle_each_epoch: bool,
+    shuffle_seed: u64,
 }
 
 impl DirectSequentialDataLoader {
@@ -27,7 +29,7 @@ impl DirectSequentialDataLoader {
             assert!(path_buf.exists(), "File not found: {path}");
         }
 
-        Self { file_paths }
+        Self { file_paths, shuffle_each_epoch: false, shuffle_seed: 0 }
     }
 
     pub fn map_file_sizes<F: FnMut(&str, u64)>(&self, mut f: F) {
@@ -38,11 +40,10 @@ impl DirectSequentialDataLoader {
 
     /// Inter-file round-robin batch interleaving.
     ///
-    /// Currently a no-op: files are always read sequentially end-to-end
-    /// in declaration order. Calling this with a non-default value emits a
-    /// `stderr` warning so callers do not silently lose the requested
-    /// behavior. Restoring the original interleave logic on top of the
-    /// `map_chunks` trait is tracked as future work.
+    /// 現状は no-op: caller が batch_size を持たない `map_chunks` trait の
+    /// 上で batch 単位 interleave を表現できないため。非デフォルト値で
+    /// 呼ばれた場合は stderr に WARNING を出して silent drop を防ぐ。
+    /// records 単位 interleave への置換は今後検討。
     pub fn with_interleave_batches(self, interleave_batches: usize) -> Self {
         if interleave_batches != usize::MAX {
             eprintln!(
@@ -53,20 +54,49 @@ impl DirectSequentialDataLoader {
         self
     }
 
-    /// Per-epoch file order shuffle (deterministic from seed + epoch index).
-    ///
-    /// Currently a no-op: file order stays fixed across epochs. Calling
-    /// with `enabled = true` emits a `stderr` warning. See
-    /// `with_interleave_batches` for restoration plan.
-    pub fn with_epoch_file_shuffle(self, enabled: bool, _seed: u64) -> Self {
-        if enabled {
-            eprintln!(
-                "[DirectSequentialDataLoader] WARNING: with_epoch_file_shuffle(true, ...) is currently a no-op; \
-                 file order will not be shuffled across epochs."
-            );
-        }
+    /// 各エポックでファイルの読み込み順を `seed + epoch_idx` から決定論的に
+    /// シャッフルする。`enabled = false` または `file_paths.len() <= 1` では
+    /// no-op。シャッフルは Fisher-Yates、内部 PRNG は xorshift64。
+    pub fn with_epoch_file_shuffle(mut self, enabled: bool, seed: u64) -> Self {
+        self.shuffle_each_epoch = enabled;
+        self.shuffle_seed = seed;
         self
     }
+}
+
+fn epoch_seed(base_seed: u64, epoch_idx: usize) -> u64 {
+    let mut x = base_seed ^ (epoch_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    if *state == 0 {
+        *state = 0xA076_1D64_78BD_642F;
+    }
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn fisher_yates_shuffle(data: &mut [usize], seed: u64) {
+    let mut state = seed;
+    for i in (1..data.len()).rev() {
+        let j = (xorshift64(&mut state) as usize) % (i + 1);
+        data.swap(i, j);
+    }
+}
+
+fn build_epoch_file_order(num_files: usize, shuffle_each_epoch: bool, seed: u64, epoch_idx: usize) -> Vec<usize> {
+    let mut order = (0..num_files).collect::<Vec<_>>();
+    if shuffle_each_epoch && num_files > 1 {
+        fisher_yates_shuffle(&mut order, epoch_seed(seed, epoch_idx));
+    }
+    order
 }
 
 impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataLoader {
@@ -90,58 +120,58 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
         Some(file_size / data_size)
     }
 
-    fn map_chunks<F: FnMut(&[T]) -> bool>(&self, mut start_position: usize, mut f: F) {
+    fn map_chunks<F: FnMut(&[T]) -> bool>(&self, start_position: usize, mut f: F) {
         let buffer_size_mb = 256;
         let buffer_size = buffer_size_mb * 1024 * 1024;
         let data_size = std::mem::size_of::<T>() as u64;
         let cap = buffer_size / data_size as usize;
 
-        let mut positions_per_epoch = 0;
+        // 1 epoch = 全 file の records 合計
+        let mut positions_per_epoch: u64 = 0;
         self.map_file_sizes(|_, this_size| positions_per_epoch += this_size / data_size);
-        start_position %= positions_per_epoch as usize;
+        let positions_per_epoch = positions_per_epoch as usize;
+        assert!(positions_per_epoch > 0, "No readable records in data files.");
 
-        let mut start_file_idx = 0;
-        let mut net_positions = 0;
-        for file in self.file_paths.iter() {
-            let this_size = std::fs::metadata(file).unwrap().len();
-            let this_positions = this_size / data_size;
-
-            net_positions += this_positions;
-
-            if start_position < net_positions as usize {
-                net_positions -= this_positions;
-                break;
-            } else {
-                start_file_idx += 1;
-            }
-        }
-
-        let mut file_paths = self.file_paths.clone();
-        file_paths.rotate_left(start_file_idx);
-
-        let mut to_skip = start_position - net_positions as usize;
+        // start_position から (epoch_idx, in-epoch offset) を導出
+        let mut epoch_idx = start_position / positions_per_epoch;
+        let mut start_in_epoch = start_position % positions_per_epoch;
 
         let mut buf = unsafe { zeroed_boxed_slice::<T>(cap) };
 
         'dataloading: loop {
-            let mut loader_files = vec![];
-            for file in file_paths.iter() {
-                loader_files.push(File::open(file).unwrap());
+            let order =
+                build_epoch_file_order(self.file_paths.len(), self.shuffle_each_epoch, self.shuffle_seed, epoch_idx);
+
+            if self.shuffle_each_epoch {
+                let order_text =
+                    order.iter().map(|&idx| self.file_paths[idx].as_str()).collect::<Vec<_>>().join(",");
+                eprintln!("[DirectSequentialDataLoader] epoch {epoch_idx}: file order = {order_text}");
             }
 
-            for (mut loader_file, file_path) in loader_files.into_iter().zip(file_paths.iter()) {
+            // 当該 epoch 内で start_in_epoch records をスキップしてから順次読む。
+            // 次 epoch 以降の skip 量は 0 に reset。
+            let mut to_skip = start_in_epoch;
+            start_in_epoch = 0;
+
+            for &file_idx in &order {
+                let file_path = &self.file_paths[file_idx];
+                let this_size = std::fs::metadata(file_path).unwrap().len();
+                let this_positions = (this_size / data_size) as usize;
+
+                if to_skip >= this_positions {
+                    to_skip -= this_positions;
+                    continue;
+                }
+
+                let mut loader_file = File::open(file_path).unwrap();
                 if to_skip > 0 {
-                    println!("Skipping to {to_skip}th entry in file [{file_path}]");
                     loader_file.seek(SeekFrom::Current((to_skip * data_size as usize) as i64)).unwrap();
                     to_skip = 0;
                 }
 
                 loop {
                     let count = loader_file
-                        .read(
-                            // we can cast the type `T` to an array of bytes
-                            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), cap * size_of::<T>()) },
-                        )
+                        .read(unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), cap * size_of::<T>()) })
                         .unwrap_or(0);
 
                     if count == 0 {
@@ -156,6 +186,8 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
                     }
                 }
             }
+
+            epoch_idx += 1;
         }
     }
 }

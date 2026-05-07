@@ -29,7 +29,8 @@ use std::{
     path::PathBuf,
 };
 
-use acyclib::{graph::like::GraphLike, graph::save::GraphWeights, trainer::dataloader::PreparedBatchDevice};
+use bullet_compiler::tensor::TValue;
+use bullet_trainer::model::save::ModelWeights;
 use bullet_lib::{
     game::{
         inputs::{
@@ -47,6 +48,23 @@ use bullet_lib::{
 };
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
+
+/// 旧 GraphWeights 互換のラッパ。`weight_view(weights, "id").values` での Vec<f32> 直接 index と
+/// `.shape` アクセスを維持するため、新 ModelWeights API の ShapedTValue から
+/// f32 配列と shape を取り出して保持する。
+struct WeightView {
+    values: Vec<f32>,
+    shape: bullet_lib::nn::Shape,
+}
+
+fn weight_view(weights: &ModelWeights, id: &str) -> WeightView {
+    let shaped = weights.get(id);
+    let shape = shaped.shape;
+    match shaped.values {
+        TValue::F32(v) => WeightView { values: v, shape },
+        _ => panic!("expected F32 weights for '{id}'"),
+    }
+}
 
 // =============================================================================
 // CLI Arguments
@@ -677,11 +695,12 @@ fn main() {
     }
     println!();
 
-    // Build network (same as training)
+    // Build network (same as training).
+    // Note: 旧 API の `.use_threads(1)` は削除された。新 trainer は LocalSettings 等で
+    // 設定する。eval のみで forward 1 回しか走らないため、ここでは指定不要。
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(optimiser::Ranger)
-        .use_threads(1)
         .inputs(ShogiHalfKA_hm)
         .output_buckets(bucket_impl)
         .save_format(&[]) // No save format needed for eval
@@ -742,15 +761,15 @@ fn main() {
     println!();
 
     if args.debug {
-        let weights = GraphWeights::from(trainer.optimiser.graph.primary());
-        let l0 = weights.get("l0w");
-        let l0b = weights.get("l0b");
-        let l1 = weights.get("l1w");
-        let l2 = weights.get("l2w");
-        let l2b = weights.get("l2b");
-        let l3 = weights.get("l3w");
-        let l3b = weights.get("l3b");
-        let l1f = weights.get("l1fw");
+        let weights = ModelWeights::from(&trainer.optimiser.model);
+        let l0 = weight_view(&weights, "l0w");
+        let l0b = weight_view(&weights, "l0b");
+        let l1 = weight_view(&weights, "l1w");
+        let l2 = weight_view(&weights, "l2w");
+        let l2b = weight_view(&weights, "l2b");
+        let l3 = weight_view(&weights, "l3w");
+        let l3b = weight_view(&weights, "l3b");
+        let l1f = weight_view(&weights, "l1fw");
         let output_dim = l0_size;
 
         const PIECE_INPUTS: usize = 1629;
@@ -878,8 +897,8 @@ fn main() {
                         *w = i32::from_le_bytes(buf4);
                     }
 
-                    let psqt_w = weights.get("psqtw");
-                    let psqt_b = weights.get("psqtb");
+                    let psqt_w = weight_view(&weights, "psqtw");
+                    let psqt_b = weight_view(&weights, "psqtb");
                     let scale = 127.0f32 * 64.0f32; // QA * QB = 8128
 
                     println!("=== PSQT bias sample check (quantised.bin vs weights.bin) ===");
@@ -973,8 +992,8 @@ fn main() {
                 }
 
                 println!("=== L1 bias sample check (quantised.bin vs weights.bin) ===");
-                let l1b = weights.get("l1b");
-                let l1fb = weights.get("l1fb");
+                let l1b = weight_view(&weights, "l1b");
+                let l1fb = weight_view(&weights, "l1fb");
                 let bias_scale = 127.0f32 * 64.0f32; // QA * QB
                 for (idx, &q_file) in l1_biases.iter().enumerate().take(4) {
                     let merged_b = l1b.values[idx] + l1fb.values[idx % l1_size];
@@ -1087,18 +1106,31 @@ fn main() {
 
         let host_data = trainer.state.prepare(std::slice::from_ref(&psv), 1, 1.0, 1.0);
 
-        #[cfg(not(any(feature = "multigpu", feature = "cpu")))]
-        let graph = &mut trainer.optimiser.graph;
+        // 新 API での single-batch forward inference:
+        // 1. Model から device を取り、stream を作成
+        // 2. forward の prealloc (batch_size=1)
+        // 3. host_data → device へ転送 (TensorMap)
+        // 4. 出力 TensorMap を確保
+        // 5. forward 実行 → sync
+        // 6. 出力テンソルを host へ読み戻し
+        let model = &mut trainer.optimiser.model;
+        model.set_fwd_batch_size(1).unwrap();
+        let device = model.device();
+        let stream = device.new_stream().unwrap();
+        let inputs_tensors = host_data.to_device(&device).unwrap();
+        let outputs_tensors = model.make_forward_output_tensors(1).unwrap();
+        // SyncOnValue::value() consumes & syncs; forward の戻り値 (Function ref) は破棄。
+        model
+            .forward(&stream, &inputs_tensors, &outputs_tensors)
+            .unwrap()
+            .value()
+            .unwrap();
 
-        #[cfg(any(feature = "multigpu", feature = "cpu"))]
-        let graph = trainer.optimiser.graph.primary_mut();
-
-        let mut device_data = PreparedBatchDevice::new(graph.devices(), &host_data).unwrap();
-        device_data.load_into_graph(graph).unwrap();
-        graph.synchronise().unwrap();
-        graph.forward().unwrap();
-
-        let vals = trainer.get_output_values();
+        let output_buf = outputs_tensors.get("outputs/output").expect("output tensor not found");
+        let vals = match output_buf.clone().to_host().unwrap() {
+            bullet_compiler::tensor::TValue::F32(v) => v,
+            _ => panic!("expected F32 output for shogi_layerstack_eval"),
+        };
         let raw_output = match vals.as_slice() {
             [score] => *score,
             [loss, draw, win] => {
@@ -1152,7 +1184,7 @@ fn main() {
     if args.dump_intermediates {
         println!();
         println!("=== Float Intermediate Values Dump ===");
-        let weights = GraphWeights::from(trainer.optimiser.graph.primary());
+        let weights = ModelWeights::from(&trainer.optimiser.model);
         dump_float_intermediates(&weights, l0_size, l1_size, l2_size, input_size, &args.pack, args.offset, bucket_impl);
     }
 }
@@ -1254,7 +1286,7 @@ impl FloatIntermediates {
 /// Float forward pass with intermediate dump
 #[allow(clippy::needless_range_loop, clippy::manual_memcpy, clippy::too_many_arguments)]
 fn dump_float_intermediates(
-    weights: &GraphWeights,
+    weights: &ModelWeights,
     l0_size: usize,
     l1_size: usize,
     l2_size: usize,
@@ -1264,18 +1296,18 @@ fn dump_float_intermediates(
     bucket_impl: ShogiLayerStackBucket9,
 ) {
     // Load weights
-    let l0w = weights.get("l0w");
-    let l0b = weights.get("l0b");
-    let l1w = weights.get("l1w");
-    let l1b = weights.get("l1b");
-    let l1fw = weights.get("l1fw");
-    let l1fb = weights.get("l1fb");
-    let l2w = weights.get("l2w");
-    let l2b = weights.get("l2b");
-    let l3w = weights.get("l3w");
-    let l3b = weights.get("l3b");
-    let psqtw = weights.get("psqtw");
-    let psqtb = weights.get("psqtb");
+    let l0w = weight_view(weights, "l0w");
+    let l0b = weight_view(weights, "l0b");
+    let l1w = weight_view(weights, "l1w");
+    let l1b = weight_view(weights, "l1b");
+    let l1fw = weight_view(weights, "l1fw");
+    let l1fb = weight_view(weights, "l1fb");
+    let l2w = weight_view(weights, "l2w");
+    let l2b = weight_view(weights, "l2b");
+    let l3w = weight_view(weights, "l3w");
+    let l3b = weight_view(weights, "l3b");
+    let psqtw = weight_view(weights, "psqtw");
+    let psqtb = weight_view(weights, "psqtb");
 
     // Read one sample from pack file
     let mut file = File::open(pack_path).expect("Failed to open pack file");

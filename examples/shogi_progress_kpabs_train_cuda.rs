@@ -29,8 +29,7 @@ use std::{
     time::Instant,
 };
 
-use bullet_cuda_backend::cudarc::{
-    self,
+use cudarc::{
     driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg},
     nvrtc,
 };

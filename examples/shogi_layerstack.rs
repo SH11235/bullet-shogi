@@ -2210,10 +2210,6 @@ fn main() {
                 .output_buckets($bucket_impl)
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
-            #[cfg(feature = "cpu")]
-            {
-                builder = builder.use_threads(1);
-            }
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }

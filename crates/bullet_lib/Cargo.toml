@@ -17,9 +17,12 @@ bulletformat = "1.8.0"
 montyformat = "0.9.2"
 sfbinpack = "0.6.0"
 viriformat = "2.0.1"
+# cuda feature 有効時のみ使用。shogi_progress_kpabs_train_cuda example が
+# cuda カーネル + driver API を直接叩くため、低水準 cudarc に依存する。
+cudarc = { version = "=0.17.3", features = ["cuda-version-from-build-system"], optional = true }
 
 [features]
-cuda = ["bullet-gpu/cuda", "bullet-trainer/cuda"]
+cuda = ["bullet-gpu/cuda", "bullet-trainer/cuda", "dep:cudarc"]
 rocm = ["bullet-gpu/rocm", "bullet-trainer/rocm"]
 # Threat profile gate. canonical test を除外するために使う build-time フラグ。
 # 通常の build では無効 (= canonical test 有効)。

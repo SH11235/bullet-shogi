@@ -36,19 +36,35 @@ impl DirectSequentialDataLoader {
         }
     }
 
-    /// 複数ファイル間のラウンドロビン読み込み (バッチ単位)。
+    /// Inter-file round-robin batch interleaving.
     ///
-    /// **TODO(upstream-rewrite)**: 旧 fork は `interleave_batches` および
-    /// `shuffle_each_epoch` をサポートしていたが、`map_chunks` への
-    /// trait 変更に伴い実装を一時喪失した。`shogi_layerstack` 等の
-    /// 呼び出し側のコンパイルを通すための no-op stub。
-    /// 元の挙動 (file 単位の sequential read) で動作する。
-    pub fn with_interleave_batches(self, _interleave_batches: usize) -> Self {
+    /// Currently a no-op: files are always read sequentially end-to-end
+    /// in declaration order. Calling this with a non-default value emits a
+    /// `stderr` warning so callers do not silently lose the requested
+    /// behavior. Restoring the original interleave logic on top of the
+    /// `map_chunks` trait is tracked as future work.
+    pub fn with_interleave_batches(self, interleave_batches: usize) -> Self {
+        if interleave_batches != usize::MAX {
+            eprintln!(
+                "[DirectSequentialDataLoader] WARNING: with_interleave_batches({interleave_batches}) is currently a no-op; \
+                 files will be read sequentially end-to-end."
+            );
+        }
         self
     }
 
-    /// エポックごとのファイル順シャッフル。同上の理由で no-op stub。
-    pub fn with_epoch_file_shuffle(self, _enabled: bool, _seed: u64) -> Self {
+    /// Per-epoch file order shuffle (deterministic from seed + epoch index).
+    ///
+    /// Currently a no-op: file order stays fixed across epochs. Calling
+    /// with `enabled = true` emits a `stderr` warning. See
+    /// `with_interleave_batches` for restoration plan.
+    pub fn with_epoch_file_shuffle(self, enabled: bool, _seed: u64) -> Self {
+        if enabled {
+            eprintln!(
+                "[DirectSequentialDataLoader] WARNING: with_epoch_file_shuffle(true, ...) is currently a no-op; \
+                 file order will not be shuffled across epochs."
+            );
+        }
         self
     }
 }

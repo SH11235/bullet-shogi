@@ -29,15 +29,15 @@ use std::{
     time::Instant,
 };
 
-use cudarc::{
-    driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg},
-    nvrtc,
-};
 use bullet_lib::{
     game::outputs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs},
     shogi::PackedSfenValue,
 };
 use clap::Parser;
+use cudarc::{
+    driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg},
+    nvrtc,
+};
 
 const PACK_RECORD_BYTES: usize = size_of::<PackedSfenValue>();
 const ADAM_BETA1: f32 = 0.9;
@@ -301,10 +301,7 @@ fn read_progress_bin(path: &Path) -> io::Result<Vec<f32>> {
             format!("progress.bin size mismatch: got {}, expected {}", bytes.len(), expected),
         ));
     }
-    Ok(bytes
-        .chunks_exact(size_of::<f64>())
-        .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
-        .collect())
+    Ok(bytes.chunks_exact(size_of::<f64>()).map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32).collect())
 }
 
 fn epoch_checkpoint_path(output: &Path, epoch: usize) -> PathBuf {
@@ -736,7 +733,13 @@ struct PrefetchProducer {
 }
 
 impl PrefetchProducer {
-    fn spawn(packs: Vec<PackInfo>, reader_threads: usize, games_per_step: usize, prefetch_depth: usize, max_games: Option<usize>) -> Self {
+    fn spawn(
+        packs: Vec<PackInfo>,
+        reader_threads: usize,
+        games_per_step: usize,
+        prefetch_depth: usize,
+        max_games: Option<usize>,
+    ) -> Self {
         let file_count = packs.len();
         let queue: Arc<Mutex<VecDeque<PackInfo>>> = Arc::new(Mutex::new(VecDeque::from(packs)));
         let (tx, rx) = mpsc::sync_channel::<Batch>(prefetch_depth.max(1));
@@ -864,7 +867,7 @@ fn train_one_epoch(
         trainer.step(&batch, lr)?;
         steps += 1;
 
-        if args.log_interval_steps > 0 && steps % args.log_interval_steps == 0 {
+        if args.log_interval_steps > 0 && steps.is_multiple_of(args.log_interval_steps) {
             trainer.synchronize()?;
             let (loss_sum, _) = trainer.read_loss_hist()?;
             let avg = if samples_total > 0 { loss_sum / samples_total as f64 } else { 0.0 };
@@ -872,8 +875,15 @@ fn train_one_epoch(
             let games_per_sec = games_total as f64 / elapsed.max(1e-9);
             println!(
                 "epoch {}/{} files_done {}/{} steps {} games {} samples {} avg_loss {:.6} games/s {:.0}",
-                epoch, total_epochs, producer.files_done(), producer.file_count(),
-                steps, games_total, samples_total, avg, games_per_sec
+                epoch,
+                total_epochs,
+                producer.files_done(),
+                producer.file_count(),
+                steps,
+                games_total,
+                samples_total,
+                avg,
+                games_per_sec
             );
         }
     }
@@ -964,12 +974,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Baseline val
     let val_max = if args.val_games > 0 { args.val_games } else { 0 };
-    let baseline = evaluate_split(&mut trainer, &val_packs, val_max, args.games_per_step, args.reader_threads, args.prefetch_depth)
-        .map_err(|e| io::Error::other(format!("baseline eval failed: {e}")))?;
+    let baseline = evaluate_split(
+        &mut trainer,
+        &val_packs,
+        val_max,
+        args.games_per_step,
+        args.reader_threads,
+        args.prefetch_depth,
+    )
+    .map_err(|e| io::Error::other(format!("baseline eval failed: {e}")))?;
     let (b_top, b_share) = top_bucket_info(&baseline.bucket_hist);
     println!(
         "baseline val_loss {:.6} samples {} games {} top_bucket b{} ({:.2}%)",
-        baseline.mean_loss, baseline.samples, baseline.games, b_top, b_share * 100.0
+        baseline.mean_loss,
+        baseline.samples,
+        baseline.games,
+        b_top,
+        b_share * 100.0
     );
 
     for epoch in 1..=args.epochs {
@@ -978,38 +999,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (t_top, t_share) = top_bucket_info(&train.bucket_hist);
         println!(
             "epoch {} train_loss {:.6} samples {} games {} steps {} top_bucket b{} ({:.2}%)",
-            epoch, train.mean_loss, train.samples, train.games, train.steps, t_top, t_share * 100.0
+            epoch,
+            train.mean_loss,
+            train.samples,
+            train.games,
+            train.steps,
+            t_top,
+            t_share * 100.0
         );
 
-        let val = evaluate_split(&mut trainer, &val_packs, val_max, args.games_per_step, args.reader_threads, args.prefetch_depth)
-            .map_err(|e| io::Error::other(format!("val eval failed: {e}")))?;
+        let val = evaluate_split(
+            &mut trainer,
+            &val_packs,
+            val_max,
+            args.games_per_step,
+            args.reader_threads,
+            args.prefetch_depth,
+        )
+        .map_err(|e| io::Error::other(format!("val eval failed: {e}")))?;
         let (v_top, v_share) = top_bucket_info(&val.bucket_hist);
         println!(
             "epoch {} val_loss {:.6} samples {} games {} top_bucket b{} ({:.2}%)",
-            epoch, val.mean_loss, val.samples, val.games, v_top, v_share * 100.0
+            epoch,
+            val.mean_loss,
+            val.samples,
+            val.games,
+            v_top,
+            v_share * 100.0
         );
 
         if args.save_each_epoch {
-            let weights = trainer
-                .read_weights()
-                .map_err(|e| io::Error::other(format!("read_weights failed: {e}")))?;
+            let weights = trainer.read_weights().map_err(|e| io::Error::other(format!("read_weights failed: {e}")))?;
             let ckpt = epoch_checkpoint_path(&args.output, epoch);
             write_progress_bin(&ckpt, &weights)?;
             println!("epoch {} checkpoint: {}", epoch, ckpt.display());
         }
     }
 
-    let weights = trainer
-        .read_weights()
-        .map_err(|e| io::Error::other(format!("final read_weights failed: {e}")))?;
+    let weights = trainer.read_weights().map_err(|e| io::Error::other(format!("final read_weights failed: {e}")))?;
     write_progress_bin(&args.output, &weights)?;
     let bytes = fs::metadata(&args.output)?.len();
-    println!(
-        "Wrote {} weights to {} ({} bytes)",
-        SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-        args.output.display(),
-        bytes
-    );
+    println!("Wrote {} weights to {} ({} bytes)", SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, args.output.display(), bytes);
 
     Ok(())
 }

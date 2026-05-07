@@ -224,10 +224,11 @@ fn main() {
         let size = fs::metadata(pa).unwrap().len();
         let records = size / RECORD_SIZE as u64;
         println!(
-            "  {} + {} -> {}  ({} records, {:.1} GB)",
+            "  {} + {} -> {}{}.bin  ({} records, {:.1} GB)",
             pa.file_name().unwrap().to_string_lossy(),
             pb.file_name().unwrap().to_string_lossy(),
-            format!("{}{}.bin", args.output_prefix, suffix),
+            args.output_prefix,
+            suffix,
             records,
             size as f64 / 1e9,
         );

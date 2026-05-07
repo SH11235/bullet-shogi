@@ -30,7 +30,6 @@ use std::{
 };
 
 use bullet_compiler::tensor::TValue;
-use bullet_trainer::model::save::ModelWeights;
 use bullet_lib::{
     game::{
         inputs::{
@@ -46,6 +45,7 @@ use bullet_lib::{
     nn::{Affine, InitSettings, Shape, optimiser},
     value::ValueTrainerBuilder,
 };
+use bullet_trainer::model::save::ModelWeights;
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
@@ -1114,11 +1114,7 @@ fn main() {
         let stream = device.new_stream().unwrap();
         let inputs_tensors = host_data.to_device(&device).unwrap();
         let outputs_tensors = model.make_forward_output_tensors(1).unwrap();
-        model
-            .forward(&stream, &inputs_tensors, &outputs_tensors)
-            .unwrap()
-            .value()
-            .unwrap();
+        model.forward(&stream, &inputs_tensors, &outputs_tensors).unwrap().value().unwrap();
 
         let output_buf = outputs_tensors.get("outputs/output").expect("output tensor not found");
         let vals = match output_buf.clone().to_host().unwrap() {

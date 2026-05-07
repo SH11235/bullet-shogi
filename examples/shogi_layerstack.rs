@@ -40,7 +40,6 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_compiler::tensor::TValue;
-use bullet_trainer::model::save::ModelWeights;
 use bullet_lib::{
     game::inputs::{
         ShogiHalfKA_hm, ShogiHalfKaHmHandCount, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
@@ -62,6 +61,7 @@ use bullet_lib::{
     },
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
+use bullet_trainer::model::save::ModelWeights;
 
 /// `ModelWeights::get` が返す `ShapedTValue` から f32 配列と shape を取り出して保持する
 /// ヘルパ。量子化保存の `transform` クロージャで重みを flat に走査するために使う。
@@ -1225,8 +1225,8 @@ mod psqt_material_tests {
     use bullet_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
     use bullet_lib::shogi::bona_piece::{
         E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER, E_PAWN,
-        F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING, F_PAWN,
-        F_ROOK,
+        F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING,
+        F_PAWN, F_ROOK,
     };
 
     #[test]

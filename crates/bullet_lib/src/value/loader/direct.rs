@@ -143,8 +143,7 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
                 build_epoch_file_order(self.file_paths.len(), self.shuffle_each_epoch, self.shuffle_seed, epoch_idx);
 
             if self.shuffle_each_epoch {
-                let order_text =
-                    order.iter().map(|&idx| self.file_paths[idx].as_str()).collect::<Vec<_>>().join(",");
+                let order_text = order.iter().map(|&idx| self.file_paths[idx].as_str()).collect::<Vec<_>>().join(",");
                 eprintln!("[DirectSequentialDataLoader] epoch {epoch_idx}: file order = {order_text}");
             }
 

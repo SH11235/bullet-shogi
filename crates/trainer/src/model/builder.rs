@@ -40,14 +40,22 @@ use crate::model::{Model, Shape, rng};
 #[derive(Clone, Debug)]
 pub enum InitSettings {
     Zeroed,
-    Normal { mean: f32, stdev: f32 },
-    Uniform { mean: f32, stdev: f32 },
+    Normal {
+        mean: f32,
+        stdev: f32,
+    },
+    Uniform {
+        mean: f32,
+        stdev: f32,
+    },
     /// 各重みを明示的な値で初期化する。
     ///
     /// `values.len()` は対応する重みテンソルの単一バッチサイズと一致する必要がある
     /// (mismatch は `assert_eq!` で停止)。レイアウトはテンソル内部の保存順
     /// (bullet では列優先) に従う。
-    Const { values: Vec<f32> },
+    Const {
+        values: Vec<f32>,
+    },
 }
 
 type InputDesc = (String, Shape, Option<usize>);

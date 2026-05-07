@@ -198,7 +198,7 @@ impl InterleaveOptions {
             let file =
                 File::open(path).with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
             let bytes = file.metadata()?.len() as usize;
-            ensure!(bytes % size == 0, "input file size is not a multiple of {size}: {}", path.display());
+            ensure!(bytes.is_multiple_of(size), "input file size is not a multiple of {size}: {}", path.display());
 
             let records = bytes / size;
             if records > 0 {

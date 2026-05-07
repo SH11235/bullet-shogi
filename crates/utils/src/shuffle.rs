@@ -41,7 +41,7 @@ impl ShuffleOptions {
         ensure!(record_size > 0, "record_size must be at least 1");
         let input_size = fs::metadata(self.input.clone()).with_context(|| "Input file is invalid.")?.len() as usize;
         ensure!(
-            input_size % record_size == 0,
+            input_size.is_multiple_of(record_size),
             "Input file size ({input_size}) is not a multiple of record size ({record_size})"
         );
 

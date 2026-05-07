@@ -132,10 +132,7 @@ fn print_report(label: &str, s: &Stats) {
     println!("  both kings entered (両入玉):     {:>6.2}%", pct(s.both_entered));
     println!("  black king past midline (≤ 4):  {:>6.2}%", pct(s.bk_past_mid));
     println!("  white king past midline (≥ 4):  {:>6.2}%", pct(s.wk_past_mid));
-    println!(
-        "  either king entered: {:>6.2}%",
-        pct(s.bk_entered + s.wk_entered - s.both_entered)
-    );
+    println!("  either king entered: {:>6.2}%", pct(s.bk_entered + s.wk_entered - s.both_entered));
 }
 
 fn main() -> io::Result<()> {

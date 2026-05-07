@@ -33,11 +33,16 @@ use bullet_gpu::{
 
 use crate::model::{Model, Shape, rng};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum InitSettings {
     Zeroed,
     Normal { mean: f32, stdev: f32 },
     Uniform { mean: f32, stdev: f32 },
+    /// 各重みを明示的な値で初期化する。
+    ///
+    /// `values.len()` は対応する重みテンソルの単一バッチサイズと一致する必要がある。
+    /// レイアウトはテンソル内部の保存順（bullet では列優先）に従う。
+    Const { values: Vec<f32> },
 }
 
 type InputDesc = (String, Shape, Option<usize>);
@@ -201,6 +206,16 @@ impl ModelBuilder {
                     InitSettings::Zeroed => vec![0.0; shape.size()],
                     InitSettings::Uniform { mean, stdev } => rng::vec_f32(shape.size(), *mean, *stdev, false),
                     InitSettings::Normal { mean, stdev } => rng::vec_f32(shape.size(), *mean, *stdev, true),
+                    InitSettings::Const { values } => {
+                        assert_eq!(
+                            values.len(),
+                            shape.size(),
+                            "InitSettings::Const: values length {} does not match weight size {}",
+                            values.len(),
+                            shape.size()
+                        );
+                        values.clone()
+                    }
                 };
                 let init = TValue::F32(init);
                 let tensor = Buffer::from_host(&device, &init).unwrap();

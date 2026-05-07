@@ -57,7 +57,7 @@ use std::{path::PathBuf, sync::OnceLock};
 use bullet_lib::{
     game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
     nn::{
-        BackendMarker, NetworkBuilderNode,
+        ModelNode,
         optimiser::{self, AdamWParams, RAdamParams, RangerParams},
     },
     trainer::{
@@ -1272,7 +1272,7 @@ fn main() {
         }
     };
 
-    type Nbn<'a> = NetworkBuilderNode<'a, BackendMarker>;
+    type Nbn<'a> = ModelNode<'a>;
 
     /// Loss function: WRM applied to network output (nodchip style).
     fn loss_fn_wrm<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
@@ -1280,7 +1280,7 @@ fn main() {
             *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
         let offset = 270.0f32;
         let scorenet = output * params.nnue2score;
-        let q = ((scorenet.copy() - offset) / params.in_scaling).sigmoid();
+        let q = ((scorenet - offset) / params.in_scaling).sigmoid();
         let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
         let qf = (1.0 + q - qm) * 0.5;
         qf.squared_error(target)

@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufRead, BufReader, Write},
+    sync::Arc,
+};
 
 use bullet_compiler::{
     ir::IRError,
@@ -105,7 +110,8 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
         let device = self.slow_params.device();
         self.op = build_ranger_op(self.slow_params.size(), params.alpha).unwrap().compile(device)?;
         self.k = params.k;
-        self.step = 0;
+        // step は意図的にリセットしない: resume 時に set_params が呼ばれた場合でも
+        // load_from_checkpoint で復元した step を保持するため。
         Ok(())
     }
 
@@ -117,6 +123,21 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
             single.slow_params.copy_from_host(&TValue::F32(par))?;
         }
 
+        // Restore Ranger lookahead step counter. Missing file (older checkpoints)
+        // is tolerated and leaves step at 0 to preserve backward compatibility.
+        let step_path = format!("{path}/step_ranger.txt");
+        if let Ok(file) = File::open(&step_path) {
+            for line in BufReader::new(file).lines() {
+                let line = line.unwrap();
+                let mut split = line.split(',');
+                let id = split.next().unwrap().to_string();
+                let step: usize = split.next().unwrap().parse().unwrap();
+                if let Some(single) = map.get_mut(&id) {
+                    single.step = step;
+                }
+            }
+        }
+
         let mut map = map.iter_mut().map(|(id, single)| (id.clone(), &mut single.inner)).collect();
         S::load_from_checkpoint(&mut map, path)
     }
@@ -124,6 +145,11 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
     fn write_to_checkpoint(map: &BTreeMap<String, &Self>, path: &str) -> Result<(), G::Error> {
         let slow_params: Vec<_> = map.iter().map(|(id, single)| (id, &single.slow_params)).collect();
         utils::write_weights_to_file::<G>(&slow_params, &format!("{path}/slow.bin"))?;
+
+        let mut file = File::create(format!("{path}/step_ranger.txt")).unwrap();
+        for (id, single) in map.iter() {
+            writeln!(file, "{id},{}", single.step).unwrap();
+        }
 
         let map = map.iter().map(|(id, single)| (id.clone(), &single.inner)).collect();
         S::write_to_checkpoint(&map, path)

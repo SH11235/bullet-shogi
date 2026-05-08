@@ -5,7 +5,7 @@ Differences from `shogi_progress_kpabs_train`:
   - Mini-batches K games per Adam step (`--games-per-step`, default 1024)
     instead of "1 game = 1 step". Convex problem so the optimum is the same;
     convergence trajectory differs.
-  - GPU forward / gradient scatter / Adam step (cudarc + NVRTC).
+  - GPU forward / gradient scatter / Adam step (bullet-gpu raw FFI + NVRTC).
   - `--lr-scale {none, sqrt}` to compensate for batch averaging.
   - `--init-from <progress.bin>` to warm-start from an existing weight file
     (for resume-style runs).
@@ -16,6 +16,7 @@ Only the game-relative training mode is implemented.
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    ffi::c_void,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Write},
     mem::size_of,
@@ -29,15 +30,39 @@ use std::{
     time::Instant,
 };
 
+use bullet_compiler::tensor::{DType, TValue};
+use bullet_gpu::{
+    buffer::Buffer,
+    runtime::{
+        Device, Dim3, Kernel, Module, Stream,
+        cuda::{Cuda, CudaError},
+    },
+};
 use bullet_lib::{
     game::outputs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs},
     shogi::PackedSfenValue,
 };
 use clap::Parser;
-use cudarc::{
-    driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg},
-    nvrtc,
-};
+
+/// Newtype around `bullet_gpu::runtime::cuda::CudaError` so it can flow
+/// through `Box<dyn std::error::Error>` via `?`. The upstream type does not
+/// implement `std::error::Error` (it's marker-typed for the GPU trait), so
+/// we wrap it locally and route through this newtype with `cu(...)?`.
+#[derive(Debug)]
+struct CudaErr(CudaError);
+
+impl std::fmt::Display for CudaErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for CudaErr {}
+
+/// Lift a `Result<_, CudaError>` into the boxed-error world used by `main`.
+fn cu<T>(r: Result<T, CudaError>) -> Result<T, CudaErr> {
+    r.map_err(CudaErr)
+}
 
 const PACK_RECORD_BYTES: usize = size_of::<PackedSfenValue>();
 const ADAM_BETA1: f32 = 0.9;
@@ -419,9 +444,10 @@ extern "C" __global__ void k_eval_loss_hist(
 }
 "#;
 
-fn launch_cfg(n: usize, threads: u32) -> LaunchConfig {
+/// Compute grid dim for a 1-D launch covering `n` items with `threads` threads per block.
+fn grid_dim_for(n: usize, threads: u32) -> Dim3 {
     let blocks = ((n as u32).max(1)).div_ceil(threads);
-    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }
+    Dim3 { x: blocks, y: 1, z: 1 }
 }
 
 // ---------- Host-side batch builder ----------
@@ -474,67 +500,94 @@ impl Batch {
 
 // ---------- GPU trainer ----------
 
+/// Owned device allocation for an arbitrary dtype not supported by `Buffer`
+/// (we need `f64` for loss accumulation and `u64` for the prediction histogram,
+/// both of which use atomic operations on raw device pointers, but bullet-gpu's
+/// `Buffer<G>` only models F32/I32). Allocation goes through `Device::malloc`
+/// directly and the pointer is freed in `Drop`.
+struct RawBuf {
+    device: Arc<Device<Cuda>>,
+    ptr: <Cuda as bullet_gpu::runtime::Gpu>::DevicePtr,
+    bytes: usize,
+}
+
+impl RawBuf {
+    fn zeroed(device: &Arc<Device<Cuda>>, bytes: usize) -> Result<Self, CudaErr> {
+        let ptr = cu(device.malloc(bytes))?;
+        unsafe {
+            cu(device.memset(ptr, bytes, 0))?;
+        }
+        Ok(Self { device: device.clone(), ptr, bytes })
+    }
+
+    fn ptr(&self) -> <Cuda as bullet_gpu::runtime::Gpu>::DevicePtr {
+        self.ptr
+    }
+}
+
+impl Drop for RawBuf {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.free(self.ptr);
+        }
+    }
+}
+
 struct GpuTrainer {
-    stream: Arc<cudarc::driver::CudaStream>,
-    f_forward: CudaFunction,
-    f_grad: CudaFunction,
-    f_adam: CudaFunction,
-    f_eval: CudaFunction,
-    weights: CudaSlice<f32>,
-    m: CudaSlice<f32>,
-    v: CudaSlice<f32>,
-    grad: CudaSlice<f32>,
-    loss_acc: CudaSlice<f64>,
-    hist: CudaSlice<u64>,
+    device: Arc<Device<Cuda>>,
+    stream: Arc<Stream<Cuda>>,
+    // The module is kept alive via the kernels (each `Kernel` holds `Arc<Module>`).
+    f_forward: Kernel<Cuda>,
+    f_grad: Kernel<Cuda>,
+    f_adam: Kernel<Cuda>,
+    f_eval: Kernel<Cuda>,
+    weights: Arc<Buffer<Cuda>>,
+    m: Arc<Buffer<Cuda>>,
+    v: Arc<Buffer<Cuda>>,
+    grad: Arc<Buffer<Cuda>>,
+    loss_acc: RawBuf,
+    hist: RawBuf,
     /// pre-allocated scratch buffers (resized on demand)
-    indices_dev: CudaSlice<i32>,
-    targets_dev: CudaSlice<f32>,
-    norm_dev: CudaSlice<f32>,
-    preds_dev: CudaSlice<f32>,
+    indices_dev: Option<Arc<Buffer<Cuda>>>,
+    targets_dev: Option<Arc<Buffer<Cuda>>>,
+    norm_dev: Option<Arc<Buffer<Cuda>>>,
+    preds_dev: Option<Arc<Buffer<Cuda>>>,
     /// Adam state
     beta1_pow: f32,
     beta2_pow: f32,
 }
 
 impl GpuTrainer {
-    fn new(device_id: usize, init_weights: Option<&[f32]>) -> Result<Self, Box<dyn std::error::Error>> {
-        let ctx = CudaContext::new(device_id)?;
-        ctx.set_blocking_synchronize()?;
-        let stream = ctx.default_stream();
+    fn new(device_id: usize, init_weights: Option<&[f32]>) -> Result<Self, CudaErr> {
+        let device = cu(Device::<Cuda>::new(device_id as i32))?;
+        let stream = cu(device.new_stream())?;
 
-        // Need sm_60+ for atomicAdd(double*) used in loss accumulation. compute_60 covers
-        // Pascal and later GPUs (GTX 10xx, RTX 20xx/30xx/40xx, all data-center cards from P100).
-        let opts = nvrtc::CompileOptions { arch: Some("compute_60"), ..Default::default() };
-        let ptx = nvrtc::compile_ptx_with_opts(KERNELS_SRC, opts)?;
-        let module: Arc<CudaModule> = ctx.load_module(ptx)?;
+        // `Module::new` runs NVRTC compile + module load in one shot. The arch
+        // option is automatically derived from `device.props().arch()` (e.g.
+        // `--gpu-architecture=sm_86`), which covers the sm_60+ requirement of
+        // the `atomicAdd(double*)` we use for loss accumulation.
+        let module = cu(Module::new(device.clone(), KERNELS_SRC))?;
 
-        // Module's CudaFunctions hold Arc<CudaModule> internally, so the module
-        // stays alive through the function handles. The CudaStream similarly
-        // keeps the CudaContext alive.
-        let f_forward = module.load_function("k_forward")?;
-        let f_grad = module.load_function("k_grad_loss_hist")?;
-        let f_adam = module.load_function("k_adam_step")?;
-        let f_eval = module.load_function("k_eval_loss_hist")?;
+        let f_forward = cu(module.clone().get_kernel("k_forward"))?;
+        let f_grad = cu(module.clone().get_kernel("k_grad_loss_hist"))?;
+        let f_adam = cu(module.clone().get_kernel("k_adam_step"))?;
+        let f_eval = cu(module.get_kernel("k_eval_loss_hist"))?;
 
         let n = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
         let weights = if let Some(init) = init_weights {
             assert_eq!(init.len(), n);
-            stream.memcpy_stod(init)?
+            cu(Buffer::from_host(&device, &TValue::F32(init.to_vec())))?
         } else {
-            stream.alloc_zeros::<f32>(n)?
+            cu(Buffer::zeroed(&device, DType::F32, n))?
         };
-        let m = stream.alloc_zeros::<f32>(n)?;
-        let v = stream.alloc_zeros::<f32>(n)?;
-        let grad = stream.alloc_zeros::<f32>(n)?;
-        let loss_acc = stream.alloc_zeros::<f64>(1)?;
-        let hist = stream.alloc_zeros::<u64>(8)?;
-
-        let indices_dev = stream.alloc_zeros::<i32>(0)?;
-        let targets_dev = stream.alloc_zeros::<f32>(0)?;
-        let norm_dev = stream.alloc_zeros::<f32>(0)?;
-        let preds_dev = stream.alloc_zeros::<f32>(0)?;
+        let m = cu(Buffer::zeroed(&device, DType::F32, n))?;
+        let v = cu(Buffer::zeroed(&device, DType::F32, n))?;
+        let grad = cu(Buffer::zeroed(&device, DType::F32, n))?;
+        let loss_acc = RawBuf::zeroed(&device, std::mem::size_of::<f64>())?;
+        let hist = RawBuf::zeroed(&device, 8 * std::mem::size_of::<u64>())?;
 
         Ok(Self {
+            device,
             stream,
             f_forward,
             f_grad,
@@ -546,78 +599,133 @@ impl GpuTrainer {
             grad,
             loss_acc,
             hist,
-            indices_dev,
-            targets_dev,
-            norm_dev,
-            preds_dev,
+            indices_dev: None,
+            targets_dev: None,
+            norm_dev: None,
+            preds_dev: None,
             beta1_pow: 1.0,
             beta2_pow: 1.0,
         })
     }
 
-    fn zero_loss_hist(&mut self) -> Result<(), cudarc::driver::DriverError> {
-        let zero_f = vec![0.0f64; 1];
-        let zero_u = vec![0u64; 8];
-        self.stream.memcpy_htod(&zero_f, &mut self.loss_acc)?;
-        self.stream.memcpy_htod(&zero_u, &mut self.hist)?;
+    fn zero_loss_hist(&mut self) -> Result<(), CudaErr> {
+        // memset to 0 is valid for both f64 0.0 and u64 0.
+        unsafe {
+            cu(self.device.memset(self.loss_acc.ptr(), self.loss_acc.bytes, 0))?;
+            cu(self.device.memset(self.hist.ptr(), self.hist.bytes, 0))?;
+        }
         Ok(())
     }
 
-    fn ensure_scratch(&mut self, n_pos: usize) -> Result<(), cudarc::driver::DriverError> {
+    fn ensure_scratch(&mut self, n_pos: usize) -> Result<(), CudaErr> {
         let need_idx = n_pos * MAX_INDS_PER_POS;
-        if self.indices_dev.len() < need_idx {
-            self.indices_dev = self.stream.alloc_zeros::<i32>(need_idx)?;
+        if self.indices_dev.as_ref().is_none_or(|b| b.size() < need_idx) {
+            self.indices_dev = Some(cu(Buffer::zeroed(&self.device, DType::I32, need_idx))?);
         }
-        if self.targets_dev.len() < n_pos {
-            self.targets_dev = self.stream.alloc_zeros::<f32>(n_pos)?;
-            self.norm_dev = self.stream.alloc_zeros::<f32>(n_pos)?;
-            self.preds_dev = self.stream.alloc_zeros::<f32>(n_pos)?;
+        if self.targets_dev.as_ref().is_none_or(|b| b.size() < n_pos) {
+            self.targets_dev = Some(cu(Buffer::zeroed(&self.device, DType::F32, n_pos))?);
+            self.norm_dev = Some(cu(Buffer::zeroed(&self.device, DType::F32, n_pos))?);
+            self.preds_dev = Some(cu(Buffer::zeroed(&self.device, DType::F32, n_pos))?);
         }
         Ok(())
     }
 
-    fn step(&mut self, batch: &Batch, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
+    /// Upload a host slice into the prefix of a device scratch buffer via
+    /// `Stream::memcpy_h2d`. The safe `Buffer::copy_from_host_async` would
+    /// require the host buffer to exactly match the device buffer size, but
+    /// the scratch buffers are sized to the largest batch ever seen and we
+    /// only write the active prefix.
+    ///
+    /// SAFETY: the destination buffer's allocation must be at least
+    /// `size_of_val(src)` bytes; the host slice must remain valid until the
+    /// stream is synced. Both are guaranteed by `ensure_scratch` and the
+    /// surrounding `step`/`eval_forward` flow which syncs before returning.
+    unsafe fn upload_prefix<T>(&self, dst: &Arc<Buffer<Cuda>>, src: &[T]) -> Result<(), CudaErr> {
+        let bytes = std::mem::size_of_val(src);
+        assert!(
+            bytes <= dst.bytes(),
+            "upload_prefix: host slice ({bytes} bytes) exceeds device buffer ({} bytes)",
+            dst.bytes()
+        );
+        let guard = cu(dst.acquire(self.stream.clone()))?;
+        unsafe {
+            cu(self.stream.memcpy_h2d(src.as_ptr().cast::<c_void>(), guard.ptr(), bytes))?;
+        }
+        // Drop the guard; the actual copy has been queued. We rely on the
+        // caller syncing the stream before re-using the host slice.
+        drop(guard);
+        Ok(())
+    }
+
+    fn step(&mut self, batch: &Batch, lr: f32) -> Result<(), CudaErr> {
         let n_pos = batch.n_positions;
         if n_pos == 0 {
             return Ok(());
         }
         self.ensure_scratch(n_pos)?;
 
-        // upload
-        self.stream.memcpy_htod(&batch.indices, &mut self.indices_dev)?;
-        self.stream.memcpy_htod(&batch.targets, &mut self.targets_dev)?;
-        self.stream.memcpy_htod(&batch.per_pos_norm, &mut self.norm_dev)?;
+        let indices_buf = self.indices_dev.as_ref().unwrap().clone();
+        let targets_buf = self.targets_dev.as_ref().unwrap().clone();
+        let norm_buf = self.norm_dev.as_ref().unwrap().clone();
+        let preds_buf = self.preds_dev.as_ref().unwrap().clone();
 
-        let cfg_pos = launch_cfg(n_pos, 256);
-        let max_inds_i32 = MAX_INDS_PER_POS as i32;
-        let n_pos_i32 = n_pos as i32;
-
-        // forward
+        // Stream-async upload of the active prefixes into the persistent
+        // scratch buffers. The sync at the end of `step` waits for these.
         unsafe {
-            self.stream
-                .launch_builder(&self.f_forward)
-                .arg(&self.indices_dev)
-                .arg(&self.weights)
-                .arg(&mut self.preds_dev)
-                .arg(&n_pos_i32)
-                .arg(&max_inds_i32)
-                .launch(cfg_pos)?;
+            self.upload_prefix(&indices_buf, &batch.indices[..n_pos * MAX_INDS_PER_POS])?;
+            self.upload_prefix(&targets_buf, &batch.targets[..n_pos])?;
+            self.upload_prefix(&norm_buf, &batch.per_pos_norm[..n_pos])?;
         }
 
-        // grad + loss + hist (loss_acc and hist are accumulated across the step)
+        let g_idx = cu(indices_buf.acquire(self.stream.clone()))?;
+        let g_tgt = cu(targets_buf.acquire(self.stream.clone()))?;
+        let g_nrm = cu(norm_buf.acquire(self.stream.clone()))?;
+        let g_pred = cu(preds_buf.acquire(self.stream.clone()))?;
+        let g_w = cu(self.weights.acquire(self.stream.clone()))?;
+        let g_grad = cu(self.grad.acquire(self.stream.clone()))?;
+        let g_m = cu(self.m.acquire(self.stream.clone()))?;
+        let g_v = cu(self.v.acquire(self.stream.clone()))?;
+
+        let n_pos_i32 = n_pos as i32;
+        let max_inds_i32 = MAX_INDS_PER_POS as i32;
+        let grid_pos = grid_dim_for(n_pos, 256);
+
+        // Forward: k_forward(indices, weights, preds, n_pos, max_inds)
         unsafe {
-            self.stream
-                .launch_builder(&self.f_grad)
-                .arg(&self.indices_dev)
-                .arg(&self.preds_dev)
-                .arg(&self.targets_dev)
-                .arg(&self.norm_dev)
-                .arg(&mut self.grad)
-                .arg(&mut self.loss_acc)
-                .arg(&mut self.hist)
-                .arg(&n_pos_i32)
-                .arg(&max_inds_i32)
-                .launch(cfg_pos)?;
+            let p_idx = g_idx.ptr();
+            let p_w = g_w.ptr();
+            let p_pred = g_pred.ptr();
+            let mut args: [*mut c_void; 5] = [
+                (&p_idx as *const _ as *mut c_void),
+                (&p_w as *const _ as *mut c_void),
+                (&p_pred as *const _ as *mut c_void),
+                (&n_pos_i32 as *const _ as *mut c_void),
+                (&max_inds_i32 as *const _ as *mut c_void),
+            ];
+            cu(self.f_forward.launch(&self.stream, grid_pos, 256, args.as_mut_ptr(), 0))?;
+        }
+
+        // Grad + loss + hist accumulator (atomic adds into self.grad / loss_acc / hist).
+        unsafe {
+            let p_idx = g_idx.ptr();
+            let p_pred = g_pred.ptr();
+            let p_tgt = g_tgt.ptr();
+            let p_nrm = g_nrm.ptr();
+            let p_grad = g_grad.ptr();
+            let p_loss = self.loss_acc.ptr();
+            let p_hist = self.hist.ptr();
+            let mut args: [*mut c_void; 9] = [
+                (&p_idx as *const _ as *mut c_void),
+                (&p_pred as *const _ as *mut c_void),
+                (&p_tgt as *const _ as *mut c_void),
+                (&p_nrm as *const _ as *mut c_void),
+                (&p_grad as *const _ as *mut c_void),
+                (&p_loss as *const _ as *mut c_void),
+                (&p_hist as *const _ as *mut c_void),
+                (&n_pos_i32 as *const _ as *mut c_void),
+                (&max_inds_i32 as *const _ as *mut c_void),
+            ];
+            cu(self.f_grad.launch(&self.stream, grid_pos, 256, args.as_mut_ptr(), 0))?;
         }
 
         // Adam step
@@ -625,84 +733,128 @@ impl GpuTrainer {
         self.beta2_pow *= ADAM_BETA2;
         let bc1 = 1.0 - self.beta1_pow;
         let bc2 = 1.0 - self.beta2_pow;
-        let cfg_w = launch_cfg(SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, 256);
-        let n_w = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS as i32;
         let beta1 = ADAM_BETA1;
         let beta2 = ADAM_BETA2;
         let eps = ADAM_EPS;
+        let n_w_i32 = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS as i32;
+        let grid_w = grid_dim_for(SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, 256);
+
         unsafe {
-            self.stream
-                .launch_builder(&self.f_adam)
-                .arg(&mut self.weights)
-                .arg(&mut self.m)
-                .arg(&mut self.v)
-                .arg(&mut self.grad)
-                .arg(&lr)
-                .arg(&beta1)
-                .arg(&beta2)
-                .arg(&eps)
-                .arg(&bc1)
-                .arg(&bc2)
-                .arg(&n_w)
-                .launch(cfg_w)?;
+            let p_w = g_w.ptr();
+            let p_m = g_m.ptr();
+            let p_v = g_v.ptr();
+            let p_grad = g_grad.ptr();
+            let mut args: [*mut c_void; 11] = [
+                (&p_w as *const _ as *mut c_void),
+                (&p_m as *const _ as *mut c_void),
+                (&p_v as *const _ as *mut c_void),
+                (&p_grad as *const _ as *mut c_void),
+                (&lr as *const _ as *mut c_void),
+                (&beta1 as *const _ as *mut c_void),
+                (&beta2 as *const _ as *mut c_void),
+                (&eps as *const _ as *mut c_void),
+                (&bc1 as *const _ as *mut c_void),
+                (&bc2 as *const _ as *mut c_void),
+                (&n_w_i32 as *const _ as *mut c_void),
+            ];
+            cu(self.f_adam.launch(&self.stream, grid_w, 256, args.as_mut_ptr(), 0))?;
         }
+
+        // Sync to ensure all kernels finish before guards are dropped and
+        // before the host-side batch buffer is freed by the caller.
+        cu(self.stream.sync())?;
+        drop((g_idx, g_tgt, g_nrm, g_pred, g_w, g_grad, g_m, g_v));
         Ok(())
     }
 
-    fn eval_forward(&mut self, batch: &Batch) -> Result<(), Box<dyn std::error::Error>> {
+    fn eval_forward(&mut self, batch: &Batch) -> Result<(), CudaErr> {
         let n_pos = batch.n_positions;
         if n_pos == 0 {
             return Ok(());
         }
         self.ensure_scratch(n_pos)?;
-        self.stream.memcpy_htod(&batch.indices, &mut self.indices_dev)?;
-        self.stream.memcpy_htod(&batch.targets, &mut self.targets_dev)?;
 
-        let cfg_pos = launch_cfg(n_pos, 256);
-        let max_inds_i32 = MAX_INDS_PER_POS as i32;
+        let indices_buf = self.indices_dev.as_ref().unwrap().clone();
+        let targets_buf = self.targets_dev.as_ref().unwrap().clone();
+        let preds_buf = self.preds_dev.as_ref().unwrap().clone();
+
+        unsafe {
+            self.upload_prefix(&indices_buf, &batch.indices[..n_pos * MAX_INDS_PER_POS])?;
+            self.upload_prefix(&targets_buf, &batch.targets[..n_pos])?;
+        }
+
+        let g_idx = cu(indices_buf.acquire(self.stream.clone()))?;
+        let g_tgt = cu(targets_buf.acquire(self.stream.clone()))?;
+        let g_pred = cu(preds_buf.acquire(self.stream.clone()))?;
+        let g_w = cu(self.weights.acquire(self.stream.clone()))?;
+
         let n_pos_i32 = n_pos as i32;
+        let max_inds_i32 = MAX_INDS_PER_POS as i32;
+        let grid_pos = grid_dim_for(n_pos, 256);
 
         unsafe {
-            self.stream
-                .launch_builder(&self.f_forward)
-                .arg(&self.indices_dev)
-                .arg(&self.weights)
-                .arg(&mut self.preds_dev)
-                .arg(&n_pos_i32)
-                .arg(&max_inds_i32)
-                .launch(cfg_pos)?;
+            let p_idx = g_idx.ptr();
+            let p_w = g_w.ptr();
+            let p_pred = g_pred.ptr();
+            let mut args: [*mut c_void; 5] = [
+                (&p_idx as *const _ as *mut c_void),
+                (&p_w as *const _ as *mut c_void),
+                (&p_pred as *const _ as *mut c_void),
+                (&n_pos_i32 as *const _ as *mut c_void),
+                (&max_inds_i32 as *const _ as *mut c_void),
+            ];
+            cu(self.f_forward.launch(&self.stream, grid_pos, 256, args.as_mut_ptr(), 0))?;
         }
+
         unsafe {
-            self.stream
-                .launch_builder(&self.f_eval)
-                .arg(&self.preds_dev)
-                .arg(&self.targets_dev)
-                .arg(&mut self.loss_acc)
-                .arg(&mut self.hist)
-                .arg(&n_pos_i32)
-                .launch(cfg_pos)?;
+            let p_pred = g_pred.ptr();
+            let p_tgt = g_tgt.ptr();
+            let p_loss = self.loss_acc.ptr();
+            let p_hist = self.hist.ptr();
+            let mut args: [*mut c_void; 5] = [
+                (&p_pred as *const _ as *mut c_void),
+                (&p_tgt as *const _ as *mut c_void),
+                (&p_loss as *const _ as *mut c_void),
+                (&p_hist as *const _ as *mut c_void),
+                (&n_pos_i32 as *const _ as *mut c_void),
+            ];
+            cu(self.f_eval.launch(&self.stream, grid_pos, 256, args.as_mut_ptr(), 0))?;
         }
+
+        cu(self.stream.sync())?;
+        drop((g_idx, g_tgt, g_pred, g_w));
         Ok(())
     }
 
-    fn read_loss_hist(&mut self) -> Result<(f64, [u64; 8]), Box<dyn std::error::Error>> {
-        let mut loss = vec![0.0f64; 1];
-        let mut hist = vec![0u64; 8];
-        self.stream.memcpy_dtoh(&self.loss_acc, &mut loss)?;
-        self.stream.memcpy_dtoh(&self.hist, &mut hist)?;
-        let mut h = [0u64; 8];
-        h.copy_from_slice(&hist);
-        Ok((loss[0], h))
+    fn read_loss_hist(&mut self) -> Result<(f64, [u64; 8]), CudaErr> {
+        let mut loss = [0.0f64; 1];
+        let mut hist = [0u64; 8];
+        unsafe {
+            cu(self.device.memcpy_d2h(
+                self.loss_acc.ptr(),
+                loss.as_mut_ptr().cast::<c_void>(),
+                std::mem::size_of::<f64>(),
+            ))?;
+            cu(self.device.memcpy_d2h(
+                self.hist.ptr(),
+                hist.as_mut_ptr().cast::<c_void>(),
+                8 * std::mem::size_of::<u64>(),
+            ))?;
+        }
+        Ok((loss[0], hist))
     }
 
-    fn read_weights(&mut self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let mut w = vec![0.0f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
-        self.stream.memcpy_dtoh(&self.weights, &mut w)?;
-        Ok(w)
+    fn read_weights(&mut self) -> Result<Vec<f32>, CudaErr> {
+        let host = cu(self.weights.to_host())?;
+        match host {
+            TValue::F32(v) => Ok(v),
+            other => Err(CudaErr(CudaError::Message(format!("unexpected weights dtype: {:?}", other.dtype())))),
+        }
     }
 
-    fn synchronize(&self) -> Result<(), cudarc::driver::DriverError> {
-        self.stream.synchronize()
+    fn synchronize(&self) -> Result<(), CudaErr> {
+        cu(self.stream.sync())?;
+        Ok(())
     }
 }
 

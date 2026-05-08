@@ -16,7 +16,13 @@ jobs:
             components: clippy
         - run: |
             cargo clippy --workspace
-            CUDA_PATH=. cargo clippy --workspace --features cuda
+            # bullet_lib は shogi_progress_kpabs_train_cuda example のために
+            # cudarc を optional dep として保持している。`cuda` feature を有効に
+            # すると cudarc の build.rs が nvcc を要求するが、GitHub Actions
+            # runner に CUDA toolchain は無いので bullet_lib のみ exclude する。
+            # 残りの crate (bullet-gpu / bullet-trainer 等) は raw FFI 経由で
+            # 動くため CUDA_PATH=. のハックで clippy が通る。
+            CUDA_PATH=. cargo clippy --workspace --exclude bullet_lib --features cuda
             HIP_PATH=. cargo clippy --workspace --features rocm
 
   test:

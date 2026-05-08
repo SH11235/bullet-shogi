@@ -19,7 +19,12 @@ sfbinpack = "0.6.0"
 viriformat = "2.0.1"
 # cuda feature 有効時のみ使用。shogi_progress_kpabs_train_cuda example が
 # cuda カーネル + driver API を直接叩くため、低水準 cudarc に依存する。
-cudarc = { version = "=0.17.3", features = ["cuda-version-from-build-system"], optional = true }
+# `dynamic-loading` は libcuda.so / libnvrtc.so 等を実行時に dlopen する方式で、
+# build 時に nvcc を要求しない (nvcc 無し環境でも clippy / build が通る)。
+# `cuda-12090` で API バージョンを固定 (12.0 系 driver は forward-compatible なため
+# 12.0 以降の host で実行可能)。実行には CUDA driver が host にインストールされている
+# 必要あり。
+cudarc = { version = "=0.17.3", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12090"], optional = true }
 
 [features]
 cuda = ["bullet-gpu/cuda", "bullet-trainer/cuda", "dep:cudarc"]

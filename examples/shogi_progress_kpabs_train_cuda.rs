@@ -566,6 +566,11 @@ impl GpuTrainer {
         // option is automatically derived from `device.props().arch()` (e.g.
         // `--gpu-architecture=sm_86`), which covers the sm_60+ requirement of
         // the `atomicAdd(double*)` we use for loss accumulation.
+        // Note: this targets the running device's exact SM. On environments
+        // where the installed NVRTC is older than the running GPU's SM, NVRTC
+        // can reject the unknown sm_xx target. If that happens, the fallback
+        // is a forward-compatible virtual arch (e.g. `compute_60` PTX) which
+        // currently requires a custom Module builder bypassing `Module::new`.
         let module = cu(Module::new(device.clone(), KERNELS_SRC))?;
 
         let f_forward = cu(module.clone().get_kernel("k_forward"))?;

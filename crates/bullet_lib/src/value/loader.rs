@@ -1,7 +1,7 @@
 mod direct;
 mod montybinpack;
 mod rng;
-mod sfbinpack;
+pub mod sfbinpack;
 pub mod shogipack;
 mod text;
 pub mod viribinpack;
@@ -11,9 +11,8 @@ pub use montybinpack::MontyBinpackLoader;
 pub use sfbinpack::SfBinpackLoader;
 pub use shogipack::ShogiPackLoader;
 pub use text::InMemoryTextLoader;
-pub use viribinpack::ViriBinpackLoader;
+pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 
-use acyclib::device::tensor::Shape;
 use bulletformat::BulletFormat;
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
@@ -59,7 +58,7 @@ pub trait DataLoader<T>: Clone + Send + Sync + 'static {
         None
     }
 
-    fn map_batches<F: FnMut(&[T]) -> bool>(&self, start_batch: usize, batch_size: usize, f: F);
+    fn map_chunks<F: FnMut(&[T]) -> bool>(&self, start_position: usize, f: F);
 }
 
 pub(crate) type B<I> = fn(&<I as SparseInputType>::RequiredDataType, f32) -> f32;
@@ -103,9 +102,46 @@ where
         &self,
         start_batch: usize,
         batch_size: usize,
-        f: F,
+        mut f: F,
     ) {
-        self.loader.map_batches(start_batch, batch_size, f);
+        let mut incomplete_buf = Vec::new();
+
+        self.loader.map_chunks(start_batch * batch_size, |chunk| {
+            let remainder = if !incomplete_buf.is_empty() {
+                let remainder = batch_size - incomplete_buf.len();
+
+                if chunk.len() >= remainder {
+                    incomplete_buf.extend_from_slice(&chunk[..remainder]);
+                    let should_break = f(&incomplete_buf);
+                    incomplete_buf.clear();
+
+                    if should_break {
+                        return true;
+                    }
+                } else {
+                    incomplete_buf.extend_from_slice(chunk);
+                }
+
+                remainder
+            } else {
+                0
+            };
+
+            if chunk.len() >= remainder {
+                let chunks = chunk[remainder..chunk.len()].chunks_exact(batch_size);
+                incomplete_buf.extend_from_slice(chunks.remainder());
+
+                for batch in chunks {
+                    let should_break = f(batch);
+
+                    if should_break {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        });
     }
 
     pub fn prepare(&self, data: &[I::RequiredDataType], threads: usize, blend: f32) -> PreparedData<I, O> {
@@ -124,30 +160,21 @@ where
     }
 }
 
-pub(crate) struct DenseInput {
-    pub value: Vec<f32>,
-    pub shape: Shape,
-}
-
-#[derive(Clone)]
-pub(crate) struct SparseInput {
-    pub value: Vec<i32>,
-    pub max_active: usize,
-    pub shape: Shape,
-}
-
 /// A batch of data, in the correct format for the GPU.
 pub struct PreparedData<I: SparseInputType, O> {
     pub(crate) input_getter: I,
     pub(crate) output_getter: O,
     pub(crate) batch_size: usize,
-    pub(crate) stm: SparseInput,
-    pub(crate) nstm: SparseInput,
-    pub(crate) buckets: SparseInput,
-    pub(crate) targets: DenseInput,
-    pub(crate) weights: DenseInput,
-    /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき設定される。
-    pub(crate) hand_count: Option<DenseInput>,
+    pub(crate) stm: Vec<i32>,
+    pub(crate) nstm: Vec<i32>,
+    pub(crate) buckets: Vec<i32>,
+    pub(crate) targets: Vec<f32>,
+    pub(crate) weights: Vec<f32>,
+    /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき
+    /// `Some(hand_count_dim * batch_size)` 長の flat Vec を保持する (列方向 = batch index)。
+    /// 次元数 (`hand_count_dim`) はここでは持たず、consumer (model 定義側) が
+    /// `input_getter.hand_count_dims()` から取得する前提。
+    pub(crate) hand_count: Option<Vec<f32>>,
 }
 
 impl<I, O> PreparedData<I, O>
@@ -177,41 +204,40 @@ where
         let output_size = if wdl { 3 } else { 1 };
         let sparse_size = max_active * batch_size;
         let hand_count_dims = input_getter.hand_count_dims();
+        let hand_count_dim = hand_count_dims.unwrap_or(0);
 
-        let hand_count_init =
-            hand_count_dims.map(|dims| DenseInput { value: vec![0.0; dims * batch_size], shape: Shape::new(dims, 1) });
+        let hand_count_init = hand_count_dims.map(|dims| vec![0.0; dims * batch_size]);
 
         let mut prep = Self {
             input_getter,
             output_getter,
             batch_size,
-            stm: SparseInput { max_active, value: vec![0; sparse_size], shape: Shape::new(input_size, 1) },
-            nstm: SparseInput { max_active, value: vec![0; sparse_size], shape: Shape::new(input_size, 1) },
-            buckets: SparseInput { max_active: 1, value: vec![0; batch_size], shape: Shape::new(O::BUCKETS, 1) },
-            targets: DenseInput { value: vec![0.0; output_size * batch_size], shape: Shape::new(output_size, 1) },
-            weights: DenseInput { value: vec![0.0; batch_size], shape: Shape::new(1, 1) },
+            stm: vec![0; sparse_size],
+            nstm: vec![0; sparse_size],
+            buckets: vec![0; batch_size],
+            targets: vec![0.0; output_size * batch_size],
+            weights: vec![0.0; batch_size],
             hand_count: hand_count_init,
         };
 
         let sparse_chunk_size = max_active * chunk_size;
 
         // HandCount 用の並列チャンクを事前に materialise。Option は並列ループ内で扱う。
-        let hand_count_dim = hand_count_dims.unwrap_or(0);
         let hand_count_chunk_size = hand_count_dim * chunk_size;
         let num_chunks = batch_size.div_ceil(chunk_size);
         let hand_count_slices: Vec<Option<&mut [f32]>> = if let Some(hc) = prep.hand_count.as_mut() {
-            hc.value.chunks_mut(hand_count_chunk_size).map(Some).collect()
+            hc.chunks_mut(hand_count_chunk_size).map(Some).collect()
         } else {
             (0..num_chunks).map(|_| None).collect()
         };
 
         std::thread::scope(|s| {
             data.chunks(chunk_size)
-                .zip(prep.stm.value.chunks_mut(sparse_chunk_size))
-                .zip(prep.nstm.value.chunks_mut(sparse_chunk_size))
-                .zip(prep.buckets.value.chunks_mut(chunk_size))
-                .zip(prep.targets.value.chunks_mut(output_size * chunk_size))
-                .zip(prep.weights.value.chunks_mut(chunk_size))
+                .zip(prep.stm.chunks_mut(sparse_chunk_size))
+                .zip(prep.nstm.chunks_mut(sparse_chunk_size))
+                .zip(prep.buckets.chunks_mut(chunk_size))
+                .zip(prep.targets.chunks_mut(output_size * chunk_size))
+                .zip(prep.weights.chunks_mut(chunk_size))
                 .zip(hand_count_slices)
                 .for_each(
                     |(

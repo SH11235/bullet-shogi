@@ -203,7 +203,7 @@ fn main() {
 
     println!("File: {file_path}");
     println!("File size: {file_size} bytes ({} records)", total_records);
-    if file_size % RECORD_SIZE as u64 != 0 {
+    if !file_size.is_multiple_of(RECORD_SIZE as u64) {
         println!(
             "WARNING: File size is NOT aligned to {RECORD_SIZE} bytes! Remainder: {} bytes",
             file_size % RECORD_SIZE as u64
@@ -248,7 +248,7 @@ fn main() {
 
         scanned += 1;
 
-        if !quiet && scanned % 50_000_000 == 0 {
+        if !quiet && scanned.is_multiple_of(50_000_000) {
             let elapsed = start.elapsed().as_secs_f64();
             let rate = scanned as f64 / elapsed;
             eprintln!(

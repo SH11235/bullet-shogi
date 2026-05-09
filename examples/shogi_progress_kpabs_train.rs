@@ -482,7 +482,7 @@ fn train_epoch_game_relative(
         samples += game_len;
         games += 1;
 
-        if log_interval > 0 && games % log_interval == 0 {
+        if log_interval > 0 && games.is_multiple_of(log_interval) {
             println!(
                 "epoch {} file {}/{} games {} samples {} avg_loss {:.6} last_game_loss {:.6}",
                 epoch,
@@ -701,7 +701,7 @@ fn train_epoch(
         batches += 1;
         loss_sum += batch_loss;
 
-        if args.log_interval > 0 && (batches % args.log_interval == 0 || samples == args.max_positions) {
+        if args.log_interval > 0 && (batches.is_multiple_of(args.log_interval) || samples == args.max_positions) {
             println!(
                 "epoch {} batch {} samples {} train_loss {:.6}",
                 epoch,

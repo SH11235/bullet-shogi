@@ -39,6 +39,7 @@ Options:
 
 use std::{path::PathBuf, sync::OnceLock};
 
+use bullet_compiler::tensor::TValue;
 use bullet_lib::{
     game::inputs::{
         ShogiHalfKA_hm, ShogiHalfKaHmHandCount, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
@@ -50,7 +51,7 @@ use bullet_lib::{
         ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
     },
     nn::{
-        Affine, BackendMarker, InitSettings, NetworkBuilderNode, Shape,
+        Affine, InitSettings, ModelNode, Shape,
         optimiser::{self, AdamWParams, RAdamParams, RangerParams},
     },
     trainer::{
@@ -60,6 +61,25 @@ use bullet_lib::{
     },
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
+use bullet_trainer::model::save::ModelWeights;
+
+/// `ModelWeights::get` が返す `ShapedTValue` から f32 配列と shape を取り出して保持する
+/// ヘルパ。量子化保存の `transform` クロージャで重みを flat に走査するために使う。
+/// `TValue::I32` は想定外なので panic。
+struct WeightView {
+    values: Vec<f32>,
+    #[allow(dead_code)]
+    shape: bullet_lib::nn::Shape,
+}
+
+fn weight_view(weights: &ModelWeights, id: &str) -> WeightView {
+    let shaped = weights.get(id);
+    let shape = shaped.shape;
+    match shaped.values {
+        TValue::F32(v) => WeightView { values: v, shape },
+        _ => panic!("expected F32 weights for '{id}'"),
+    }
+}
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -1205,8 +1225,8 @@ mod psqt_material_tests {
     use bullet_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
     use bullet_lib::shogi::bona_piece::{
         E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER, E_PAWN,
-        F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING, F_PAWN,
-        F_ROOK,
+        F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING,
+        F_PAWN, F_ROOK,
     };
 
     #[test]
@@ -1494,7 +1514,7 @@ fn build_layerstack_save_format(
     let input_size_captured = input_size;
     let ft_biases_leb128 = SavedFormat::empty()
         .transform(move |graph, _| {
-            let l0b = graph.get("l0b");
+            let l0b = weight_view(graph, "l0b");
             let qa_f = qa_i16 as f64;
             let biases_i16: Vec<i16> = l0b.values.iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
             let leb128_bytes = encode_leb128_tensor_i16(&biases_i16);
@@ -1506,7 +1526,7 @@ fn build_layerstack_save_format(
     let halfka_dim_captured = halfka_dim;
     let ft_weights_leb128 = SavedFormat::empty()
         .transform(move |graph, _| {
-            let l0w = graph.get("l0w");
+            let l0w = weight_view(graph, "l0w");
 
             // Quantise to i16 (scale = QA = 127)
             // Threat 有効時は最初の halfka_dim 特徴量のみ（piece 部分）を書き出す。
@@ -1529,8 +1549,8 @@ fn build_layerstack_save_format(
         Some(
             SavedFormat::empty()
                 .transform(move |graph, _| {
-                    let psqt_w = graph.get("psqtw"); // [NUM_BUCKETS, input_size] column-major
-                    let psqt_b = graph.get("psqtb"); // [NUM_BUCKETS]
+                    let psqt_w = weight_view(graph, "psqtw"); // [NUM_BUCKETS, input_size] column-major
+                    let psqt_b = weight_view(graph, "psqtb"); // [NUM_BUCKETS]
 
                     let scale = (QA as i32 * QB as i32) as f64; // 8128.0
                     let mut bytes: Vec<u8> = Vec::new();
@@ -1570,7 +1590,7 @@ fn build_layerstack_save_format(
         Some(
             SavedFormat::empty()
                 .transform(move |graph, _| {
-                    let l0w = graph.get("l0w");
+                    let l0w = weight_view(graph, "l0w");
                     let qa_f = qa_for_threat as f64;
 
                     // threat 部分: feat halfka_dim..input_size
@@ -1601,7 +1621,7 @@ fn build_layerstack_save_format(
         Some(
             SavedFormat::empty()
                 .transform(move |graph, _| {
-                    let l0w = graph.get("l0w");
+                    let l0w = weight_view(graph, "l0w");
                     let qa_f = qa_for_ht as f64;
 
                     let ht_start = halfka_dim_for_ht * ft_out_for_ht;
@@ -1643,14 +1663,14 @@ fn build_layerstack_save_format(
     let hand_count_dense_dims_captured = hand_count_dense_dims;
     let layerstack_data = SavedFormat::empty()
         .transform(move |graph, _| {
-            let l1w = graph.get("l1w");
-            let l1b = graph.get("l1b");
-            let l1fw = graph.get("l1fw");
-            let l1fb = graph.get("l1fb");
-            let l2w = graph.get("l2w");
-            let l2b = graph.get("l2b");
-            let l3w = graph.get("l3w");
-            let l3b = graph.get("l3b");
+            let l1w = weight_view(graph, "l1w");
+            let l1b = weight_view(graph, "l1b");
+            let l1fw = weight_view(graph, "l1fw");
+            let l1fb = weight_view(graph, "l1fb");
+            let l2w = weight_view(graph, "l2w");
+            let l2b = weight_view(graph, "l2b");
+            let l3w = weight_view(graph, "l3w");
+            let l3b = weight_view(graph, "l3b");
 
             let qb_f = QB as f64;
             let bias_scale_f = bias_scale as f64;
@@ -2153,7 +2173,7 @@ fn main() {
         },
     };
 
-    type Nbn<'a> = NetworkBuilderNode<'a, BackendMarker>;
+    type Nbn<'a> = ModelNode<'a>;
 
     /// Loss function: WRM applied to network output (nodchip style).
     fn loss_fn_wrm<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
@@ -2161,7 +2181,7 @@ fn main() {
             *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
         let offset = 270.0f32;
         let scorenet = output * params.nnue2score;
-        let q = ((scorenet.copy() - offset) / params.in_scaling).sigmoid();
+        let q = ((scorenet - offset) / params.in_scaling).sigmoid();
         let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
         let qf = (1.0 + q - qm) * 0.5;
         qf.squared_error(target)
@@ -2190,10 +2210,6 @@ fn main() {
                 .output_buckets($bucket_impl)
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
-            #[cfg(feature = "cpu")]
-            {
-                builder = builder.use_threads(1);
-            }
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }

@@ -757,7 +757,7 @@ where
         None
     }
 
-    fn map_batches<F: FnMut(&[PackedSfenValue]) -> bool>(&self, start_batch: usize, batch_size: usize, mut f: F) {
+    fn map_chunks<F: FnMut(&[PackedSfenValue]) -> bool>(&self, start_position: usize, mut f: F) {
         let file_paths = self.file_paths.clone();
         let buffer_size = self.buffer_size;
         let filter = self.filter.clone();
@@ -766,7 +766,7 @@ where
         //
         // .pack は (1) 可変長レコード (2) caller 提供 filter (3) shuffle buffer の
         // 3 要素により bit-exact な seek が原理的に不可能。本実装は expander 段で
-        // start_batch * batch_size 個の filter 通過 position を input 順序で
+        // start_position 個の filter 通過 position を input 順序で
         // 読み飛ばす "best-effort consume-and-drop" を採用している。
         //
         // **既知の限界**: shuffle buffer (= buffer_size 個の position) 単位で見ると、
@@ -786,10 +786,10 @@ where
         // **本 loader を実学習で多用するなら**: shuffle 段の RNG seed を引数化して
         // post-shuffle skip に切り替える、もしくは shuffle window 境界で checkpoint
         // を保存する設計に refactor する必要がある。詳細議論は PR #12 review thread 参照。
-        let positions_to_skip = start_batch.saturating_mul(batch_size);
+        let positions_to_skip = start_position;
         if positions_to_skip > 0 {
             eprintln!(
-                "[ShogiPackLoader] WARNING: start_batch={start_batch} (skip {positions_to_skip} positions). \n\
+                "[ShogiPackLoader] WARNING: start_position={start_position} (skip {positions_to_skip} positions). \n\
                 .pack resume is BEST-EFFORT, NOT bit-exact: ~1 shuffle buffer worth of positions \n\
                 near the resume boundary will be partially replayed and partially never seen. \n\
                 For bit-exact resume, preprocess .pack to .psv and use DirectSequentialDataLoader.",
@@ -954,32 +954,16 @@ where
             }
         });
 
-        // ----- Stage 4: Batch (チャンク分割 → コールバック) -----
-        let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<PackedSfenValue>>(16);
-        let (batch_stop_tx, batch_stop_rx) = mpsc::sync_channel::<bool>(1);
-
-        std::thread::spawn(move || {
-            'dataloading: while let Ok(shuffle_buffer) = shuffle_rx.recv() {
-                for batch in shuffle_buffer.chunks(batch_size) {
-                    if batch_stop_rx.try_recv().unwrap_or(false) || batch_tx.send(batch.to_vec()).is_err() {
-                        shuffle_stop_tx.send(true).ok();
-                        break 'dataloading;
-                    }
-                }
-            }
-        });
-
-        'dataloading: while let Ok(inputs) = batch_rx.recv() {
-            for batch in inputs.chunks(batch_size) {
-                let should_break = f(batch);
-                if should_break {
-                    batch_stop_tx.send(true).ok();
-                    break 'dataloading;
-                }
+        // ----- Stage 4: Flush (shuffle buffer → コールバック) -----
+        // shuffle buffer 全体を 1 chunk として callback `f` に渡す。
+        // batch 単位の分割は `DataLoader::map_chunks` の caller (load_and_map_batches)
+        // が `chunks_exact(batch_size)` で行うため、ここでは行わない。
+        'dataloading: while let Ok(shuffle_buffer) = shuffle_rx.recv() {
+            if f(&shuffle_buffer) {
+                shuffle_stop_tx.send(true).ok();
+                break 'dataloading;
             }
         }
-
-        drop(batch_rx);
     }
 }
 

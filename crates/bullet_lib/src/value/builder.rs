@@ -135,11 +135,17 @@ where
 
         let output_size = if self.wdl_output { 3 } else { 1 };
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
-        let (out, loss) = f(inputs, nnz, targets, &builder);
+        let (out, mut loss) = f(inputs, nnz, targets, &builder);
 
         if self.weight_getter.is_some() {
             let entry_weights = builder.new_dense_input("entry_weights", Shape::new(1, 1));
-            let _ = entry_weights * loss;
+            // The multiplication result must be reassigned to `loss`. Otherwise
+            // `EliminateUnusedOperations` (in `CanonicalisePass::all()`) prunes
+            // the multiplication node — its output has no children and is not
+            // a registered IR output — and the entry-weights mask never reaches
+            // either the loss value or the gradients, silently no-op'ing
+            // `datapoint_weight_function`.
+            loss = entry_weights * loss;
         }
 
         let model = builder.build(Device::<ExecutionContext>::new(0).unwrap(), loss, out);

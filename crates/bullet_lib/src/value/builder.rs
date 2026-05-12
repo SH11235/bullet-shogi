@@ -139,12 +139,8 @@ where
 
         if self.weight_getter.is_some() {
             let entry_weights = builder.new_dense_input("entry_weights", Shape::new(1, 1));
-            // The multiplication result must be reassigned to `loss`. Otherwise
-            // `EliminateUnusedOperations` (in `CanonicalisePass::all()`) prunes
-            // the multiplication node — its output has no children and is not
-            // a registered IR output — and the entry-weights mask never reaches
-            // either the loss value or the gradients, silently no-op'ing
-            // `datapoint_weight_function`.
+            // Reassign to `loss` so the multiplication stays connected to the registered
+            // output and is not pruned by `EliminateUnusedOperations`.
             loss = entry_weights * loss;
         }
 

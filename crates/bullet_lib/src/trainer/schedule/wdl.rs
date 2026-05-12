@@ -4,6 +4,13 @@ use bullet_trainer::run::logger::ansi;
 
 /// WDL lambda scheduling. Types implementing this trait output a WDL lambda
 /// at each point in training, indexed by batch and superbatch.
+///
+/// The data loader may call `blend` with `superbatch > max`, because batches
+/// are prefetched past `end_superbatch`. Implementations must saturate at
+/// the endpoint value in that case, mirroring `LrScheduler` decay
+/// schedulers. The downstream consumer (`value/loader.rs`) asserts the
+/// returned lambda lies in `[0, 1]`; constructing a scheduler with endpoint
+/// values outside `[0, 1]` therefore violates the consumer's contract.
 pub trait WdlScheduler: Clone + Debug + Send + Sync + 'static {
     /// The WDL lambda for the current batch and superbatch.
     /// Most schedulers do not depend on the batch index.
@@ -37,7 +44,18 @@ pub struct LinearWDL {
 
 impl WdlScheduler for LinearWDL {
     fn blend(&self, _batch: usize, superbatch: usize, max: usize) -> f32 {
-        let grad = (self.end - self.start) / (max - 1).max(1) as f32;
+        // Saturate at both ends. The LR-side schedulers only guard the high
+        // end because their formula reads `superbatch as f32 / max as f32`
+        // which already evaluates to `0.0` at `superbatch == 0`; this
+        // scheduler interpolates over `(superbatch - 1)` instead, so
+        // `superbatch == 0` would produce `start - grad` without the guard.
+        if max <= 1 || superbatch <= 1 {
+            return self.start;
+        }
+        if superbatch >= max {
+            return self.end;
+        }
+        let grad = (self.end - self.start) / (max - 1) as f32;
         self.start + grad * (superbatch - 1) as f32
     }
 
@@ -88,7 +106,10 @@ impl<First: WdlScheduler, Second: WdlScheduler> WdlScheduler for Sequence<First,
         if superbatch <= midpoint {
             self.first.blend(batch, superbatch, midpoint)
         } else {
-            self.second.blend(batch, superbatch - midpoint, max - midpoint)
+            // `saturating_sub` guards against misconfigured schedules where
+            // `max < midpoint` (e.g. resuming with an `end_superbatch` lower
+            // than the original `first_scheduler_final_superbatch`).
+            self.second.blend(batch, superbatch - midpoint, max.saturating_sub(midpoint))
         }
     }
 
@@ -137,5 +158,92 @@ impl WdlScheduler for WdlSchedulerEnum {
             Self::Constant(s) => s.colourful(),
             Self::Linear(s) => s.colourful(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-6, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn linear_wdl_endpoints() {
+        let s = LinearWDL { start: 0.2, end: 0.8 };
+        approx_eq(s.blend(0, 1, 3), 0.2);
+        approx_eq(s.blend(0, 2, 3), 0.5);
+        approx_eq(s.blend(0, 3, 3), 0.8);
+    }
+
+    #[test]
+    fn linear_wdl_saturates_when_superbatch_exceeds_max() {
+        // Reproduces the dataloader-prefetch case where superbatch overruns
+        // end_superbatch: pre-fix this returned 1.5 and tripped the
+        // `blend in [0, 1]` assertion in `value/loader.rs`.
+        let s = LinearWDL { start: 0.0, end: 1.0 };
+        approx_eq(s.blend(0, 4, 3), 1.0);
+        approx_eq(s.blend(0, 100, 3), 1.0);
+    }
+
+    #[test]
+    fn linear_wdl_clamps_subzero_superbatch() {
+        let s = LinearWDL { start: 0.2, end: 0.8 };
+        approx_eq(s.blend(0, 0, 3), 0.2);
+        approx_eq(s.blend(0, 1, 1), 0.2);
+    }
+
+    #[test]
+    fn linear_wdl_output_always_in_unit_interval_for_valid_endpoints() {
+        let s = LinearWDL { start: 0.1, end: 0.9 };
+        for sb in 0..200 {
+            let v = s.blend(0, sb, 10);
+            assert!((0.0..=1.0).contains(&v), "blend({sb}) = {v} out of range");
+        }
+    }
+
+    #[test]
+    fn linear_wdl_descending_lambda_saturates_correctly() {
+        // start > end: saturation must return the literal endpoints, not the
+        // numeric min/max of the range.
+        let s = LinearWDL { start: 0.8, end: 0.2 };
+        approx_eq(s.blend(0, 1, 5), 0.8);
+        approx_eq(s.blend(0, 5, 5), 0.2);
+        approx_eq(s.blend(0, 100, 5), 0.2);
+    }
+
+    #[test]
+    fn warmup_linear_wdl_overshoot_saturates_to_end() {
+        // Warmup only adjusts the very first superbatch, so any overshoot
+        // must come from the inner LinearWDL saturation.
+        let inner = LinearWDL { start: 0.0, end: 1.0 };
+        let warmup = Warmup { inner, warmup_batches: 4 };
+        approx_eq(warmup.blend(0, 4, 3), 1.0);
+        approx_eq(warmup.blend(0, 999, 3), 1.0);
+    }
+
+    #[test]
+    fn sequence_overshoot_uses_inner_saturation() {
+        // After the midpoint the second scheduler receives shifted
+        // (superbatch - midpoint, max - midpoint); overshoot must saturate.
+        let first = LinearWDL { start: 0.0, end: 0.5 };
+        let second = LinearWDL { start: 0.5, end: 1.0 };
+        let seq = Sequence { first, second, first_scheduler_final_superbatch: 3 };
+        approx_eq(seq.blend(0, 3, 6), 0.5);
+        approx_eq(seq.blend(0, 6, 6), 1.0);
+        approx_eq(seq.blend(0, 100, 6), 1.0);
+    }
+
+    #[test]
+    fn sequence_with_misconfigured_max_does_not_panic() {
+        // max < midpoint can occur when resuming with a shortened schedule.
+        // `saturating_sub` should keep this from underflowing.
+        let first = LinearWDL { start: 0.0, end: 0.5 };
+        let second = LinearWDL { start: 0.5, end: 1.0 };
+        let seq = Sequence { first, second, first_scheduler_final_superbatch: 10 };
+        // superbatch beyond the (shrunk) max — inner saturates at second.start
+        // because `max - midpoint` saturates to 0, hitting the `max <= 1` guard.
+        approx_eq(seq.blend(0, 12, 5), 0.5);
     }
 }

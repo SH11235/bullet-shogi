@@ -71,7 +71,9 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy)]
 struct WrmLossParams {
-    nnue2score: f32,
+    /// network output を centipawn 単位に変換する乗算係数。
+    out_scaling: f32,
+    /// network 側 WRM sigmoid の入力スケール。
     in_scaling: f32,
 }
 
@@ -1279,7 +1281,7 @@ fn main() {
         let params =
             *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
         let offset = 270.0f32;
-        let scorenet = output * params.nnue2score;
+        let scorenet = output * params.out_scaling;
         let q = ((scorenet - offset) / params.in_scaling).sigmoid();
         let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
         let qf = (1.0 + q - qm) * 0.5;
@@ -1293,7 +1295,7 @@ fn main() {
 
     let loss_fn: for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a> = if let Some(in_scaling) = args.wrm_in_scaling {
         WRM_LOSS_PARAMS
-            .set(WrmLossParams { nnue2score: args.scale as f32, in_scaling })
+            .set(WrmLossParams { out_scaling: args.scale as f32, in_scaling })
             .expect("WRM loss parameters should only be initialized once");
         loss_fn_wrm
     } else {

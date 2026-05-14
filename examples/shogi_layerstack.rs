@@ -93,7 +93,10 @@ const QB: i16 = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct WrmLossParams {
-    nnue2score: f32,
+    /// network output を centipawn 単位に変換する乗算係数。
+    /// chess (nnue-pytorch upstream) 既定値は 380。
+    out_scaling: f32,
+    /// network 側 WRM sigmoid の入力スケール。chess 既定値は 340。
     in_scaling: f32,
 }
 
@@ -259,9 +262,9 @@ struct Args {
     /// Scaling factor to convert network output to centipawn score for WRM loss.
     /// Only used when --wrm-in-scaling is set. The raw network output is multiplied
     /// by this value before being passed to the WRM function.
-    /// (nnue-pytorch-nodchip default: 600)
+    /// (nnue-pytorch upstream default: 380; nnue-pytorch-nodchip uses 600)
     #[arg(long, default_value_t = 600.0, requires = "wrm_in_scaling")]
-    wrm_nnue2score: f32,
+    wrm_out_scaling: f32,
 
     /// `|score| >= N` の局面を loss から除外する（weight=0）。
     /// 典型用途: dlshogi 系教師の `±32000` mate-stamp を除く ablation 実験。
@@ -417,8 +420,11 @@ impl Args {
             if !in_scaling.is_finite() || in_scaling <= 0.0 {
                 return Err(format!("--wrm-in-scaling must be a positive finite value (got {})", in_scaling));
             }
-            if !self.wrm_nnue2score.is_finite() || self.wrm_nnue2score <= 0.0 {
-                return Err(format!("--wrm-nnue2score must be a positive finite value (got {})", self.wrm_nnue2score));
+            if !self.wrm_out_scaling.is_finite() || self.wrm_out_scaling <= 0.0 {
+                return Err(format!(
+                    "--wrm-out-scaling must be a positive finite value (got {})",
+                    self.wrm_out_scaling
+                ));
             }
         }
         Ok(())
@@ -1199,13 +1205,14 @@ fn build_packed_bp_material_table() -> [f32; bullet_lib::game::inputs::PIECE_INP
 /// `input_size > halfka_dim` の場合（Threat/HandThreat 結合時）、
 /// halfka 以外の特徴量は 0 で埋める。
 ///
-/// `nnue2score_scale` は centipawn → 内部スケールへの変換係数（通常 `args.wrm_nnue2score`、
-/// デフォルト 600.0）。これで割ることで float 重みが訓練時の net_output スケールに揃う。
-fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score_scale: f32) -> Vec<f32> {
+/// `out_scaling` は centipawn → 内部スケールへの変換係数（WRM 損失の場合は
+/// `args.wrm_out_scaling`、純 sigmoid 損失の場合は `args.scale`）。これで割る
+/// ことで float 重みが訓練時の net_output スケールに揃う。
+fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, out_scaling: f32) -> Vec<f32> {
     use bullet_lib::game::inputs::PIECE_INPUTS;
 
     assert!(input_size >= halfka_dim, "input_size must be >= halfka_dim");
-    assert!(nnue2score_scale > 0.0, "nnue2score_scale must be positive");
+    assert!(out_scaling > 0.0, "out_scaling must be positive");
     assert_eq!(halfka_dim % PIECE_INPUTS, 0, "halfka_dim must be a multiple of PIECE_INPUTS");
 
     let packed_material = build_packed_bp_material_table();
@@ -1217,7 +1224,7 @@ fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score
     for kb in 0..num_king_buckets {
         for (bp, &material) in packed_material.iter().enumerate() {
             let feat = kb * PIECE_INPUTS + bp;
-            let value = material / nnue2score_scale;
+            let value = material / out_scaling;
             let base = feat * NUM_BUCKETS;
             for slot in vals.iter_mut().skip(base).take(NUM_BUCKETS) {
                 *slot = value;
@@ -1949,7 +1956,7 @@ fn main() {
     println!("Weight decay: {}", args.weight_decay);
     println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
     if let Some(in_scaling) = args.wrm_in_scaling {
-        println!("WRM in_scaling: {} nnue2score: {} (network output WRM enabled)", in_scaling, args.wrm_nnue2score);
+        println!("WRM in_scaling: {} out_scaling: {} (network output WRM enabled)", in_scaling, args.wrm_out_scaling);
     }
     match args.score_drop_abs {
         Some(cap) => println!("Score drop abs: |score| >= {} -> weight=0 (record dropped from loss)", cap),
@@ -2116,26 +2123,25 @@ fn main() {
     let l2_in_c = l2_in;
     let use_psqt = args.psqt;
 
-    // PSQT 重みの初期化：
-    // - zeroed: Stockfish 未準拠。v87/v88 互換（学習初期は PSQT なしと等価）
-    // - material: 駒の cp 値 / scale を初期値とする（学習開始から prior あり）
+    // PSQT 重みの初期化方式:
+    // - zeroed:   PSQT を 0 で初期化（学習初期は PSQT なしと等価）
+    // - material: 駒の centipawn material 値を float 重みの初期値とする (prior あり)
     //
-    // スケール選択は学習損失モードに依存する：
-    // - WRM 損失 (`--wrm-in-scaling` 指定) : `scorenet = output * wrm_nnue2score` により
-    //   net_output は「cp / wrm_nnue2score」のスケールで収束するため、重みの divisor
-    //   は `wrm_nnue2score` を用いる。
-    // - 純 sigmoid 損失 (WRM 未指定) : 教師 target は `sigmoid(cp / args.scale)` で
-    //   与えられるため net_output は「cp / args.scale」スケールで収束する。
-    //   divisor は `args.scale` を用いる。
+    // material 初期化で使う除数は学習損失モードで決まる:
+    // - WRM 損失 (`--wrm-in-scaling` 指定) : `scorenet = output * wrm_out_scaling` で
+    //   net_output は「cp / wrm_out_scaling」スケールに収束。divisor は
+    //   `wrm_out_scaling` を用いる
+    // - 純 sigmoid 損失 (WRM 未指定) : target は `sigmoid(cp / args.scale)` で与えられ
+    //   net_output は「cp / args.scale」スケールに収束。divisor は `args.scale` を用いる
     //
-    // 許可しない組合せ（Codex review 指摘）：
+    // 禁止される組合せ:
     // - `--psqt` + `--threat` / `--hand-threat` / `--hand-threat-defensive`
-    //   → PSQT 重みが `input_size` 次元で学習されるが、save format は先頭 `halfka_dim`
-    //      のみ書き出すため、Threat 尾部の学習済み重みが silently drop される。
-    //      rshogi 推論との不整合を避けるため組合せ禁止。
+    //   PSQT 重みは `input_size` 次元で学習されるが save format は先頭 `halfka_dim`
+    //   のみ書き出すため、Threat 尾部の学習済み重みが silently drop され rshogi 推論
+    //   と乖離する
     // - `--psqt-init material` + `--win-rate-model` without `--wrm-in-scaling`
-    //   → target は WRM 変換後、loss は sigmoid なので net_output は logit(WRM(cp))
-    //      空間となり `cp / args.scale` スケールの prior と整合しない。
+    //   target は WRM 変換後、loss は sigmoid なので net_output は logit(WRM(cp))
+    //   空間に収束し、`cp / args.scale` スケールの prior と整合しない
     if args.psqt && input_size > halfka_dim {
         eprintln!(
             "ERROR: --psqt と --threat / --hand-threat / --hand-threat-defensive の組合せは\n\
@@ -2162,7 +2168,7 @@ fn main() {
         }
         (true, PsqtInit::Material) => {
             let (scale, scale_label) = if args.wrm_in_scaling.is_some() {
-                (args.wrm_nnue2score, "wrm_nnue2score")
+                (args.wrm_out_scaling, "wrm_out_scaling")
             } else {
                 (args.scale as f32, "scale")
             };
@@ -2195,7 +2201,7 @@ fn main() {
         let params =
             *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
         let offset = 270.0f32;
-        let scorenet = output * params.nnue2score;
+        let scorenet = output * params.out_scaling;
         let q = ((scorenet - offset) / params.in_scaling).sigmoid();
         let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
         let qf = (1.0 + q - qm) * 0.5;
@@ -2209,7 +2215,7 @@ fn main() {
 
     let loss_fn: for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a> = if let Some(in_scaling) = args.wrm_in_scaling {
         WRM_LOSS_PARAMS
-            .set(WrmLossParams { nnue2score: args.wrm_nnue2score, in_scaling })
+            .set(WrmLossParams { out_scaling: args.wrm_out_scaling, in_scaling })
             .expect("WRM loss parameters should only be initialized once");
         loss_fn_wrm
     } else {

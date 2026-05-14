@@ -65,7 +65,10 @@ use bullet_lib::{
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
         settings::LocalSettings,
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    value::{
+        ValueTrainerBuilder,
+        loader::{DirectSequentialDataLoader, WrmTargetParams},
+    },
 };
 use clap::{Parser, ValueEnum};
 
@@ -1312,7 +1315,7 @@ fn main() {
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
             if $use_win_rate {
-                builder = builder.use_win_rate_model();
+                builder = builder.use_win_rate_model(WrmTargetParams::CHESS_DEFAULT);
             }
             builder.build(|builder, stm_inputs, ntm_inputs| {
                 let l0 = builder.new_affine("l0", input_size, l1_size);
@@ -1342,7 +1345,7 @@ fn main() {
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
             if $use_win_rate {
-                builder = builder.use_win_rate_model();
+                builder = builder.use_win_rate_model(WrmTargetParams::CHESS_DEFAULT);
             }
             builder.build(|builder, stm_inputs, ntm_inputs| {
                 let l0 = builder.new_affine("l0", input_size, l1_size);
@@ -1373,7 +1376,7 @@ fn main() {
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
             if $use_win_rate {
-                builder = builder.use_win_rate_model();
+                builder = builder.use_win_rate_model(WrmTargetParams::CHESS_DEFAULT);
             }
             builder.build(|builder, stm_inputs, ntm_inputs| {
                 let l0 = builder.new_affine("l0", input_size, l1_size);
@@ -1404,7 +1407,7 @@ fn main() {
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
             if $use_win_rate {
-                builder = builder.use_win_rate_model();
+                builder = builder.use_win_rate_model(WrmTargetParams::CHESS_DEFAULT);
             }
             builder.build(|builder, stm_inputs, ntm_inputs| {
                 let l0 = builder.new_affine("l0", input_size, l1_size);

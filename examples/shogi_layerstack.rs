@@ -59,7 +59,10 @@ use bullet_lib::{
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
         settings::LocalSettings,
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    value::{
+        ValueTrainerBuilder,
+        loader::{DirectSequentialDataLoader, WrmTargetParams},
+    },
 };
 use bullet_trainer::model::save::ModelWeights;
 
@@ -266,6 +269,19 @@ struct Args {
     #[arg(long, default_value_t = 600.0, requires = "wrm_in_scaling")]
     wrm_out_scaling: f32,
 
+    /// WRM target sigmoid input scaling (steepness の逆数).
+    /// target = 0.5 * (1 + sigmoid((score - offset) / scaling) - sigmoid((-score - offset) / scaling))
+    /// (nnue-pytorch upstream default: 380, chess 評価値分布向けにチューニング済)
+    /// Requires `--win-rate-model`.
+    #[arg(long, default_value_t = 380.0, requires = "win_rate_model")]
+    wrm_target_scaling: f32,
+
+    /// WRM target sigmoid center offset (target=0.5 となる score 値).
+    /// (nnue-pytorch upstream default: 270)
+    /// Requires `--win-rate-model`.
+    #[arg(long, default_value_t = 270.0, requires = "win_rate_model")]
+    wrm_target_offset: f32,
+
     /// `|score| >= N` の局面を loss から除外する（weight=0）。
     /// 典型用途: dlshogi 系教師の `±32000` mate-stamp を除く ablation 実験。
     /// 未指定時は全局面を学習に使用（デフォルト挙動）。
@@ -425,6 +441,17 @@ impl Args {
                     "--wrm-out-scaling must be a positive finite value (got {})",
                     self.wrm_out_scaling
                 ));
+            }
+        }
+        if self.win_rate_model {
+            if !self.wrm_target_scaling.is_finite() || self.wrm_target_scaling <= 0.0 {
+                return Err(format!(
+                    "--wrm-target-scaling must be a positive finite value (got {})",
+                    self.wrm_target_scaling
+                ));
+            }
+            if !self.wrm_target_offset.is_finite() {
+                return Err(format!("--wrm-target-offset must be a finite value (got {})", self.wrm_target_offset));
             }
         }
         Ok(())
@@ -695,6 +722,12 @@ struct ExperimentParams {
     scale: i32,
     weight_decay: f32,
     win_rate_model: bool,
+    /// WRM target sigmoid 入力スケール (`--wrm-target-scaling`). win_rate_model=true 時のみ意味あり。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrm_target_scaling: Option<f32>,
+    /// WRM target sigmoid 中心オフセット (`--wrm-target-offset`). win_rate_model=true 時のみ意味あり。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrm_target_offset: Option<f32>,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
     /// `None` または省略時は学習に全局面を使用（既存実験との後方互換のため `skip` で省略）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1954,7 +1987,14 @@ fn main() {
     println!("FV_SCALE: {} (QA={}, QB={}, scale={})", fv_scale, QA, QB, args.scale);
     println!("Optimizer: {}", optimizer_name);
     println!("Weight decay: {}", args.weight_decay);
-    println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
+    if args.win_rate_model {
+        let chess_default = (args.wrm_target_scaling - 380.0).abs() < f32::EPSILON
+            && (args.wrm_target_offset - 270.0).abs() < f32::EPSILON;
+        let suffix = if chess_default { " (chess upstream defaults)" } else { "" };
+        println!("WRM target: scaling={} offset={}{}", args.wrm_target_scaling, args.wrm_target_offset, suffix);
+    } else {
+        println!("Win rate model: disabled");
+    }
     if let Some(in_scaling) = args.wrm_in_scaling {
         println!("WRM in_scaling: {} out_scaling: {} (network output WRM enabled)", in_scaling, args.wrm_out_scaling);
     }
@@ -2016,6 +2056,8 @@ fn main() {
         scale: args.scale,
         weight_decay: args.weight_decay,
         win_rate_model: args.win_rate_model,
+        wrm_target_scaling: args.win_rate_model.then_some(args.wrm_target_scaling),
+        wrm_target_offset: args.win_rate_model.then_some(args.wrm_target_offset),
         score_drop_abs: args.score_drop_abs,
         optimizer: optimizer_name.to_string(),
         qa: QA,
@@ -2223,7 +2265,7 @@ fn main() {
     };
 
     macro_rules! build_trainer_with_input {
-        ($opt:expr, $use_win_rate:expr, $bucket_impl:expr, $input:expr) => {{
+        ($opt:expr, $wrm_target:expr, $bucket_impl:expr, $input:expr) => {{
             let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
@@ -2231,8 +2273,8 @@ fn main() {
                 .output_buckets($bucket_impl)
                 .save_format(&save_format)
                 .loss_fn(loss_fn);
-            if $use_win_rate {
-                builder = builder.use_win_rate_model();
+            if let Some(target) = $wrm_target {
+                builder = builder.use_win_rate_model(target);
             }
             if let Some(cap) = args.score_drop_abs {
                 builder = builder.score_drop_abs(cap);
@@ -2341,7 +2383,9 @@ fn main() {
         }};
     }
 
-    let use_win_rate_model = args.win_rate_model;
+    let wrm_target: Option<WrmTargetParams> = args
+        .win_rate_model
+        .then_some(WrmTargetParams { scaling: args.wrm_target_scaling, offset: args.wrm_target_offset });
 
     // 入力型の分岐: threat 有効時は ShogiHalfKaHmThreat、無効時は ShogiHalfKA_hm
     // ジェネリクスが異なるため、各 optimizer × input の組み合わせを展開する
@@ -2349,21 +2393,18 @@ fn main() {
         ($input:expr) => {{
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer =
-                        build_trainer_with_input!(optimiser::AdamW, use_win_rate_model, bucket_impl, $input);
+                    let mut trainer = build_trainer_with_input!(optimiser::AdamW, wrm_target, bucket_impl, $input);
                     trainer.optimiser.set_params(AdamWParams { decay: args.weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer =
-                        build_trainer_with_input!(optimiser::RAdam, use_win_rate_model, bucket_impl, $input);
+                    let mut trainer = build_trainer_with_input!(optimiser::RAdam, wrm_target, bucket_impl, $input);
                     let params = RAdamParams { decay: args.weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer =
-                        build_trainer_with_input!(optimiser::Ranger, use_win_rate_model, bucket_impl, $input);
+                    let mut trainer = build_trainer_with_input!(optimiser::Ranger, wrm_target, bucket_impl, $input);
                     trainer.optimiser.set_params(RangerParams { decay: args.weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }

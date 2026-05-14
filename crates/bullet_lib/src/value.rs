@@ -23,7 +23,7 @@ use crate::{
     },
     value::{
         dataloader::ValueDataLoader,
-        loader::{DefaultDataLoader, LoadableDataType},
+        loader::{DefaultDataLoader, LoadableDataType, WrmTargetParams},
     },
 };
 
@@ -70,7 +70,9 @@ pub struct ValueTrainerState<Inp: SparseInputType, Out> {
     blend_getter: B<Inp>,
     weight_getter: Option<Wgt<Inp>>,
     saved_format: Vec<SavedFormat>,
-    use_win_rate_model: bool,
+    /// `Some(params)` のとき教師 score を WRM target に変換する。
+    /// builder の `use_win_rate_model(WrmTargetParams)` で設定。
+    wrm_target: Option<WrmTargetParams>,
     wdl: bool,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
     /// builder の `score_drop_abs(cap)` で設定。
@@ -95,7 +97,7 @@ where
             self.output_getter,
             self.blend_getter,
             self.weight_getter,
-            self.use_win_rate_model,
+            self.wrm_target,
             self.wdl,
             batch,
             threads,
@@ -137,7 +139,7 @@ where
             self.state.output_getter,
             self.state.blend_getter,
             self.state.weight_getter,
-            self.state.use_win_rate_model,
+            self.state.wrm_target,
             self.state.wdl,
             schedule.eval_scale,
             self.state.score_drop_abs,
@@ -252,7 +254,7 @@ where
             self.state.output_getter,
             self.state.blend_getter,
             self.state.weight_getter,
-            self.state.use_win_rate_model,
+            self.state.wrm_target,
             self.state.wdl,
             schedule.eval_scale,
             self.state.score_drop_abs,

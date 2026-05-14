@@ -63,13 +63,34 @@ pub trait DataLoader<T>: Clone + Send + Sync + 'static {
 
 pub(crate) type B<I> = fn(&<I as SparseInputType>::RequiredDataType, f32) -> f32;
 
+/// 教師スコアを win-rate target に変換する WRM パラメータ。
+///
+/// target = 0.5 * (1 + sigmoid((score - offset) / scaling) - sigmoid((-score - offset) / scaling))
+///
+/// chess (nnue-pytorch upstream) 由来の既定値が `CHESS_DEFAULT`。
+/// 異なるドメイン (将棋の決着スコア帯はチェスより広い) では再チューニングが必要。
+#[derive(Debug, Clone, Copy)]
+pub struct WrmTargetParams {
+    /// sigmoid 入力スケール (steepness の逆数)。
+    pub scaling: f32,
+    /// sigmoid の中心オフセット (target=0.5 となる score)。
+    pub offset: f32,
+}
+
+impl WrmTargetParams {
+    /// chess (nnue-pytorch upstream) 既定値: scaling=380, offset=270。
+    pub const CHESS_DEFAULT: Self = Self { scaling: 380.0, offset: 270.0 };
+}
+
 #[derive(Clone)]
 pub struct DefaultDataLoader<I: SparseInputType, O, D> {
     input_getter: I,
     output_getter: O,
     blend_getter: B<I>,
     weight_getter: Option<Wgt<I>>,
-    use_win_rate_model: bool,
+    /// `Some(params)` のとき教師 score を WRM target に変換する。
+    /// `None` のとき `sigmoid(score / scale)` で変換する (純 sigmoid 損失用)。
+    wrm_target: Option<WrmTargetParams>,
     wdl: bool,
     scale: f32,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外（weight を 0 にする）。
@@ -85,7 +106,7 @@ impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
         output_getter: O,
         blend_getter: B<I>,
         weight_getter: Option<Wgt<I>>,
-        use_win_rate_model: bool,
+        wrm_target: Option<WrmTargetParams>,
         wdl: bool,
         scale: f32,
         score_drop_abs: Option<u16>,
@@ -96,7 +117,7 @@ impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
             output_getter,
             blend_getter,
             weight_getter,
-            use_win_rate_model,
+            wrm_target,
             wdl,
             scale,
             score_drop_abs,
@@ -164,7 +185,7 @@ where
             self.output_getter,
             self.blend_getter,
             self.weight_getter,
-            self.use_win_rate_model,
+            self.wrm_target,
             self.wdl,
             data,
             threads,
@@ -204,7 +225,7 @@ where
         output_getter: O,
         blend_getter: B<I>,
         weight_getter: Option<Wgt<I>>,
-        use_win_rate_model: bool,
+        wrm_target: Option<WrmTargetParams>,
         wdl: bool,
         data: &[I::RequiredDataType],
         threads: usize,
@@ -324,9 +345,9 @@ where
                                     results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
                                 } else {
                                     let score = f32::from(pos.score());
-                                    let score = if use_win_rate_model {
-                                        let p = (score - 270.0) / 380.0;
-                                        let pm = (-score - 270.0) / 380.0;
+                                    let score = if let Some(wrm) = wrm_target {
+                                        let p = (score - wrm.offset) / wrm.scaling;
+                                        let pm = (-score - wrm.offset) / wrm.scaling;
                                         0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
                                     } else {
                                         sigmoid(rscale * score)

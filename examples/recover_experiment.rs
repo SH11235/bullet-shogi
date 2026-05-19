@@ -97,7 +97,14 @@ struct Args {
 // =============================================================================
 
 #[derive(Serialize)]
+struct Generator {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize)]
 struct ExperimentLog {
+    generator: Generator,
     id: String,
     name: String,
     date: String,
@@ -317,9 +324,12 @@ fn main() {
     });
 
     let (id_ts, date) = get_timestamp();
-    let id = format!("{}-{}", id_ts, name);
+    // run 一意な id: 秒精度時刻 + name + process id (nnue-lab の
+    // (tenant, producer_id) upsert キー)。
+    let id = format!("{}-{}-{}", id_ts, name, std::process::id());
 
     let experiment = ExperimentLog {
+        generator: Generator { name: "bullet-shogi".to_string(), version: env!("CARGO_PKG_VERSION").to_string() },
         id,
         name: name.clone(),
         date: date.clone(),

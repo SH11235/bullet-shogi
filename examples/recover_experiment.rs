@@ -97,7 +97,14 @@ struct Args {
 // =============================================================================
 
 #[derive(Serialize)]
+struct Generator {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize)]
 struct ExperimentLog {
+    generator: Generator,
     id: String,
     name: String,
     date: String,
@@ -254,9 +261,41 @@ fn get_timestamp() -> (String, String) {
     (id_ts, date)
 }
 
+/// 上書き対象の experiment.json が既にあれば、その `id` と `date` を読んで返す。
+/// recover を同一 run に再実行したとき producer 側 run id (`id`) を保持し、
+/// nnue-lab の `(tenant_id, producer_id)` upsert が別 row でなく同一 row を更新
+/// するようにする。ファイルが無い / 壊れている / 当該キーが無い場合は `None`。
+fn read_existing_id_date(output_path: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(output_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let id = json.get("id")?.as_str()?.to_string();
+    let date = json.get("date")?.as_str()?.to_string();
+    Some((id, date))
+}
+
 fn main() {
     let args = Args::parse();
     let name = args.name.unwrap_or_else(|| args.net_id.clone());
+
+    // 出力先 experiment.json の path。学習側の write_experiment_json は
+    // output_dir.join(net_id).join("experiment.json") に書く (例: --output
+    // checkpoints --net-id v63 → checkpoints/v63/experiment.json)。recover の
+    // --checkpoint-dir は呼び出し方で 2 粒度ありうる:
+    //   1) 学習の --output と同じ root (例: checkpoints) → checkpoint_dir/<name>/experiment.json
+    //   2) 実験固有ディレクトリ (例: checkpoints/v63) → checkpoint_dir/experiment.json
+    // checkpoint_dir 末尾の component が name と一致するかで判定する。
+    let output_path = args.output.unwrap_or_else(|| {
+        let dir_already_experiment_root = args.checkpoint_dir.file_name().map(|s| s == name.as_str()).unwrap_or(false);
+        if dir_already_experiment_root {
+            args.checkpoint_dir.join("experiment.json")
+        } else {
+            args.checkpoint_dir.join(&name).join("experiment.json")
+        }
+    });
+    if output_path.exists() && !args.force {
+        eprintln!("Error: {} already exists. Use --force to overwrite.", output_path.display());
+        std::process::exit(1);
+    }
 
     // Find latest checkpoint with log.txt
     let checkpoints = collect_checkpoints(&args.checkpoint_dir, &args.net_id);
@@ -316,15 +355,21 @@ fn main() {
         }
     });
 
-    let (id_ts, date) = get_timestamp();
-    let id = format!("{}-{}", id_ts, name);
+    let (id_ts, now_iso) = get_timestamp();
+    // 上書き再実行では既存 experiment.json の id/date を再利用する — recover を
+    // 同一 run に再実行しても producer 側 run id が変わらず、nnue-lab の
+    // (tenant_id, producer_id) upsert が別 row でなく同一 row を更新する。
+    // 新規時の id は run 一意化のため 秒精度時刻 + name + process id とする。
+    let (id, date) = read_existing_id_date(&output_path)
+        .unwrap_or_else(|| (format!("{}-{}-{}", id_ts, name, std::process::id()), now_iso.clone()));
 
     let experiment = ExperimentLog {
+        generator: Generator { name: "bullet-shogi".to_string(), version: env!("CARGO_PKG_VERSION").to_string() },
         id,
         name: name.clone(),
-        date: date.clone(),
+        date,
         status: args.status,
-        last_updated_at: date,
+        last_updated_at: now_iso,
         commit: None,
         command: args.command,
         params: ExperimentParams {
@@ -346,29 +391,6 @@ fn main() {
     };
 
     let json = serde_json::to_string_pretty(&experiment).expect("Failed to serialize JSON");
-
-    // 学習側の write_experiment_json は output_dir.join(net_id).join("experiment.json")
-    // に書く (例: --output checkpoints --net-id v63 → checkpoints/v63/experiment.json)。
-    // recover の --checkpoint-dir は呼び出し方によって 2 つの粒度がありうる:
-    //   1) 学習の --output と同じ root (例: checkpoints) を渡すケース
-    //      → 出力は checkpoint_dir/<net_id>/experiment.json
-    //   2) 実験固有ディレクトリ (例: checkpoints/v63) を渡すケース
-    //      → 出力は checkpoint_dir/experiment.json
-    // checkpoint_dir 末尾の component が net_id と一致するかで判定する。
-    let output_path = args.output.unwrap_or_else(|| {
-        let dir_already_experiment_root = args.checkpoint_dir.file_name().map(|s| s == name.as_str()).unwrap_or(false);
-        if dir_already_experiment_root {
-            args.checkpoint_dir.join("experiment.json")
-        } else {
-            args.checkpoint_dir.join(&name).join("experiment.json")
-        }
-    });
-
-    // Check if file already exists
-    if output_path.exists() && !args.force {
-        eprintln!("Error: {} already exists. Use --force to overwrite.", output_path.display());
-        std::process::exit(1);
-    }
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("Failed to create output directory");

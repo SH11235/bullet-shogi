@@ -673,7 +673,14 @@ fn load_progress_bucket_v2_from_json(path: &PathBuf) -> Result<ShogiProgressBuck
 // =============================================================================
 
 #[derive(Serialize, Clone)]
+struct Generator {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize, Clone)]
 struct ExperimentLog {
+    generator: Generator,
     id: String,
     name: String,
     date: String,
@@ -903,7 +910,9 @@ impl ExperimentContext {
     ) -> Self {
         let commit = get_git_commit();
         let (id_ts, date) = get_timestamp();
-        let id = format!("{}-{}", id_ts, &net_id);
+        // run 一意な id: 秒精度時刻 + net_id + process id。同一秒に同一 net_id で
+        // 複数 run が始まっても衝突しない (nnue-lab の (tenant, producer_id) upsert キー)。
+        let id = format!("{}-{}-{}", id_ts, &net_id, std::process::id());
 
         const PACKED_SFEN_VALUE_SIZE: u64 = 40;
         let positions: u64 = data_name
@@ -960,6 +969,7 @@ impl ExperimentContext {
         let (_, last_updated_at) = get_timestamp();
 
         ExperimentLog {
+            generator: Generator { name: "bullet-shogi".to_string(), version: env!("CARGO_PKG_VERSION").to_string() },
             id: self.experiment_id.clone(),
             name: self.net_id.clone(),
             date: self.experiment_date.clone(),

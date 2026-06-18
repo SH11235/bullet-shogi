@@ -117,7 +117,7 @@ reader 視点」を採る。加えて以下:
 ## 関連リポジトリ
 
 ```
-/mnt/nvme1/development/
+~/development/
 ├── rshogi/               # 推論エンジン本体 (USI engine)
 │   └── crates/engine-core/src/nnue/   # NNUE 推論実装
 ├── nnue-pytorch/         # オリジナル (chess)

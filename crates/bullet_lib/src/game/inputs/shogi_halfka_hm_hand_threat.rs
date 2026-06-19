@@ -683,13 +683,14 @@ mod tests {
         use std::fs::File;
         use std::io::{Read, Write};
 
-        let pack_path = std::env::var("SHOGI_DATA")
-            .map(|d| format!("{d}/teachers/DLSuisho15b_deduped_shuffled.bin"))
+        let shogi_data = std::env::var("SHOGI_DATA")
             .expect("set SHOGI_DATA (共有データ root) to run this ignored snapshot test");
+        let pack_path = std::path::Path::new(&shogi_data).join("teachers/DLSuisho15b_deduped_shuffled.bin");
         const NUM_POSITIONS: usize = 1000;
         const SNAPSHOT_PATH: &str = "/tmp/hand_threat_snapshot.txt";
 
-        let mut file = File::open(&pack_path).unwrap_or_else(|e| panic!("failed to open {pack_path}: {e}"));
+        let mut file =
+            File::open(&pack_path).unwrap_or_else(|e| panic!("failed to open {}: {e}", pack_path.display()));
 
         let input = ShogiHalfKaHmHandThreat::new();
         let mut dump = String::new();

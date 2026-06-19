@@ -657,7 +657,8 @@ mod tests {
     ///
     /// ```bash
     /// # 最適化前に baseline snapshot を取る
-    /// cd /mnt/nvme1/development/bullet-shogi
+    /// cd /path/to/bullet-shogi
+    /// # $SHOGI_DATA を共有データ root に設定しておく (teachers/ から教師データを読む)
     /// cargo test -p bullet_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
     /// cp /tmp/hand_threat_snapshot.txt /tmp/hand_threat_snapshot_before.txt
     ///
@@ -682,11 +683,13 @@ mod tests {
         use std::fs::File;
         use std::io::{Read, Write};
 
-        const PACK_PATH: &str = "/mnt/nvme1/development/bullet-shogi/data/DLSuisho15b_deduped_shuffled.bin";
+        let shogi_data =
+            std::env::var("SHOGI_DATA").expect("set SHOGI_DATA (共有データ root) to run this ignored snapshot test");
+        let pack_path = std::path::Path::new(&shogi_data).join("teachers/DLSuisho15b_deduped_shuffled.bin");
         const NUM_POSITIONS: usize = 1000;
         const SNAPSHOT_PATH: &str = "/tmp/hand_threat_snapshot.txt";
 
-        let mut file = File::open(PACK_PATH).unwrap_or_else(|e| panic!("failed to open {PACK_PATH}: {e}"));
+        let mut file = File::open(&pack_path).unwrap_or_else(|e| panic!("failed to open {}: {e}", pack_path.display()));
 
         let input = ShogiHalfKaHmHandThreat::new();
         let mut dump = String::new();

@@ -1,28 +1,23 @@
 <div align="center">
 
-# bullet
+# bullet-shogi
 
 </div>
 
-A domain-specific ML library, generally used for training NNUE-style networks for many of the strongest chess engines in the world
-due to its best-in-class performance, chess-specific tooling and ease of use.
+> [!IMPORTANT]
+> `bullet-shogi` is no longer maintained. Development has moved to
+> [`tatara`](https://github.com/SH11235/tatara), an all-Rust GPU trainer for
+> shogi NNUE evaluation networks.
+>
+> Use `tatara` for new training work. This repository remains available as an
+> archive of the Bullet-based shogi fork and its historical experiments.
 
-### Usage for NNUE/Value Network Training
+`bullet-shogi` is a shogi-focused fork of
+[`bullet`](https://github.com/jw1912/bullet), a domain-specific ML library for
+training NNUE-style evaluation networks.
 
-Before attempting to use, check out the [docs](docs/0-contents.md) which contain the main information about building bullet, managing training data and the network output format.
+### Status
 
-Most people simply clone the repo and edit one of the [examples](/examples) to their taste.
-If you want to create your own example file to ease pulling from upstream, you need to add the example to [`bullet_lib`'s `Cargo.toml`](crates/bullet_lib/Cargo.toml).
-
-Alternatively, import the `bullet_lib` crate with
-```toml
-bullet = { git = "https://github.com/jw1912/bullet", package = "bullet_lib" }
-```
-
-Specific API documentation is covered by Rust's docstrings. You can create local documentations with `cargo doc`.
-
-### Help/Feedback
-
-- Please open an issue to file any bug reports/feature requests.
-- Feel free to use the dedicated `#bullet` channel in the [Engine Programming](https://discord.com/invite/F6W6mMsTGN) discord server if you run into any issues.
-- For general training discussion the Engine Programming non-`#bullet` channels are appropriate, or `#engines-dev` in the [Stockfish](https://discord.gg/GWDRS3kU6R) discord.
+- New shogi NNUE training work should use [`tatara`](https://github.com/SH11235/tatara).
+- This repository is kept for reference to the legacy `bullet-shogi` implementation and experiments.
+- Issues and pull requests for `bullet-shogi` may not be handled.

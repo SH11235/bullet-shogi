@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{Error, ErrorKind, Read},
+    io::{BufReader, Error, ErrorKind, Read},
     mem::size_of,
     path::Path,
 };
@@ -33,6 +33,7 @@ pub struct AccuracyReport {
     pub sign_matches: usize,
     pub drawn_games: usize,
     pub filtered_by_score_cap: usize,
+    pub non_finite: usize,
     pub loss_sampled: usize,
     pub test_loss: Option<f32>,
 }
@@ -57,6 +58,12 @@ fn win_rate(score: f32, scaling: f32, offset: f32) -> f32 {
 
 /// Computes decisive-game sign accuracy and the mean held-out training loss.
 /// Draws are excluded from accuracy but retained in the loss subset.
+/// Non-finite network outputs are counted as accuracy mismatches (a NaN output
+/// otherwise compares equal to a lost game and inflates accuracy) and excluded
+/// from the loss mean.
+/// The loss is averaged over surviving positions (finite output, not dropped by
+/// `score_drop_abs`); the training log instead divides by the full batch size, so
+/// under `--score-drop-abs` the two denominators differ.
 pub fn compute_test_metrics(
     model_outputs: &[f32],
     teacher_scores: &[i16],
@@ -67,7 +74,7 @@ pub fn compute_test_metrics(
     assert_eq!(model_outputs.len(), teacher_results.len(), "model output and result length mismatch");
 
     let mut report = AccuracyReport::default();
-    let mut loss_sum = 0.0;
+    let mut loss_sum = 0.0f64;
 
     for ((&output, &score), &result) in model_outputs.iter().zip(teacher_scores).zip(teacher_results) {
         if params.score_drop_abs.is_some_and(|cap| score.unsigned_abs() >= cap) {
@@ -75,13 +82,22 @@ pub fn compute_test_metrics(
             continue;
         }
 
+        let output_finite = output.is_finite();
+        if !output_finite {
+            report.non_finite += 1;
+        }
+
         if result == 0 {
             report.drawn_games += 1;
         } else {
             report.compared += 1;
-            if (output >= 0.0) == (result > 0) {
+            if output_finite && (output >= 0.0) == (result > 0) {
                 report.sign_matches += 1;
             }
+        }
+
+        if !output_finite {
+            continue;
         }
 
         let result_norm = match result.signum() {
@@ -97,13 +113,13 @@ pub fn compute_test_metrics(
         let prediction = params
             .wrm_output
             .map_or_else(|| sigmoid(output), |wrm| win_rate(output * wrm.out_scaling, wrm.in_scaling, wrm.offset));
-        let diff = prediction - target;
+        let diff = f64::from(prediction - target);
         loss_sum += diff * diff;
         report.loss_sampled += 1;
     }
 
     if report.loss_sampled > 0 {
-        report.test_loss = Some(loss_sum / report.loss_sampled as f32);
+        report.test_loss = Some((loss_sum / report.loss_sampled as f64) as f32);
     }
     report
 }
@@ -121,11 +137,11 @@ pub fn read_psv_positions(path: &Path, limit: usize) -> std::io::Result<Vec<Pack
 
     let available = file_size / record_size;
     let count = if limit == 0 { available } else { available.min(limit) };
-    let mut file = File::open(path)?;
+    let mut reader = BufReader::new(File::open(path)?);
     let mut positions = Vec::with_capacity(count);
     for _ in 0..count {
         let mut position = PackedSfenValue::default();
-        file.read_exact(position.as_bytes_mut())?;
+        reader.read_exact(position.as_bytes_mut())?;
         positions.push(position);
     }
     Ok(positions)
@@ -194,5 +210,28 @@ mod tests {
         let report = compute_test_metrics(&[], &[], &[], standard_params());
         assert_eq!(report.test_loss, None);
         assert!(report.accuracy().is_nan());
+    }
+
+    #[test]
+    fn nan_output_does_not_masquerade_as_loss_sign_match() {
+        // A NaN output on a lost game: (NaN >= 0.0) == false and (result > 0) == false,
+        // so without an explicit finite guard the two compare equal and count as a match.
+        let report = compute_test_metrics(&[f32::NAN], &[-100], &[-1], standard_params());
+        assert_eq!(report.compared, 1);
+        assert_eq!(report.sign_matches, 0);
+        assert_eq!(report.non_finite, 1);
+        assert_eq!(report.loss_sampled, 0);
+        assert_eq!(report.test_loss, None);
+    }
+
+    #[test]
+    fn non_finite_outputs_are_excluded_from_loss_and_counted_as_mismatch() {
+        let report =
+            compute_test_metrics(&[f32::NAN, f32::INFINITY, 1.0], &[100, -100, 50], &[1, -1, 1], standard_params());
+        assert_eq!(report.compared, 3);
+        assert_eq!(report.sign_matches, 1);
+        assert_eq!(report.non_finite, 2);
+        assert_eq!(report.loss_sampled, 1);
+        assert!(report.test_loss.unwrap().is_finite());
     }
 }

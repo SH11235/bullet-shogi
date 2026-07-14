@@ -757,6 +757,10 @@ struct ExperimentParams {
     optimizer: String,
     qa: i16,
     qb: i16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_positions: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]
@@ -833,14 +837,23 @@ fn get_timestamp() -> (String, String) {
 
 /// `prior` (resume 元 experiment.json から引き継いだ history) と
 /// `current` (現在 process の log.txt を parse した history) を superbatch でマージ。
-/// 同一 superbatch が両方にある場合は current を採用する。
+/// loss は同一 superbatch なら current を採用するが、current の test_loss / test_accuracy が
+/// None のときは prior の値を温存する。resume 直後の log.txt は旧 checkpoint 由来で test
+/// メトリクスを持たないため、素直に上書きすると experiment.json から旧 superbatch の値が消える。
 fn merge_loss_histories(prior: &[LossEntry], current: &[LossEntry]) -> Vec<LossEntry> {
     let mut map: BTreeMap<usize, LossEntry> = BTreeMap::new();
-    for entry in prior {
-        map.insert(entry.superbatch, entry.clone());
-    }
-    for entry in current {
-        map.insert(entry.superbatch, entry.clone());
+    for entry in prior.iter().chain(current) {
+        map.entry(entry.superbatch)
+            .and_modify(|existing| {
+                existing.loss = entry.loss;
+                if entry.test_loss.is_some() {
+                    existing.test_loss = entry.test_loss;
+                }
+                if entry.test_accuracy.is_some() {
+                    existing.test_accuracy = entry.test_accuracy;
+                }
+            })
+            .or_insert_with(|| entry.clone());
     }
     map.into_values().collect()
 }
@@ -916,6 +929,8 @@ struct ExperimentContext {
     /// resume 時に既存 experiment.json から引き継いだ history。
     /// build_experiment_log() で現在 process の history とマージされる。
     prior_history: Vec<LossEntry>,
+    /// 各 superbatch の held-out 検証 (test_loss / test_accuracy) 結果。
+    /// build_experiment_log() で loss history にマージされる。
     validation_history: RefCell<BTreeMap<usize, LossEntry>>,
     /// resume 時に既存 experiment.json から引き継いだ累積学習時間 (秒)。
     /// build_experiment_log() で現在 process の経過時間に加算される。
@@ -2147,6 +2162,8 @@ fn main() {
         optimizer: optimizer_name.to_string(),
         qa: QA,
         qb: QB,
+        test_data: args.test_data.as_ref().map(|path| path.display().to_string()),
+        test_positions: args.test_data.as_ref().map(|_| args.test_positions),
     };
     let experiment_quantise_only = args.quantise_only;
     let mut experiment_ctx = ExperimentContext::new(
@@ -2235,13 +2252,13 @@ fn main() {
             },
         );
         let test_loss = report.test_loss.unwrap_or(f32::NAN);
+        let accuracy_display =
+            if report.compared > 0 { format!("{:.6}", report.accuracy()) } else { "n/a".to_string() };
+        let non_finite_display =
+            if report.non_finite > 0 { format!(", non_finite={}", report.non_finite) } else { String::new() };
         eprintln!(
-            "test_loss={test_loss:.6} test_accuracy={:.6} ({}/{} decisive, draws={}, filtered={})",
-            report.accuracy(),
-            report.sign_matches,
-            report.compared,
-            report.drawn_games,
-            report.filtered_by_score_cap,
+            "test_loss={test_loss:.6} test_accuracy={accuracy_display} ({}/{} decisive, draws={}, filtered={}{})",
+            report.sign_matches, report.compared, report.drawn_games, report.filtered_by_score_cap, non_finite_display,
         );
         experiment_ctx.record_validation(superbatch, train_loss, report);
         if let Err(error) = experiment_ctx.write_experiment_json("running") {

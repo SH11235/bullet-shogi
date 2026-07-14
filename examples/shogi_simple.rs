@@ -11,6 +11,8 @@ Options:
     --l2 <SIZE>         L2 (hidden layer 1) size
     --l3 <SIZE>         L3 (hidden layer 2) size
     --data <PATH>       Training data path (comma-separated for multiple files)
+    --test-data <PSV>   Held-out PackedSfenValue file for per-superbatch test_loss/test_accuracy
+    --test-positions <N>  Max held-out positions to use (0 = all records)
     --batch-size <N>    Batch size (default: 16384)
     --superbatches <N>  Number of superbatches (default: 100)
     --lr <RATE>         Initial learning rate (default: 0.001)
@@ -52,7 +54,7 @@ Examples:
     cargo run --release --example shogi_simple -- --data data/train.bin --start-wdl 0.2 --end-wdl 0.8
 */
 
-use std::{path::PathBuf, sync::OnceLock};
+use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
     game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
@@ -68,6 +70,7 @@ use bullet_lib::{
     value::{
         ValueTrainerBuilder,
         loader::{DirectSequentialDataLoader, WrmTargetParams},
+        validate::{AccuracyReport, ValidationParams, WrmOutputParams, compute_test_metrics, read_psv_positions},
     },
 };
 use clap::{Parser, ValueEnum};
@@ -201,6 +204,14 @@ struct Args {
     /// Training data path (comma-separated for multiple files)
     #[arg(long, default_value = "data/train.bin")]
     data: String,
+
+    /// Held-out PackedSfenValue data used for per-superbatch metrics
+    #[arg(long)]
+    test_data: Option<PathBuf>,
+
+    /// Maximum held-out positions to use (0 = all records)
+    #[arg(long, default_value_t = 0)]
+    test_positions: usize,
 
     /// Batch size
     #[arg(long, default_value = "16384")]
@@ -395,6 +406,12 @@ struct ExperimentResults {
     fv_scale: i32,
     best_loss: Option<f64>,
     best_loss_superbatch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_test_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_test_loss_superbatch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_test_accuracy: Option<f64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -436,6 +453,10 @@ struct ExperimentData {
 struct LossEntry {
     superbatch: usize,
     loss: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_accuracy: Option<f64>,
 }
 
 // =============================================================================
@@ -496,19 +517,17 @@ fn get_timestamp() -> (String, String) {
 /// `current` (現在 process の log.txt を parse した history) を superbatch でマージ。
 /// 同一 superbatch が両方にある場合は current を採用する (再学習で値が更新された場合に対応)。
 fn merge_loss_histories(prior: &[LossEntry], current: &[LossEntry]) -> Vec<LossEntry> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<usize, f64> = BTreeMap::new();
+    let mut map: BTreeMap<usize, LossEntry> = BTreeMap::new();
     for entry in prior {
-        map.insert(entry.superbatch, entry.loss);
+        map.insert(entry.superbatch, entry.clone());
     }
     for entry in current {
-        map.insert(entry.superbatch, entry.loss);
+        map.insert(entry.superbatch, entry.clone());
     }
-    map.into_iter().map(|(superbatch, loss)| LossEntry { superbatch, loss }).collect()
+    map.into_values().collect()
 }
 
 fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
-    use std::collections::BTreeMap;
     let content = match std::fs::read_to_string(log_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -526,7 +545,12 @@ fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
     }
     superbatch_losses
         .into_iter()
-        .map(|(sb, (sum, count))| LossEntry { superbatch: sb, loss: sum / count as f64 })
+        .map(|(sb, (sum, count))| LossEntry {
+            superbatch: sb,
+            loss: sum / count as f64,
+            test_loss: None,
+            test_accuracy: None,
+        })
         .collect()
 }
 
@@ -573,6 +597,9 @@ struct ExperimentContext {
     /// resume 時に既存 experiment.json から引き継いだ history。
     /// build_experiment_log() で現在 process の history とマージされる。
     prior_history: Vec<LossEntry>,
+    /// 各 superbatch の held-out 検証 (test_loss / test_accuracy) 結果。
+    /// build_experiment_log() で loss history にマージされる。
+    validation_history: RefCell<BTreeMap<usize, LossEntry>>,
     /// resume 時に既存 experiment.json から引き継いだ累積学習時間 (秒)。
     /// build_experiment_log() で現在 process の経過時間に加算される。
     prior_training_seconds: u64,
@@ -615,6 +642,7 @@ impl ExperimentContext {
             training_start: std::time::Instant::now(),
             positions,
             prior_history: Vec::new(),
+            validation_history: RefCell::new(BTreeMap::new()),
             prior_training_seconds: 0,
         }
     }
@@ -630,6 +658,8 @@ impl ExperimentContext {
         // log.txt は checkpoint 単位で current process の error_record から書き直されるため、
         // prior_history を持っていないと sb 1..=resume_point の loss が experiment.json から消える。
         let history = merge_loss_histories(&self.prior_history, &current_history);
+        let measured_history: Vec<LossEntry> = self.validation_history.borrow().values().cloned().collect();
+        let history = merge_loss_histories(&history, &measured_history);
 
         let checkpoints = collect_checkpoints(&self.output_dir, &self.net_id);
 
@@ -644,6 +674,13 @@ impl ExperimentContext {
             .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
             .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
             .unwrap_or((None, None));
+        let (best_test_loss, best_test_loss_superbatch) = history
+            .iter()
+            .filter_map(|entry| entry.test_loss.map(|loss| (loss, entry.superbatch)))
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(loss, superbatch)| (Some(loss), Some(superbatch)))
+            .unwrap_or((None, None));
+        let final_test_accuracy = history.iter().rev().find_map(|entry| entry.test_accuracy);
 
         let training_time_seconds = self.prior_training_seconds.saturating_add(self.training_start.elapsed().as_secs());
         let (_, last_updated_at) = get_timestamp();
@@ -669,6 +706,9 @@ impl ExperimentContext {
                 fv_scale: self.fv_scale,
                 best_loss,
                 best_loss_superbatch,
+                best_test_loss,
+                best_test_loss_superbatch,
+                final_test_accuracy,
             },
             history,
             checkpoints,
@@ -684,6 +724,18 @@ impl ExperimentContext {
         std::fs::write(&json_path, &json)?;
         println!("Experiment log saved to {} (status: {})", json_path.display(), status);
         Ok(())
+    }
+
+    fn record_validation(&self, superbatch: usize, train_loss: f64, report: AccuracyReport) {
+        self.validation_history.borrow_mut().insert(
+            superbatch,
+            LossEntry {
+                superbatch,
+                loss: train_loss,
+                test_loss: report.test_loss.map(f64::from),
+                test_accuracy: (report.compared > 0).then(|| f64::from(report.accuracy())),
+            },
+        );
     }
 
     /// resume 時に既存 experiment.json から experiment_id / date / history を引き継ぐ。
@@ -737,7 +789,12 @@ impl ExperimentContext {
                 .filter_map(|entry| {
                     let sb = entry.get("superbatch").and_then(|v| v.as_u64())? as usize;
                     let loss = entry.get("loss").and_then(|v| v.as_f64())?;
-                    Some(LossEntry { superbatch: sb, loss })
+                    Some(LossEntry {
+                        superbatch: sb,
+                        loss,
+                        test_loss: entry.get("test_loss").and_then(|v| v.as_f64()),
+                        test_accuracy: entry.get("test_accuracy").and_then(|v| v.as_f64()),
+                    })
                 })
                 .collect();
             history.sort_by_key(|e| e.superbatch);
@@ -902,6 +959,24 @@ fn pad_weights_for_simd(weights: &[f32], out_dim: usize, in_dim: usize) -> Vec<f
 // Main
 // =============================================================================
 
+struct TestPositionsCache {
+    positions: Vec<bullet_lib::shogi::PackedSfenValue>,
+    teacher_scores: Vec<i16>,
+    teacher_results: Vec<i8>,
+}
+
+impl TestPositionsCache {
+    fn load(path: &std::path::Path, limit: usize) -> std::io::Result<Self> {
+        let positions = read_psv_positions(path, limit)?;
+        if positions.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "test data contains no positions"));
+        }
+        let teacher_scores = positions.iter().map(|position| position.score()).collect();
+        let teacher_results = positions.iter().map(|position| position.game_result()).collect();
+        Ok(Self { positions, teacher_scores, teacher_results })
+    }
+}
+
 fn main() {
     let args = Args::parse();
     args.validate_wrm_settings().unwrap_or_else(|e| {
@@ -1040,6 +1115,9 @@ fn main() {
     println!("Output: {}", args.output.display());
     println!("Net ID: {}", args.net_id);
     println!("Data: {}", args.data);
+    if let Some(path) = &args.test_data {
+        println!("Test data: {} (limit={})", path.display(), args.test_positions);
+    }
     println!("===========================");
 
     // Capture data for experiment JSON before args.net_id is moved
@@ -1083,6 +1161,15 @@ fn main() {
         args.superbatches,
         experiment_fv_scale,
     );
+
+    let test_cache = args.test_data.as_ref().map(|path| {
+        let cache = TestPositionsCache::load(path, args.test_positions).unwrap_or_else(|error| {
+            eprintln!("ERROR: failed to load --test-data {}: {error}", path.display());
+            std::process::exit(1);
+        });
+        eprintln!("Loaded {} held-out positions from {}", cache.positions.len(), path.display());
+        cache
+    });
 
     // Create WDL scheduler
     let wdl_scheduler = args.create_wdl_scheduler().unwrap_or_else(|e| {
@@ -1438,6 +1525,43 @@ fn main() {
         }};
     }
 
+    // held-out 検証は学習 loss と同一式で行う。sigmoid 損失時は eval_scale=args.scale の
+    // sigmoid(score/scale)、WRM 損失時は target=CHESS_DEFAULT WRM・prediction=network 出力 WRM。
+    let wrm_output = args.wrm_in_scaling.map(|in_scaling| WrmOutputParams {
+        in_scaling,
+        out_scaling: args.scale as f32,
+        offset: 270.0,
+    });
+    let wrm_target = args.win_rate_model.then_some(WrmTargetParams::CHESS_DEFAULT);
+    let mut on_validation = |superbatch: usize, train_loss: f64, outputs: Vec<f32>| {
+        let cache = test_cache.as_ref().expect("validation callback requires test data");
+        let report = compute_test_metrics(
+            &outputs,
+            &cache.teacher_scores,
+            &cache.teacher_results,
+            ValidationParams {
+                blend: schedule.wdl(0, superbatch),
+                eval_scale: args.scale as f32,
+                wrm_target,
+                wrm_output,
+                score_drop_abs: None,
+            },
+        );
+        let test_loss = report.test_loss.unwrap_or(f32::NAN);
+        eprintln!(
+            "test_loss={test_loss:.6} test_accuracy={:.6} ({}/{} decisive, draws={}, filtered={})",
+            report.accuracy(),
+            report.sign_matches,
+            report.compared,
+            report.drawn_games,
+            report.filtered_by_score_cap,
+        );
+        experiment_ctx.record_validation(superbatch, train_loss, report);
+        if let Err(error) = experiment_ctx.write_experiment_json("running") {
+            eprintln!("Warning: Failed to update experiment JSON after validation: {error}");
+        }
+    };
+
     // Helper macro to either run training or just re-quantise
     macro_rules! maybe_run_or_quantise {
         ($trainer:expr) => {{
@@ -1461,7 +1585,18 @@ fn main() {
                     println!("Resuming from checkpoint: {}", resume_str);
                     $trainer.load_from_checkpoint(resume_str);
                 }
-                $trainer.run(&schedule, &settings, &data_loader);
+                if let Some(cache) = &test_cache {
+                    $trainer.run_with_validation(
+                        &schedule,
+                        &settings,
+                        &data_loader,
+                        &cache.positions,
+                        args.batch_size,
+                        &mut on_validation,
+                    );
+                } else {
+                    $trainer.run(&schedule, &settings, &data_loader);
+                }
             }
         }};
     }

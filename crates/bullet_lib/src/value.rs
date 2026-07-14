@@ -2,6 +2,7 @@ pub(crate) mod builder;
 mod dataloader;
 pub mod loader;
 mod save;
+pub mod validate;
 
 use std::cell::RefCell;
 
@@ -121,6 +122,32 @@ where
         settings: &LocalSettings,
         dataloader: &impl loader::DataLoader<Inp::RequiredDataType>,
     ) {
+        self.run_internal(schedule, settings, dataloader, None, 1, |_, _, _| {});
+    }
+
+    pub fn run_with_validation(
+        &mut self,
+        schedule: &TrainingSchedule<impl LrScheduler, impl WdlScheduler>,
+        settings: &LocalSettings,
+        dataloader: &impl loader::DataLoader<Inp::RequiredDataType>,
+        positions: &[Inp::RequiredDataType],
+        batch_size: usize,
+        callback: impl FnMut(usize, f64, Vec<f32>),
+    ) {
+        assert!(!positions.is_empty(), "validation positions must not be empty");
+        assert!(batch_size > 0, "validation batch size must be positive");
+        self.run_internal(schedule, settings, dataloader, Some(positions), batch_size, callback);
+    }
+
+    fn run_internal(
+        &mut self,
+        schedule: &TrainingSchedule<impl LrScheduler, impl WdlScheduler>,
+        settings: &LocalSettings,
+        dataloader: &impl loader::DataLoader<Inp::RequiredDataType>,
+        validation_positions: Option<&[Inp::RequiredDataType]>,
+        validation_batch_size: usize,
+        mut validation_callback: impl FnMut(usize, f64, Vec<f32>),
+    ) {
         logger::clear_colours();
         println!("{}", logger::ansi("Training Preamble", "34;1"));
 
@@ -153,6 +180,7 @@ where
         let steps = schedule.steps;
 
         let error_record = RefCell::new(Vec::new());
+        let validation_loss = RefCell::new((steps.start_superbatch, 0.0f64, 0usize));
         let mut loss_sum = 0.0;
         let mut ticks_since_last = 0.0;
 
@@ -164,6 +192,14 @@ where
             },
             ValueDataLoader { steps, threads: settings.threads, dataloader, wdl: schedule.wdl_scheduler.clone() },
             |_, superbatch, curr_batch, error| {
+                if validation_positions.is_some() {
+                    let mut accumulated = validation_loss.borrow_mut();
+                    if accumulated.0 != superbatch {
+                        *accumulated = (superbatch, 0.0, 0);
+                    }
+                    accumulated.1 += f64::from(error);
+                    accumulated.2 += 1;
+                }
                 loss_sum += error;
                 ticks_since_last += 1.0;
 
@@ -179,6 +215,13 @@ where
                 }
             },
             |trainer, superbatch| {
+                if let Some(positions) = validation_positions {
+                    let (_, sum, count) = *validation_loss.borrow();
+                    let train_loss = if count == 0 { f64::NAN } else { sum / count as f64 };
+                    let outputs = Self::eval_batch(trainer, positions, validation_batch_size);
+                    validation_callback(superbatch, train_loss, outputs);
+                }
+
                 if superbatch % schedule.save_rate == 0 || superbatch == steps.end_superbatch {
                     let name = format!("{}-{superbatch}", schedule.net_id);
                     let path = format!("{}/{name}", settings.output_directory);
@@ -195,6 +238,38 @@ where
             },
         )
         .unwrap();
+    }
+
+    fn eval_batch(
+        trainer: &mut Trainer<ExecutionContext, Opt, ValueTrainerState<Inp, Out>>,
+        positions: &[Inp::RequiredDataType],
+        batch_size: usize,
+    ) -> Vec<f32> {
+        let mut all_outputs = Vec::with_capacity(positions.len());
+        let device = trainer.optimiser.model.device();
+        let stream = device.new_stream().unwrap();
+        // Cache output tensors per chunk size: every chunk is `batch_size`
+        // except possibly the final partial one, so this allocates at most
+        // twice instead of once per chunk. `forward` overwrites the tensors,
+        // but each chunk's values are copied to host before the next call.
+        let mut cached_outputs: Option<(usize, _)> = None;
+        for chunk in positions.chunks(batch_size) {
+            let n = chunk.len();
+            if cached_outputs.as_ref().map(|(size, _)| *size) != Some(n) {
+                trainer.optimiser.model.set_fwd_batch_size(n).unwrap();
+                let outputs = trainer.optimiser.model.make_forward_output_tensors(n).unwrap();
+                cached_outputs = Some((n, outputs));
+            }
+            let (_, outputs) = cached_outputs.as_ref().unwrap();
+            let host_data = trainer.state.prepare(chunk, 1, 1.0, 1.0);
+            let model = &trainer.optimiser.model;
+            let inputs = host_data.to_device(&device).unwrap();
+            model.forward(&stream, &inputs, outputs).unwrap().value().unwrap();
+            let output = outputs.get("outputs/output").unwrap().clone();
+            let TValue::F32(values) = output.to_host().unwrap() else { panic!() };
+            all_outputs.extend_from_slice(&values);
+        }
+        all_outputs
     }
 
     pub fn eval_raw_output(&mut self, fen: &str) -> Vec<f32>

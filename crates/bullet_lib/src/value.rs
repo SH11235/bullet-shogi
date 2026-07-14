@@ -246,16 +246,25 @@ where
         batch_size: usize,
     ) -> Vec<f32> {
         let mut all_outputs = Vec::with_capacity(positions.len());
+        let device = trainer.optimiser.model.device();
+        let stream = device.new_stream().unwrap();
+        // Cache output tensors per chunk size: every chunk is `batch_size`
+        // except possibly the final partial one, so this allocates at most
+        // twice instead of once per chunk. `forward` overwrites the tensors,
+        // but each chunk's values are copied to host before the next call.
+        let mut cached_outputs: Option<(usize, _)> = None;
         for chunk in positions.chunks(batch_size) {
             let n = chunk.len();
-            trainer.optimiser.model.set_fwd_batch_size(n).unwrap();
+            if cached_outputs.as_ref().map(|(size, _)| *size) != Some(n) {
+                trainer.optimiser.model.set_fwd_batch_size(n).unwrap();
+                let outputs = trainer.optimiser.model.make_forward_output_tensors(n).unwrap();
+                cached_outputs = Some((n, outputs));
+            }
+            let (_, outputs) = cached_outputs.as_ref().unwrap();
             let host_data = trainer.state.prepare(chunk, 1, 1.0, 1.0);
             let model = &trainer.optimiser.model;
-            let device = model.device();
-            let stream = device.new_stream().unwrap();
             let inputs = host_data.to_device(&device).unwrap();
-            let outputs = model.make_forward_output_tensors(n).unwrap();
-            model.forward(&stream, &inputs, &outputs).unwrap().value().unwrap();
+            model.forward(&stream, &inputs, outputs).unwrap().value().unwrap();
             let output = outputs.get("outputs/output").unwrap().clone();
             let TValue::F32(values) = output.to_host().unwrap() else { panic!() };
             all_outputs.extend_from_slice(&values);

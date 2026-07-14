@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn linear_wdl_saturates_when_superbatch_exceeds_max() {
         // Reproduces the dataloader-prefetch case where superbatch overruns
-        // end_superbatch: pre-fix this returned 1.5 and tripped the
+        // end_superbatch: naive interpolation yields 1.5 here and trips the
         // `blend in [0, 1]` assertion in `value/loader.rs`.
         let s = LinearWDL { start: 0.0, end: 1.0 };
         approx_eq(s.blend(0, 4, 3), 1.0);
@@ -210,8 +210,7 @@ mod tests {
     fn linear_wdl_one_superbatch_schedule_saturates_overshoot_to_end() {
         // For a single-superbatch schedule (`max == 1`) the lone superbatch
         // is both start and end, but any prefetched overshoot must saturate
-        // to `end` rather than collapsing to `start`. (Regression coverage
-        // for the Codex review on PR #15.)
+        // to `end` rather than collapsing to `start`.
         let s = LinearWDL { start: 0.0, end: 1.0 };
         approx_eq(s.blend(0, 1, 1), 0.0);
         approx_eq(s.blend(0, 2, 1), 1.0);
@@ -265,7 +264,7 @@ mod tests {
         // overshoot still routes through the first scheduler, and must
         // saturate at the value that scheduler would produce at
         // `superbatch == max`, rather than continuing to interpolate past
-        // the overall schedule end. (Copilot review on PR #15.)
+        // the overall schedule end.
         let first = LinearWDL { start: 0.0, end: 0.5 };
         let second = LinearWDL { start: 0.5, end: 1.0 };
         let seq = Sequence { first, second, first_scheduler_final_superbatch: 10 };

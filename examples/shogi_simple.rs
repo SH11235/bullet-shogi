@@ -416,6 +416,10 @@ struct ExperimentResults {
 
 #[derive(Serialize, Clone)]
 struct ExperimentParams {
+    /// nnue-lab の一覧列 / facet が読む合成済みアーキテクチャ名
+    /// (例: `HalfKP-256x2-32-32-CReLU`)。shogi_layerstack の
+    /// `LayerStack-...` と同じく feature 名を接頭辞にする。
+    architecture: String,
     l1: usize,
     l2: usize,
     l3: usize,
@@ -1139,6 +1143,15 @@ fn main() {
         OutputFormat::Standard => "standard",
     };
     let experiment_params = ExperimentParams {
+        architecture: format!(
+            "{}-{}x2-{}-{}-{}{}",
+            feature_name,
+            l1_size,
+            l2_size,
+            l3_size,
+            activation_name,
+            if pairwise_enabled { "-Pairwise" } else { "" }
+        ),
         l1: l1_size,
         l2: l2_size,
         l3: l3_size,

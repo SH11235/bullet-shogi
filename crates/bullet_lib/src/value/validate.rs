@@ -61,6 +61,9 @@ fn win_rate(score: f32, scaling: f32, offset: f32) -> f32 {
 /// Non-finite network outputs are counted as accuracy mismatches (a NaN output
 /// otherwise compares equal to a lost game and inflates accuracy) and excluded
 /// from the loss mean.
+/// Positions at or above `score_drop_abs` are excluded from both metrics, so
+/// they are computed over the same survivor set the training objective assigns
+/// non-zero weight to; accuracy is then no longer a pure draws-excluded rate.
 /// The loss is averaged over surviving positions (finite output, not dropped by
 /// `score_drop_abs`); the training log instead divides by the full batch size, so
 /// under `--score-drop-abs` the two denominators differ.

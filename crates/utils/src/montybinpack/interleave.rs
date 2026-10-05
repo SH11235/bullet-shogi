@@ -11,7 +11,10 @@ use crate::Rand;
 
 #[derive(Args)]
 pub struct InterleaveOptions {
-    #[arg(required = true, num_args = 2..)]
+    /// Input files; at least two are required.
+    // The minimum is enforced after parsing: a per-occurrence minimum would reject
+    // inputs that are split around options.
+    #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
     #[arg(required = true, short, long)]
     pub output: PathBuf,

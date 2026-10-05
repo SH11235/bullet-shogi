@@ -11,7 +11,7 @@ use clap::Args;
 use crate::{
     Rand,
     interleave::{InterleaveMode, InterleaveOptions},
-    output::{AtomicOutput, ensure_distinct_output},
+    output::{AtomicOutput, temporary_prefix},
 };
 
 #[derive(Args)]
@@ -50,7 +50,8 @@ impl ShuffleOptions {
         ensure!(bytes_used > 0, "mem_used_mb must be at least 1");
         ensure!(bytes_used >= record_size, "memory limit must include at least one record");
 
-        ensure_distinct_output(std::slice::from_ref(&self.input), &self.output)?;
+        // The input may also be the output: it is read completely, or split into temporary
+        // files, before the output is replaced.
         let mut output = AtomicOutput::new(&self.output)?;
 
         println!("# [Shuffling Data] (record_size={})", record_size);
@@ -74,7 +75,8 @@ impl ShuffleOptions {
             output.commit()?;
         } else {
             drop(output);
-            let temp_dir = tempfile::Builder::new().prefix(".bullet-shuffle-").tempdir_in(".")?;
+            let temp_dir =
+                tempfile::Builder::new().prefix(&temporary_prefix("shuffle", &self.output)?).tempdir_in(".")?;
             let num_tmp_files = input_size.div_ceil(bytes_used).max(MIN_TMP_FILES);
             let temp_files =
                 (0..num_tmp_files).map(|idx| temp_dir.path().join(format!("part_{}.bin", idx + 1))).collect::<Vec<_>>();

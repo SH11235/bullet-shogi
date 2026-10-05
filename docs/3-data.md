@@ -50,28 +50,68 @@ cargo run --release -p bullet-utils -- interleave a.psv b.psv \
     --output combined.psv --record-size 40 --mode block --seed 123
 ```
 
-Keep inputs unchanged while processing. The output must be separate from every
-input, including symbolic and hard links. Both commands write to a temporary
-file beside the output and replace the output only after successful completion.
-Output destinations must be regular files or new file paths. Devices, FIFOs,
-and streams such as `/dev/null` or `/dev/stdout` are not supported. Existing
-read-only outputs are refused, and the parent directory must permit temporary
-file creation and replacement, even when the existing file itself is writable.
-Existing file permissions also restrict temporary files from creation and are
-retained on publication. New files follow the process umask. Replacement changes the file identity:
-hard links keep the previous contents, output symbolic links are replaced, and
-ownership or extended access controls are not copied.
+`interleave` takes at least two inputs; they may be listed before, after, or
+between the options. `concat` does not use `--record-size`.
 
-Disk-backed shuffling creates a unique `.bullet-shuffle-*` directory in the
-current working directory. Each invocation removes only its own directory;
-an unrelated `tmp` directory is left intact. Normal errors also clean up the
-temporary files. A forced process termination can leave `.bullet-shuffle-*`
-directories or `.bullet-output-*` files behind; remove them only after confirming
-that no running command uses them. Atomic replacement requires the filesystem
-to support a rename beside the destination, and does not guarantee recovery
-after power loss. On Windows, readers that deny file replacement can prevent
-publication and leave the existing output intact.
+### Outputs
 
-Usage errors return exit status 2; processing errors return 1. Successful
-commands, help, and version requests return 0. Scripts should treat any nonzero
-status as failure instead of requiring a particular failure code.
+Keep inputs unchanged while processing. For `interleave`, the output must be
+separate from every input, including symbolic and hard links to one. `shuffle`
+may write back to its own input (`--input x --output x`): the input is read
+completely, or split into temporary files, before the output is replaced.
+
+`shuffle`, `interleave`, and `convert` write to a temporary file beside the
+output and rename it over the output only after successful completion, so a
+failed run leaves an existing output untouched. The `montybinpack` and
+`viribinpack` subcommands write to their output directly.
+
+- An output that is a symbolic link is written through: the temporary file is
+  created beside the link target, the target is replaced, and the link stays.
+  A dangling link gets its target created.
+- Devices, FIFOs, and other existing non-regular outputs such as `/dev/null`
+  are written in place without a temporary file. `interleave` checks the size
+  of what it wrote, so it reports an error for outputs that do not retain data.
+- Existing read-only outputs are refused, and the directory of the output must
+  permit creating and renaming files, even when the existing file is writable.
+- Existing file permissions restrict the temporary file from creation and are
+  retained on publication. New files follow the process umask.
+- Replacement changes the file identity: other hard links keep the previous
+  contents, and ownership or extended access controls are not copied.
+- The output file is synced before the rename, and on Unix its directory is
+  synced afterwards, so a completed command survives power loss on filesystems
+  that honour both. If the directory sync is rejected, a warning is printed and
+  the command still succeeds.
+- On Windows, readers that deny file replacement can prevent publication and
+  leave the existing output intact.
+
+### Disk space
+
+Disk-backed shuffling (input larger than `--mem-used-mb`) stores a full copy of
+the input as temporary parts in the current working directory, then writes the
+temporary output beside the destination. An existing output is kept until the
+rename, so replacing one needs room for the parts, the new output, and the old
+output at the same time: about three times the input size, or twice when
+the output does not exist yet. `interleave` and `convert` need room for the new
+output in addition to an existing one.
+
+### Temporary files and interruption
+
+| Name | Location | Created by |
+| --- | --- | --- |
+| `.bullet-output-<output name>.<random>` (file) | directory of the output, or of the link target | `shuffle`, `interleave`, `convert` |
+| `.bullet-shuffle-<output name>.<random>/` (directory) | current working directory | disk-backed `shuffle` |
+
+Each invocation removes only the entries it created, on success and on errors
+it reports itself; an unrelated `tmp` directory is left intact. There is no
+signal handling: interrupting the command (Ctrl-C, `kill`, a closed terminal)
+or losing power leaves these hidden entries behind, and they can be as large
+as the dataset. The destination itself is not modified in that case. Leftover
+entries are never reused, so they are safe to delete once no running command
+is writing to that output; `ls -A` shows them.
+
+### Exit status
+
+Successful commands, `--help`, and `--version` return 0. Usage errors (missing
+or unknown arguments, invalid values, fewer than two `interleave` inputs)
+return 2. Processing errors return 1. Scripts should treat any nonzero status
+as failure instead of requiring a particular failure code.

@@ -37,7 +37,10 @@ impl FromStr for InterleaveMode {
 
 #[derive(Args)]
 pub struct InterleaveOptions {
-    #[arg(required = true, num_args = 2..)]
+    /// Input files; at least two are required.
+    // The minimum is enforced after parsing: a per-occurrence minimum would reject
+    // inputs that are split around options.
+    #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
     #[arg(required = true, short, long)]
     pub output: PathBuf,
@@ -73,7 +76,6 @@ impl Stream {
 
 impl InterleaveOptions {
     pub fn run(&self) -> anyhow::Result<()> {
-        ensure!(self.record_size > 0, "record_size must be at least 1");
         ensure_distinct_output(&self.inputs, &self.output)?;
         match self.mode {
             InterleaveMode::Record => self.run_record(self.seed.unwrap_or_else(Rand::random_seed)),

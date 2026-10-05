@@ -7,7 +7,7 @@ mod shuffle;
 mod validate;
 mod viribinpack;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 
 #[derive(Parser)]
 #[command(version, propagate_version = true)]
@@ -23,8 +23,44 @@ pub enum Options {
     Viribinpack(viribinpack::ViriBinpackOptions),
 }
 
+impl Options {
+    const MIN_INTERLEAVE_INPUTS: usize = 2;
+
+    fn parse_checked<I, T>(arguments: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let options = Self::try_parse_from(arguments)?;
+        let (subcommand, inputs): (&[&str], usize) = match &options {
+            Options::Interleave(options) => (&["interleave"], options.inputs.len()),
+            Options::Montybinpack(montybinpack::MontyBinpackOptions::Interleave(options)) => {
+                (&["montybinpack", "interleave"], options.inputs.len())
+            }
+            Options::Viribinpack(viribinpack::ViriBinpackOptions::Interleave(options)) => {
+                (&["viribinpack", "interleave"], options.inputs.len())
+            }
+            _ => return Ok(options),
+        };
+        if inputs >= Self::MIN_INTERLEAVE_INPUTS {
+            return Ok(options);
+        }
+        // Reported through the subcommand so the message carries its usage line and exit status.
+        let mut command = Self::command();
+        command.build();
+        let mut command = &mut command;
+        for name in subcommand {
+            command = command.find_subcommand_mut(name).expect("subcommand is defined");
+        }
+        Err(command.error(
+            ErrorKind::TooFewValues,
+            format!("at least {} inputs are required; only {inputs} was provided", Self::MIN_INTERLEAVE_INPUTS),
+        ))
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    match Options::parse() {
+    match Options::parse_checked(std::env::args_os()).unwrap_or_else(|error| error.exit()) {
         Options::Convert(options) => options.run(),
         Options::Interleave(options) => options.run(),
         Options::Shuffle(options) => options.run(),
@@ -76,7 +112,6 @@ impl Rand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn cli_schema_is_consistent() {
@@ -140,10 +175,19 @@ mod tests {
             ] {
                 assert!(Options::try_parse_from(arguments).is_ok());
             }
-            assert!(Options::try_parse_from(["bullet-utils", format, "interleave", "a", "-o", "output"]).is_err());
+            assert!(Options::parse_checked(["bullet-utils", format, "interleave", "a", "-o", "output"]).is_err());
+            assert!(Options::parse_checked(["bullet-utils", format, "interleave", "a", "-o", "output", "b"]).is_ok());
         }
         assert!(Options::try_parse_from(["bullet-utils", "viribinpack", "splat", "input", "output", "config"]).is_ok());
-        assert!(Options::try_parse_from(["bullet-utils", "interleave", "a", "-o", "output"]).is_err());
+        let error = Options::parse_checked(["bullet-utils", "interleave", "a", "-o", "output"]).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::TooFewValues);
+        assert_eq!(error.exit_code(), 2);
+        let Ok(Options::Interleave(options)) =
+            Options::parse_checked(["bullet-utils", "interleave", "a", "-o", "output", "b", "--seed", "1", "c"])
+        else {
+            panic!("expected interleave command");
+        };
+        assert_eq!(options.inputs, ["a", "b", "c"].map(std::path::PathBuf::from));
         assert!(Options::try_parse_from(["bullet-utils", "bucket-count", "a", "-b", "buckets"]).is_ok());
         assert!(
             Options::try_parse_from([

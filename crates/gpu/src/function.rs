@@ -282,10 +282,10 @@ impl<G: Gpu> Function<G> {
             sync.attach(guard)?;
             ptrs[idx] = ptr;
 
-            if let Some(is_alr_mut) = mutmap.insert(ptr, is_mut) {
-                if is_mut || is_alr_mut {
-                    return Err("Cannot alias pointers!".to_string().into());
-                }
+            if let Some(is_alr_mut) = mutmap.insert(ptr, is_mut)
+                && (is_mut || is_alr_mut)
+            {
+                return Err("Cannot alias pointers!".to_string().into());
             }
         }
 

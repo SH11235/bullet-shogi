@@ -11,17 +11,17 @@ use bulletformat::{
     chess::{CudADFormat, MarlinFormat},
     convert_from_bin, convert_from_text,
 };
-use structopt::StructOpt;
+use clap::Args;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct ConvertOptions {
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     from: String,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     input: PathBuf,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     output: PathBuf,
-    #[structopt(short, long, default_value = "1")]
+    #[arg(short, long, default_value = "1")]
     threads: usize,
 }
 

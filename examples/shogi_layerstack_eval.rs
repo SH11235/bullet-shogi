@@ -813,257 +813,255 @@ fn main() {
 
         // quantised.bin と weights.bin の一致確認（L1の一部）
         let quantised_path = args.checkpoint.join("quantised.bin");
-        if quantised_path.exists() {
-            if let Ok(mut f) = std::fs::File::open(&quantised_path) {
-                let mut buf4 = [0u8; 4];
-                // Header
-                let _ = f.read_exact(&mut buf4);
-                let _ = f.read_exact(&mut buf4);
-                let _ = f.read_exact(&mut buf4);
-                let arch_len = u32::from_le_bytes(buf4) as usize;
-                let mut arch = vec![0u8; arch_len];
-                let _ = f.read_exact(&mut arch);
-                let arch_str = String::from_utf8_lossy(&arch);
-                let has_psqt = arch_str.contains("PSQT=");
-                println!("Architecture: {}", arch_str);
-                println!("Has PSQT: {}", has_psqt);
+        if quantised_path.exists()
+            && let Ok(mut f) = std::fs::File::open(&quantised_path)
+        {
+            let mut buf4 = [0u8; 4];
+            // Header
+            let _ = f.read_exact(&mut buf4);
+            let _ = f.read_exact(&mut buf4);
+            let _ = f.read_exact(&mut buf4);
+            let arch_len = u32::from_le_bytes(buf4) as usize;
+            let mut arch = vec![0u8; arch_len];
+            let _ = f.read_exact(&mut arch);
+            let arch_str = String::from_utf8_lossy(&arch);
+            let has_psqt = arch_str.contains("PSQT=");
+            println!("Architecture: {}", arch_str);
+            println!("Has PSQT: {}", has_psqt);
 
-                // ft_hash
-                let _ = f.read_exact(&mut buf4);
+            // ft_hash
+            let _ = f.read_exact(&mut buf4);
 
-                // FT biases / weights はそれぞれ LEB128 ブロック
-                let ft_biases_q = match read_leb128_i16_block(&mut f) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Warning: failed to parse FT bias block: {e}");
-                        return;
-                    }
-                };
-                let ft_weights_q = match read_leb128_i16_block(&mut f) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Warning: failed to parse FT weight block: {e}");
-                        return;
-                    }
-                };
-
-                if ft_biases_q.len() != l0_size {
-                    eprintln!("Warning: FT bias length mismatch: got {}, expected {}", ft_biases_q.len(), l0_size);
+            // FT biases / weights はそれぞれ LEB128 ブロック
+            let ft_biases_q = match read_leb128_i16_block(&mut f) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Warning: failed to parse FT bias block: {e}");
                     return;
                 }
-                // FT weights は HalfKA 部分のみ（Threat 有効時も同一）
-                if ft_weights_q.len() != halfka_dim * l0_size {
-                    eprintln!(
-                        "Warning: FT weight length mismatch: got {}, expected {}",
-                        ft_weights_q.len(),
-                        halfka_dim * l0_size
-                    );
+            };
+            let ft_weights_q = match read_leb128_i16_block(&mut f) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Warning: failed to parse FT weight block: {e}");
                     return;
                 }
+            };
 
-                println!("=== FT bias sample check (quantised.bin vs weights.bin) ===");
-                for (idx, &q_file) in ft_biases_q.iter().enumerate().take(4) {
-                    let q_expected = (l0b.values[idx] * 127.0f32).round() as i16;
-                    println!("ft_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}", l0b.values[idx]);
-                }
-                println!();
+            if ft_biases_q.len() != l0_size {
+                eprintln!("Warning: FT bias length mismatch: got {}, expected {}", ft_biases_q.len(), l0_size);
+                return;
+            }
+            // FT weights は HalfKA 部分のみ（Threat 有効時も同一）
+            if ft_weights_q.len() != halfka_dim * l0_size {
+                eprintln!(
+                    "Warning: FT weight length mismatch: got {}, expected {}",
+                    ft_weights_q.len(),
+                    halfka_dim * l0_size
+                );
+                return;
+            }
 
-                println!("=== FT weight sample check (quantised.bin vs weights.bin) ===");
-                for &(name, bp) in &features[..4] {
-                    let feature_idx = KB * PIECE_INPUTS + bp;
-                    for out_idx in 0..2 {
-                        let expected = (l0.values[feature_idx * output_dim + out_idx] * 127.0f32).round() as i16;
-                        let q_file = ft_weights_q[feature_idx * l0_size + out_idx];
-                        println!(
-                            "{name} out={out_idx}: float={:.6} q_expected={expected} q_file={q_file}",
-                            l0.values[feature_idx * output_dim + out_idx]
-                        );
-                    }
-                }
-                println!();
+            println!("=== FT bias sample check (quantised.bin vs weights.bin) ===");
+            for (idx, &q_file) in ft_biases_q.iter().enumerate().take(4) {
+                let q_expected = (l0b.values[idx] * 127.0f32).round() as i16;
+                println!("ft_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}", l0b.values[idx]);
+            }
+            println!();
 
-                // PSQT ブロック (FT と LayerStack の間)
-                if has_psqt {
-                    let mut psqt_biases_q = [0i32; NUM_BUCKETS];
-                    for bias in psqt_biases_q.iter_mut() {
-                        let _ = f.read_exact(&mut buf4);
-                        *bias = i32::from_le_bytes(buf4);
-                    }
-                    let weight_count = halfka_dim * NUM_BUCKETS;
-                    let mut psqt_weights_q = vec![0i32; weight_count];
-                    for w in psqt_weights_q.iter_mut() {
-                        let _ = f.read_exact(&mut buf4);
-                        *w = i32::from_le_bytes(buf4);
-                    }
-
-                    let psqt_w = weight_view(&weights, "psqtw");
-                    let psqt_b = weight_view(&weights, "psqtb");
-                    let scale = 127.0f32 * 64.0f32; // QA * QB = 8128
-
-                    println!("=== PSQT bias sample check (quantised.bin vs weights.bin) ===");
-                    for (idx, &q_file) in psqt_biases_q.iter().enumerate().take(4) {
-                        let q_expected = (psqt_b.values[idx] as f64 * scale as f64).round() as i32;
-                        println!(
-                            "psqt_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}",
-                            psqt_b.values[idx]
-                        );
-                    }
-                    println!();
-
-                    println!("=== PSQT weight sample check (quantised.bin vs weights.bin) ===");
-                    for feat in 0..3 {
-                        for bucket in 0..2 {
-                            let idx = feat * NUM_BUCKETS + bucket;
-                            let q_file = psqt_weights_q[idx];
-                            let w = psqt_w.values[idx];
-                            let q_expected = (w as f64 * scale as f64).round() as i32;
-                            println!(
-                                "psqt_w[feat={feat} bucket={bucket}]: float={w:.6} q_expected={q_expected} q_file={q_file}"
-                            );
-                        }
-                    }
-                    println!();
-                }
-
-                // FT ブロック消費後、LayerStack 本体を読む。
-
-                // LayerStack は bucket ごとに保存される:
-                // [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
-                let l1_bias_count = NUM_BUCKETS * l1_size;
-                let mut l1_biases = vec![0i32; l1_bias_count];
-                let mut l1_weights = vec![0i8; l1_bias_count * l1_input_dim];
-                let l2_bias_count = NUM_BUCKETS * l2_size;
-                let mut l2_biases = vec![0i32; l2_bias_count];
-                let mut l2_weights = vec![0i8; l2_bias_count * l2_input];
-                let mut l3_biases = [0i32; NUM_BUCKETS];
-                let mut l3_weights = vec![0i8; NUM_BUCKETS * l2_size];
-
-                let l1_padded_in = pad32(l1_input_dim);
-                let l2_padded_in = pad32(l2_input);
-                let out_padded_in = pad32(l2_size);
-
-                for bucket in 0..NUM_BUCKETS {
-                    // fc_hash
-                    let _ = f.read_exact(&mut buf4);
-
-                    // l1 biases
-                    for out_idx in 0..l1_size {
-                        let _ = f.read_exact(&mut buf4);
-                        l1_biases[bucket * l1_size + out_idx] = i32::from_le_bytes(buf4);
-                    }
-
-                    // l1 weights (row-major with padded input)
-                    let mut row = vec![0u8; l1_padded_in];
-                    for out_idx in 0..l1_size {
-                        let _ = f.read_exact(&mut row);
-                        let global_out = bucket * l1_size + out_idx;
-                        for in_idx in 0..l1_input_dim {
-                            l1_weights[global_out * l1_input_dim + in_idx] = row[in_idx] as i8;
-                        }
-                    }
-
-                    // l2 biases
-                    for out_idx in 0..l2_size {
-                        let _ = f.read_exact(&mut buf4);
-                        l2_biases[bucket * l2_size + out_idx] = i32::from_le_bytes(buf4);
-                    }
-
-                    // l2 weights (row-major with padded input)
-                    let mut l2_row = vec![0u8; l2_padded_in];
-                    for out_idx in 0..l2_size {
-                        let _ = f.read_exact(&mut l2_row);
-                        let global_out = bucket * l2_size + out_idx;
-                        for in_idx in 0..l2_input {
-                            l2_weights[global_out * l2_input + in_idx] = l2_row[in_idx] as i8;
-                        }
-                    }
-
-                    // l3 bias
-                    let _ = f.read_exact(&mut buf4);
-                    l3_biases[bucket] = i32::from_le_bytes(buf4);
-
-                    // l3 weights (padded)
-                    let mut out_row = vec![0u8; out_padded_in];
-                    let _ = f.read_exact(&mut out_row);
-                    for in_idx in 0..l2_size {
-                        l3_weights[bucket * l2_size + in_idx] = out_row[in_idx] as i8;
-                    }
-                }
-
-                println!("=== L1 bias sample check (quantised.bin vs weights.bin) ===");
-                let l1b = weight_view(&weights, "l1b");
-                let l1fb = weight_view(&weights, "l1fb");
-                let bias_scale = 127.0f32 * 64.0f32; // QA * QB
-                for (idx, &q_file) in l1_biases.iter().enumerate().take(4) {
-                    let merged_b = l1b.values[idx] + l1fb.values[idx % l1_size];
-                    let q_expected = (merged_b * bias_scale).round() as i32;
-                    println!("bias[{idx}]: merged_float={merged_b:.6} q_expected={q_expected} q_file={q_file}");
-                }
-                println!();
-
-                println!("=== L1 weight sample check (quantised.bin vs weights.bin) ===");
-                let qb = 64.0f32;
-                let bucket = 8usize;
-                let out_base = bucket * l1_size;
-                for out_in_bucket in 0..2 {
-                    let out_idx = out_base + out_in_bucket;
-                    for in_idx in 0..4 {
-                        let bucket_w = l1.values[in_idx * (NUM_BUCKETS * l1_size) + out_idx];
-                        let shared_w = l1f.values[in_idx * l1_size + out_in_bucket];
-                        let float_w = bucket_w + shared_w;
-                        let q_expected = (float_w * qb).round() as i8;
-                        let q_file = l1_weights[out_idx * l1_input_dim + in_idx];
-                        println!(
-                            "bucket={bucket} out={out_in_bucket} in={in_idx}: merged_float={float_w:.6} q_expected={q_expected} q_file={q_file}"
-                        );
-                    }
-                }
-                println!();
-
-                println!("=== L2 bias sample check (quantised.bin vs weights.bin) ===");
-                let bias_scale = 127.0f32 * 64.0f32;
-                for (idx, &b_file) in l2_biases.iter().enumerate().take(4) {
-                    let b_expected = (l2b.values[idx] * bias_scale).round() as i32;
-                    println!("l2_bias[{idx}]: float={:.6} q_expected={b_expected} q_file={b_file}", l2b.values[idx]);
-                }
-                println!();
-
-                println!("=== L2 weight sample check (quantised.bin vs weights.bin) ===");
-                let qb = 64.0f32;
-                let bucket = 8usize;
-                let out_base = bucket * l2_size;
-                for out_in_bucket in 0..2 {
-                    let out_idx = out_base + out_in_bucket;
-                    for in_idx in 0..4 {
-                        let w = l2.values[in_idx * (NUM_BUCKETS * l2_size) + out_idx];
-                        let q_expected = (w * qb).round() as i8;
-                        let q_file = l2_weights[out_idx * l2_input + in_idx];
-                        println!(
-                            "bucket={bucket} out={out_in_bucket} in={in_idx}: float={w:.6} q_expected={q_expected} q_file={q_file}"
-                        );
-                    }
-                }
-                println!();
-
-                println!("=== L3 bias/weight sample check (quantised.bin vs weights.bin) ===");
-                for bucket in 0..2 {
-                    let b_expected = (l3b.values[bucket] * bias_scale).round() as i32;
-                    let b_file = l3_biases[bucket];
+            println!("=== FT weight sample check (quantised.bin vs weights.bin) ===");
+            for &(name, bp) in &features[..4] {
+                let feature_idx = KB * PIECE_INPUTS + bp;
+                for out_idx in 0..2 {
+                    let expected = (l0.values[feature_idx * output_dim + out_idx] * 127.0f32).round() as i16;
+                    let q_file = ft_weights_q[feature_idx * l0_size + out_idx];
                     println!(
-                        "l3_bias[bucket={bucket}]: float={:.6} q_expected={b_expected} q_file={b_file}",
-                        l3b.values[bucket]
+                        "{name} out={out_idx}: float={:.6} q_expected={expected} q_file={q_file}",
+                        l0.values[feature_idx * output_dim + out_idx]
                     );
-                    for in_idx in 0..4 {
-                        let w = l3.values[in_idx * NUM_BUCKETS + bucket];
-                        let q_expected = (w * qb).round() as i8;
-                        let q_file = l3_weights[bucket * l2_size + in_idx];
+                }
+            }
+            println!();
+
+            // PSQT ブロック (FT と LayerStack の間)
+            if has_psqt {
+                let mut psqt_biases_q = [0i32; NUM_BUCKETS];
+                for bias in psqt_biases_q.iter_mut() {
+                    let _ = f.read_exact(&mut buf4);
+                    *bias = i32::from_le_bytes(buf4);
+                }
+                let weight_count = halfka_dim * NUM_BUCKETS;
+                let mut psqt_weights_q = vec![0i32; weight_count];
+                for w in psqt_weights_q.iter_mut() {
+                    let _ = f.read_exact(&mut buf4);
+                    *w = i32::from_le_bytes(buf4);
+                }
+
+                let psqt_w = weight_view(&weights, "psqtw");
+                let psqt_b = weight_view(&weights, "psqtb");
+                let scale = 127.0f32 * 64.0f32; // QA * QB = 8128
+
+                println!("=== PSQT bias sample check (quantised.bin vs weights.bin) ===");
+                for (idx, &q_file) in psqt_biases_q.iter().enumerate().take(4) {
+                    let q_expected = (psqt_b.values[idx] as f64 * scale as f64).round() as i32;
+                    println!(
+                        "psqt_bias[{idx}]: float={:.6} q_expected={q_expected} q_file={q_file}",
+                        psqt_b.values[idx]
+                    );
+                }
+                println!();
+
+                println!("=== PSQT weight sample check (quantised.bin vs weights.bin) ===");
+                for feat in 0..3 {
+                    for bucket in 0..2 {
+                        let idx = feat * NUM_BUCKETS + bucket;
+                        let q_file = psqt_weights_q[idx];
+                        let w = psqt_w.values[idx];
+                        let q_expected = (w as f64 * scale as f64).round() as i32;
                         println!(
-                            "l3_w[bucket={bucket} in={in_idx}]: float={w:.6} q_expected={q_expected} q_file={q_file}"
+                            "psqt_w[feat={feat} bucket={bucket}]: float={w:.6} q_expected={q_expected} q_file={q_file}"
                         );
                     }
                 }
                 println!();
             }
+
+            // FT ブロック消費後、LayerStack 本体を読む。
+
+            // LayerStack は bucket ごとに保存される:
+            // [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
+            let l1_bias_count = NUM_BUCKETS * l1_size;
+            let mut l1_biases = vec![0i32; l1_bias_count];
+            let mut l1_weights = vec![0i8; l1_bias_count * l1_input_dim];
+            let l2_bias_count = NUM_BUCKETS * l2_size;
+            let mut l2_biases = vec![0i32; l2_bias_count];
+            let mut l2_weights = vec![0i8; l2_bias_count * l2_input];
+            let mut l3_biases = [0i32; NUM_BUCKETS];
+            let mut l3_weights = vec![0i8; NUM_BUCKETS * l2_size];
+
+            let l1_padded_in = pad32(l1_input_dim);
+            let l2_padded_in = pad32(l2_input);
+            let out_padded_in = pad32(l2_size);
+
+            for bucket in 0..NUM_BUCKETS {
+                // fc_hash
+                let _ = f.read_exact(&mut buf4);
+
+                // l1 biases
+                for out_idx in 0..l1_size {
+                    let _ = f.read_exact(&mut buf4);
+                    l1_biases[bucket * l1_size + out_idx] = i32::from_le_bytes(buf4);
+                }
+
+                // l1 weights (row-major with padded input)
+                let mut row = vec![0u8; l1_padded_in];
+                for out_idx in 0..l1_size {
+                    let _ = f.read_exact(&mut row);
+                    let global_out = bucket * l1_size + out_idx;
+                    for in_idx in 0..l1_input_dim {
+                        l1_weights[global_out * l1_input_dim + in_idx] = row[in_idx] as i8;
+                    }
+                }
+
+                // l2 biases
+                for out_idx in 0..l2_size {
+                    let _ = f.read_exact(&mut buf4);
+                    l2_biases[bucket * l2_size + out_idx] = i32::from_le_bytes(buf4);
+                }
+
+                // l2 weights (row-major with padded input)
+                let mut l2_row = vec![0u8; l2_padded_in];
+                for out_idx in 0..l2_size {
+                    let _ = f.read_exact(&mut l2_row);
+                    let global_out = bucket * l2_size + out_idx;
+                    for in_idx in 0..l2_input {
+                        l2_weights[global_out * l2_input + in_idx] = l2_row[in_idx] as i8;
+                    }
+                }
+
+                // l3 bias
+                let _ = f.read_exact(&mut buf4);
+                l3_biases[bucket] = i32::from_le_bytes(buf4);
+
+                // l3 weights (padded)
+                let mut out_row = vec![0u8; out_padded_in];
+                let _ = f.read_exact(&mut out_row);
+                for in_idx in 0..l2_size {
+                    l3_weights[bucket * l2_size + in_idx] = out_row[in_idx] as i8;
+                }
+            }
+
+            println!("=== L1 bias sample check (quantised.bin vs weights.bin) ===");
+            let l1b = weight_view(&weights, "l1b");
+            let l1fb = weight_view(&weights, "l1fb");
+            let bias_scale = 127.0f32 * 64.0f32; // QA * QB
+            for (idx, &q_file) in l1_biases.iter().enumerate().take(4) {
+                let merged_b = l1b.values[idx] + l1fb.values[idx % l1_size];
+                let q_expected = (merged_b * bias_scale).round() as i32;
+                println!("bias[{idx}]: merged_float={merged_b:.6} q_expected={q_expected} q_file={q_file}");
+            }
+            println!();
+
+            println!("=== L1 weight sample check (quantised.bin vs weights.bin) ===");
+            let qb = 64.0f32;
+            let bucket = 8usize;
+            let out_base = bucket * l1_size;
+            for out_in_bucket in 0..2 {
+                let out_idx = out_base + out_in_bucket;
+                for in_idx in 0..4 {
+                    let bucket_w = l1.values[in_idx * (NUM_BUCKETS * l1_size) + out_idx];
+                    let shared_w = l1f.values[in_idx * l1_size + out_in_bucket];
+                    let float_w = bucket_w + shared_w;
+                    let q_expected = (float_w * qb).round() as i8;
+                    let q_file = l1_weights[out_idx * l1_input_dim + in_idx];
+                    println!(
+                        "bucket={bucket} out={out_in_bucket} in={in_idx}: merged_float={float_w:.6} q_expected={q_expected} q_file={q_file}"
+                    );
+                }
+            }
+            println!();
+
+            println!("=== L2 bias sample check (quantised.bin vs weights.bin) ===");
+            let bias_scale = 127.0f32 * 64.0f32;
+            for (idx, &b_file) in l2_biases.iter().enumerate().take(4) {
+                let b_expected = (l2b.values[idx] * bias_scale).round() as i32;
+                println!("l2_bias[{idx}]: float={:.6} q_expected={b_expected} q_file={b_file}", l2b.values[idx]);
+            }
+            println!();
+
+            println!("=== L2 weight sample check (quantised.bin vs weights.bin) ===");
+            let qb = 64.0f32;
+            let bucket = 8usize;
+            let out_base = bucket * l2_size;
+            for out_in_bucket in 0..2 {
+                let out_idx = out_base + out_in_bucket;
+                for in_idx in 0..4 {
+                    let w = l2.values[in_idx * (NUM_BUCKETS * l2_size) + out_idx];
+                    let q_expected = (w * qb).round() as i8;
+                    let q_file = l2_weights[out_idx * l2_input + in_idx];
+                    println!(
+                        "bucket={bucket} out={out_in_bucket} in={in_idx}: float={w:.6} q_expected={q_expected} q_file={q_file}"
+                    );
+                }
+            }
+            println!();
+
+            println!("=== L3 bias/weight sample check (quantised.bin vs weights.bin) ===");
+            for bucket in 0..2 {
+                let b_expected = (l3b.values[bucket] * bias_scale).round() as i32;
+                let b_file = l3_biases[bucket];
+                println!(
+                    "l3_bias[bucket={bucket}]: float={:.6} q_expected={b_expected} q_file={b_file}",
+                    l3b.values[bucket]
+                );
+                for in_idx in 0..4 {
+                    let w = l3.values[in_idx * NUM_BUCKETS + bucket];
+                    let q_expected = (w * qb).round() as i8;
+                    let q_file = l3_weights[bucket * l2_size + in_idx];
+                    println!("l3_w[bucket={bucket} in={in_idx}]: float={w:.6} q_expected={q_expected} q_file={q_file}");
+                }
+            }
+            println!();
         }
     }
 
@@ -1143,11 +1141,11 @@ fn main() {
         let decoded = psv.decode();
         let sfen_line = board_to_sfen(&decoded, psv.game_ply());
 
-        if let Some(writer) = sfen_writer.as_mut() {
-            if let Err(e) = writeln!(writer, "{sfen_line}") {
-                eprintln!("Error: Failed to write SFEN: {e}");
-                std::process::exit(1);
-            }
+        if let Some(writer) = sfen_writer.as_mut()
+            && let Err(e) = writeln!(writer, "{sfen_line}")
+        {
+            eprintln!("Error: Failed to write SFEN: {e}");
+            std::process::exit(1);
         }
 
         println!(
@@ -1226,7 +1224,7 @@ impl FloatIntermediates {
         let ft_stm_sum: f32 = self.ft_stm.iter().sum();
         let ft_nstm_sum: f32 = self.ft_nstm.iter().sum();
         println!("FT STM [1536]: sum={:.2}", ft_stm_sum);
-        println!("  first 8: {:?}", &self.ft_stm[..8].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
+        println!("  first 8: {:?}", self.ft_stm[..8].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
         println!("FT NSTM [1536]: sum={:.2}", ft_nstm_sum);
 
         // PP出力の統計
@@ -1235,11 +1233,11 @@ impl FloatIntermediates {
         let pp_min = self.pp_out.iter().cloned().fold(f32::INFINITY, f32::min);
         println!();
         println!("PP out [1536]: sum={:.2}, min={:.4}, max={:.4}", pp_sum, pp_min, pp_max);
-        println!("  first 8: {:?}", &self.pp_out[..8].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
+        println!("  first 8: {:?}", self.pp_out[..8].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
 
         // L1出力
         println!();
-        println!("L1 main [15]: {:?}", &self.l1_main.iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
+        println!("L1 main [15]: {:?}", self.l1_main.iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
         println!("L1 bypass: {:.4}", self.l1_bypass);
 
         // Dual Activation
@@ -1247,18 +1245,18 @@ impl FloatIntermediates {
         println!("Dual Act [30]:");
         println!(
             "  SqrCReLU [0..15]: {:?}",
-            &self.dual_act[..15].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>()
+            self.dual_act[..15].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>()
         );
         println!(
             "  CReLU [15..30]: {:?}",
-            &self.dual_act[15..30].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>()
+            self.dual_act[15..30].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>()
         );
 
         // L2出力
         println!();
         let l2_sum: f32 = self.l2_out.iter().sum();
         println!("L2 out [64]: sum={:.2}", l2_sum);
-        println!("  first 8: {:?}", &self.l2_out[..8].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
+        println!("  first 8: {:?}", self.l2_out[..8].iter().map(|x| format!("{:.4}", x)).collect::<Vec<_>>());
 
         // Output
         println!();
@@ -1997,7 +1995,7 @@ fn run_integer_forward(
             }
         }
 
-        println!("L1 out ({}): {:?}", l1_size, &l1_out);
+        println!("L1 out ({}): {:?}", l1_size, l1_out);
         let l1_skip = l1_out[l1_effective];
         println!("L1 skip: {}", l1_skip);
 
@@ -2013,7 +2011,7 @@ fn run_integer_forward(
             l2_in[l1_effective + i] = (l1_out[i] >> 6).clamp(0, 127) as u8;
         }
 
-        println!("L2 input ({}): {:?}", l2_in_dim, &l2_in);
+        println!("L2 input ({}): {:?}", l2_in_dim, l2_in);
 
         // --- 5. L2: l2_in_dim → l2_size (i32) + ClippedReLU → u8 ---
         let mut l2_raw = vec![0i32; l2_size];
@@ -2029,7 +2027,7 @@ fn run_integer_forward(
             l2_relu[out] = (l2_raw[out] >> 6).clamp(0, 127) as u8;
         }
 
-        println!("L2 out ({}): {:?}", l2_size, &l2_relu);
+        println!("L2 out ({}): {:?}", l2_size, l2_relu);
 
         // --- 6. Output: l2_size → 1 + skip ---
         let mut output = net.l3_biases[bucket];
@@ -2056,8 +2054,8 @@ fn run_integer_forward(
         }
         let psqt_value = (psqt_stm[bucket] - psqt_nstm[bucket]) / 2;
 
-        println!("psqt_acc[stm]: {:?}", &psqt_stm);
-        println!("psqt_acc[nstm]: {:?}", &psqt_nstm);
+        println!("psqt_acc[stm]: {:?}", psqt_stm);
+        println!("psqt_acc[nstm]: {:?}", psqt_nstm);
         println!("psqt_value: {}", psqt_value);
 
         // --- 8. Final score ---

@@ -534,11 +534,11 @@ fn main() {
     }
 
     if let Some(path) = &args.dump_progress_csv {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("Failed to create parent dir for --dump-progress-csv '{}': {e}", path.display());
-                std::process::exit(1);
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("Failed to create parent dir for --dump-progress-csv '{}': {e}", path.display());
+            std::process::exit(1);
         }
         if let Err(e) = dump_progress_feature_csv(path, &packs, &samples, args.ply_max) {
             eprintln!("Failed to write --dump-progress-csv '{}': {e}", path.display());
@@ -547,11 +547,11 @@ fn main() {
         println!("Dumped progress feature CSV: {}", path.display());
     }
     if let Some(path) = &args.dump_progress_v2_csv {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("Failed to create parent dir for --dump-progress-v2-csv '{}': {e}", path.display());
-                std::process::exit(1);
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("Failed to create parent dir for --dump-progress-v2-csv '{}': {e}", path.display());
+            std::process::exit(1);
         }
         if let Err(e) = dump_progress_feature_v2_csv(path, &packs, &samples, args.ply_max) {
             eprintln!("Failed to write --dump-progress-v2-csv '{}': {e}", path.display());

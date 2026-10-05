@@ -198,7 +198,7 @@ pub fn generate(sub: &SubGraph, props: &DeviceProps) -> Result<Option<(Pointwise
             let out = op.outputs()[0];
             let weights = *out_buf_map.get(&out).unwrap();
 
-            for (this_bwd, inputs) in bwd.inner().iter().zip(op.inputs().chunks_exact(2)) {
+            for (this_bwd, inputs) in bwd.inner().iter().zip(op.inputs().as_chunks::<2>().0) {
                 let indices = *inp_buf_map.get(&inputs[1]).unwrap();
                 let Some(gradients) = get_val(inputs[0], &mut pntwise, &mapping)? else { return Ok(None) };
                 pntwise.sparse_matmul_bwd(weights, indices, gradients, this_bwd.0)?;

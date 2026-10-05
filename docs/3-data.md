@@ -31,3 +31,47 @@ In particular, you can convert to this data type from a text file that contains 
 - each line is of the form `<FEN> | <score> | <result>`
 - `score` is white relative and in centipawns
 - `result` is white relative and of the form `1.0` for win, `0.5` for draw, `0.0` for loss
+
+## Fixed-size shuffle and interleave
+
+`bullet-utils shuffle` and `bullet-utils interleave` accept `--record-size 40`
+for shogi PackedSfenValue data. The default record size is 32 bytes. Supply
+`--seed` to reproduce the record order for the same inputs, memory limit, and
+interleave settings. `record` and `block` modes require complete records;
+`concat` copies the input bytes in their listed order. Record size must be
+positive. The shuffle memory budget must be at least 1 MiB and fit one complete
+record; `--mem-used-mb` counts 1,048,576-byte units.
+
+```sh
+cargo run --release -p bullet-utils -- shuffle \
+    --input input.psv --output shuffled.psv --mem-used-mb 256 \
+    --record-size 40 --seed 123
+cargo run --release -p bullet-utils -- interleave a.psv b.psv \
+    --output combined.psv --record-size 40 --mode block --seed 123
+```
+
+Keep inputs unchanged while processing. The output must be separate from every
+input, including symbolic and hard links. Both commands write to a temporary
+file beside the output and replace the output only after successful completion.
+Output destinations must be regular files or new file paths. Devices, FIFOs,
+and streams such as `/dev/null` or `/dev/stdout` are not supported. Existing
+read-only outputs are refused, and the parent directory must permit temporary
+file creation and replacement, even when the existing file itself is writable.
+Existing file permissions also restrict temporary files from creation and are
+retained on publication. New files follow the process umask. Replacement changes the file identity:
+hard links keep the previous contents, output symbolic links are replaced, and
+ownership or extended access controls are not copied.
+
+Disk-backed shuffling creates a unique `.bullet-shuffle-*` directory in the
+current working directory. Each invocation removes only its own directory;
+an unrelated `tmp` directory is left intact. Normal errors also clean up the
+temporary files. A forced process termination can leave `.bullet-shuffle-*`
+directories or `.bullet-output-*` files behind; remove them only after confirming
+that no running command uses them. Atomic replacement requires the filesystem
+to support a rename beside the destination, and does not guarantee recovery
+after power loss. On Windows, readers that deny file replacement can prevent
+publication and leave the existing output intact.
+
+Usage errors return exit status 2; processing errors return 1. Successful
+commands, help, and version requests return 0. Scripts should treat any nonzero
+status as failure instead of requiring a particular failure code.

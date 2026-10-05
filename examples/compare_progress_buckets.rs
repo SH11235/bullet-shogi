@@ -53,7 +53,7 @@ fn load_progress_weights(path: &Path) -> io::Result<Vec<f32>> {
             format!("size mismatch: got {} bytes, expected {}", bytes.len(), expected),
         ));
     }
-    Ok(bytes.chunks_exact(8).map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32).collect())
+    Ok(bytes.as_chunks::<8>().0.iter().map(|b| f64::from_le_bytes(*b) as f32).collect())
 }
 
 fn sigmoid(z: f32) -> f32 {

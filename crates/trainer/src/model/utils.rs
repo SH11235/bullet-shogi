@@ -56,7 +56,7 @@ pub fn read_from_byte_buffer(bytes: &[u8]) -> (Vec<f32>, String, usize) {
 
     let mut values = vec![0.0; single_size];
 
-    for (word, val) in bytes[offset..total_read].chunks_exact(4).zip(values.iter_mut()) {
+    for (word, val) in bytes[offset..total_read].as_chunks::<4>().0.iter().zip(values.iter_mut()) {
         let mut buf = [0; 4];
         buf.copy_from_slice(word);
         *val = f32::from_le_bytes(buf);

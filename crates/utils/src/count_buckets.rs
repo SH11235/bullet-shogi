@@ -1,17 +1,17 @@
 use anyhow::Context;
 use bulletformat::{ChessBoard, DataLoader};
-use structopt::StructOpt;
+use clap::Args;
 
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct ValidateOptions {
-    #[structopt(required = true, min_values = 1)]
+    #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     bucket_file: String,
 }
 

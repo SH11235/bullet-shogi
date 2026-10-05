@@ -6,16 +6,16 @@ use std::{
 
 use anyhow::Context;
 use bulletformat::ChessBoard;
-use structopt::StructOpt;
+use clap::Args;
 use viriformat::dataformat::{Filter, Game};
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct SplatOptions {
     /// Path to input viriformat file.
-    #[structopt(required = true)]
+    #[arg(required = true)]
     pub input: PathBuf,
     /// Path to output bulletformat file.
-    #[structopt(required = true)]
+    #[arg(required = true)]
     pub output: PathBuf,
     /// Optional path to a viriformat filter config toml.
     pub cfg: PathBuf,

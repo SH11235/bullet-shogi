@@ -4,16 +4,16 @@ use std::{
     path::PathBuf,
 };
 
-use structopt::StructOpt;
+use clap::Args;
 use viriformat::dataformat::Game;
 
 use crate::Rand;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct InterleaveOptions {
-    #[structopt(required = true, min_values = 2)]
+    #[arg(required = true, num_args = 2..)]
     pub inputs: Vec<PathBuf>,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     pub output: PathBuf,
 }
 

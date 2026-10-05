@@ -11,29 +11,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
         - uses: actions/checkout@v4
-        - uses: dtolnay/rust-toolchain@stable
+        - uses: dtolnay/rust-toolchain@1.99.0
           with:
             components: clippy
         - run: |
-            cargo clippy --workspace
-            CUDA_PATH=. cargo clippy --workspace --features cuda
-            HIP_PATH=. cargo clippy --workspace --features rocm
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+            CUDA_PATH=. cargo clippy --locked --workspace --features cuda --all-targets -- -D warnings
+            HIP_PATH=. cargo clippy --locked --workspace --features rocm --all-targets -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
         - uses: actions/checkout@v4
-        - uses: dtolnay/rust-toolchain@stable
-        - run: cargo test --workspace
+        - uses: dtolnay/rust-toolchain@1.99.0
+        - run: cargo test --locked --workspace
 
   format:
     name: format
     runs-on: ubuntu-latest
     steps:
         - uses: actions/checkout@v4
-        - uses: dtolnay/rust-toolchain@stable
+        - uses: dtolnay/rust-toolchain@1.99.0
           with:
             components: rustfmt
         - run: cargo fmt --all -- --check
-

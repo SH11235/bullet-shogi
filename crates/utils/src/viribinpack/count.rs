@@ -1,11 +1,11 @@
 use std::{fs::File, io::BufReader, path::PathBuf};
 
-use structopt::StructOpt;
+use clap::Args;
 use viriformat::dataformat::Game;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct CountOptions {
-    #[structopt(required = true)]
+    #[arg(required = true)]
     pub input: PathBuf,
 }
 

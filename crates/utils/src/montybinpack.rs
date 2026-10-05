@@ -2,9 +2,9 @@ mod count;
 mod head;
 mod interleave;
 
-use structopt::StructOpt;
+use clap::Subcommand;
 
-#[derive(StructOpt)]
+#[derive(Subcommand)]
 pub enum MontyBinpackOptions {
     Head(head::HeadOptions),
     Interleave(interleave::InterleaveOptions),

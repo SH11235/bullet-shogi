@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader, BufWriter},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -11,32 +11,36 @@ use bulletformat::{
     chess::{CudADFormat, MarlinFormat},
     convert_from_bin, convert_from_text,
 };
-use structopt::StructOpt;
+use clap::Args;
 
-#[derive(StructOpt)]
+use crate::output::AtomicOutput;
+
+#[derive(Args)]
 pub struct ConvertOptions {
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     from: String,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     input: PathBuf,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     output: PathBuf,
-    #[structopt(short, long, default_value = "1")]
+    #[arg(short, long, default_value = "1")]
     threads: usize,
 }
 
 impl ConvertOptions {
     pub fn run(&self) -> anyhow::Result<()> {
+        let output = AtomicOutput::new(&self.output)?;
         match self.from.as_str() {
-            "marlinformat" => convert_from_bin::<MarlinFormat, ChessBoard>(&self.input, &self.output, self.threads)
-                .with_context(|| "Failed to convert marlinformat."),
-            "cudadformat" => convert_from_bin::<CudADFormat, ChessBoard>(&self.input, &self.output, self.threads)
-                .with_context(|| "Failed to convert cudadformat."),
-            "text" => convert_text(&self.input, &self.output),
-            "ataxx" => convert_from_text::<AtaxxBoard>(&self.input, &self.output)
-                .with_context(|| "Failed to convert ataxxformat."),
+            "marlinformat" => convert_from_bin::<MarlinFormat, ChessBoard>(&self.input, output.path(), self.threads)
+                .with_context(|| "Failed to convert marlinformat.")?,
+            "cudadformat" => convert_from_bin::<CudADFormat, ChessBoard>(&self.input, output.path(), self.threads)
+                .with_context(|| "Failed to convert cudadformat.")?,
+            "text" => convert_text(&self.input, output.path())?,
+            "ataxx" => convert_from_text::<AtaxxBoard>(&self.input, output.path())
+                .with_context(|| "Failed to convert ataxxformat.")?,
             _ => bail!("Unrecognised Source Type! Supported: 'marlinformat', 'text', 'ataxx'."),
         }
+        output.commit()
     }
 }
 
@@ -67,6 +71,7 @@ fn convert_text(inp_path: impl AsRef<Path>, out_path: impl AsRef<Path>) -> anyho
     }
 
     BulletFormat::write_to_bin(&mut output, &data).with_context(|| "Failed to write boards into output.")?;
+    output.flush().with_context(|| "Failed to write boards into output.")?;
 
     println!("Parsed to Position");
     println!("Summary: {} Positions in {:.2} seconds", results.iter().sum::<u64>(), timer.elapsed().as_secs_f32());

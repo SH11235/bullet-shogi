@@ -216,7 +216,7 @@ impl OpType for SparseMatmulBwdMulti {
             out.write(i, DValue::zero(out.dtype()));
         }
 
-        for (bwd, inps) in self.0.iter().zip(inputs.chunks_exact(2)) {
+        for (bwd, inps) in self.0.iter().zip(inputs.as_chunks::<2>().0) {
             let mut this_out = TValue::zeros(out.dtype(), out.size());
             if !bwd.evaluate(inps.to_vec(), vec![&mut this_out]) {
                 return false;

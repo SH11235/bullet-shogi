@@ -4,16 +4,19 @@ use std::{
     path::PathBuf,
 };
 
-use structopt::StructOpt;
+use clap::Args;
 use viriformat::dataformat::Game;
 
 use crate::Rand;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct InterleaveOptions {
-    #[structopt(required = true, min_values = 2)]
+    /// Input files; at least two are required.
+    // The minimum is enforced after parsing: a per-occurrence minimum would reject
+    // inputs that are split around options.
+    #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     pub output: PathBuf,
 }
 

@@ -4,16 +4,16 @@ use std::{
     path::PathBuf,
 };
 
+use clap::Args;
 use montyformat::{FastDeserialise, MontyValueFormat};
-use structopt::StructOpt;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct HeadOptions {
-    #[structopt(required = true)]
+    #[arg(required = true)]
     pub input: PathBuf,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     pub output: PathBuf,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     pub games: usize,
 }
 

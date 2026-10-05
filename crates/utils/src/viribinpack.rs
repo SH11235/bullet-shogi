@@ -3,9 +3,9 @@ mod head;
 mod interleave;
 mod splat;
 
-use structopt::StructOpt;
+use clap::Subcommand;
 
-#[derive(StructOpt)]
+#[derive(Subcommand)]
 pub enum ViriBinpackOptions {
     Head(head::HeadOptions),
     Interleave(interleave::InterleaveOptions),

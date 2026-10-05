@@ -364,10 +364,10 @@ impl Args {
     }
 
     fn validate_wrm_settings(&self) -> Result<(), String> {
-        if let Some(in_scaling) = self.wrm_in_scaling {
-            if !in_scaling.is_finite() || in_scaling <= 0.0 {
-                return Err(format!("--wrm-in-scaling must be a positive finite value (got {})", in_scaling));
-            }
+        if let Some(in_scaling) = self.wrm_in_scaling
+            && (!in_scaling.is_finite() || in_scaling <= 0.0)
+        {
+            return Err(format!("--wrm-in-scaling must be a positive finite value (got {})", in_scaling));
         }
         Ok(())
     }
@@ -552,12 +552,12 @@ fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
     let mut superbatch_losses: BTreeMap<usize, (f64, usize)> = BTreeMap::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 3 {
-            if let (Ok(sb), Ok(loss)) = (parts[0].trim().parse::<usize>(), parts[2].trim().parse::<f64>()) {
-                let entry = superbatch_losses.entry(sb).or_insert((0.0, 0));
-                entry.0 += loss;
-                entry.1 += 1;
-            }
+        if parts.len() >= 3
+            && let (Ok(sb), Ok(loss)) = (parts[0].trim().parse::<usize>(), parts[2].trim().parse::<f64>())
+        {
+            let entry = superbatch_losses.entry(sb).or_insert((0.0, 0));
+            entry.0 += loss;
+            entry.1 += 1;
         }
     }
     superbatch_losses
@@ -636,7 +636,7 @@ impl ExperimentContext {
         let (id_ts, date) = get_timestamp();
         // run 一意な id: 秒精度時刻 + net_id + process id。同一秒に同一 net_id で
         // 複数 run が始まっても衝突しない (nnue-lab の (tenant, producer_id) upsert キー)。
-        let id = format!("{}-{}-{}", id_ts, &net_id, std::process::id());
+        let id = format!("{}-{}-{}", id_ts, net_id, std::process::id());
 
         const PACKED_SFEN_VALUE_SIZE: u64 = 40;
         let positions: u64 = data_name
@@ -781,24 +781,23 @@ impl ExperimentContext {
             Err(_) => return,
         };
 
-        if let Some(id) = existing.get("id").and_then(|v| v.as_str()) {
-            if !id.is_empty() {
-                println!("Inheriting experiment id from {}: {}", json_path.display(), id);
-                self.experiment_id = id.to_string();
-            }
+        if let Some(id) = existing.get("id").and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            println!("Inheriting experiment id from {}: {}", json_path.display(), id);
+            self.experiment_id = id.to_string();
         }
-        if let Some(date) = existing.get("date").and_then(|v| v.as_str()) {
-            if !date.is_empty() {
-                self.experiment_date = date.to_string();
-            }
+        if let Some(date) = existing.get("date").and_then(|v| v.as_str())
+            && !date.is_empty()
+        {
+            self.experiment_date = date.to_string();
         }
         if let Some(secs) =
             existing.get("results").and_then(|v| v.get("training_time_seconds")).and_then(|v| v.as_u64())
+            && secs > 0
         {
-            if secs > 0 {
-                println!("Inheriting prior training time: {} seconds", secs);
-                self.prior_training_seconds = secs;
-            }
+            println!("Inheriting prior training time: {} seconds", secs);
+            self.prior_training_seconds = secs;
         }
         if let Some(arr) = existing.get("history").and_then(|v| v.as_array()) {
             let mut history: Vec<LossEntry> = arr
@@ -1759,10 +1758,8 @@ fn main() {
     }
 
     // Generate final experiment JSON (status: completed)
-    if !experiment_quantise_only {
-        if let Err(e) = experiment_ctx.write_experiment_json("completed") {
-            eprintln!("Warning: Failed to generate experiment JSON: {}", e);
-        }
+    if !experiment_quantise_only && let Err(e) = experiment_ctx.write_experiment_json("completed") {
+        eprintln!("Warning: Failed to generate experiment JSON: {}", e);
     }
 }
 

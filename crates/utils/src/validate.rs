@@ -1,12 +1,12 @@
 use anyhow::Context;
 use bulletformat::{ChessBoard, DataLoader};
-use structopt::StructOpt;
+use clap::Args;
 
 use std::{path::PathBuf, time::Instant};
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct ValidateOptions {
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     input: PathBuf,
 }
 

@@ -334,10 +334,10 @@ where
 
                                 buckets_chunk[i] = i32::from(out.bucket(pos));
                                 let mut weight = weight_getter.map_or(1.0, |w| w(pos));
-                                if let Some(cap) = score_drop_abs {
-                                    if pos.score().unsigned_abs() >= cap {
-                                        weight = 0.0;
-                                    }
+                                if let Some(cap) = score_drop_abs
+                                    && pos.score().unsigned_abs() >= cap
+                                {
+                                    weight = 0.0;
                                 }
                                 weights_chunk[i] = weight;
 

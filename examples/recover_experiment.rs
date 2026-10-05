@@ -186,12 +186,12 @@ fn parse_loss_history(log_path: &Path) -> Vec<LossEntry> {
     let mut superbatch_losses: BTreeMap<usize, (f64, usize)> = BTreeMap::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 3 {
-            if let (Ok(sb), Ok(loss)) = (parts[0].trim().parse::<usize>(), parts[2].trim().parse::<f64>()) {
-                let entry = superbatch_losses.entry(sb).or_insert((0.0, 0));
-                entry.0 += loss;
-                entry.1 += 1;
-            }
+        if parts.len() >= 3
+            && let (Ok(sb), Ok(loss)) = (parts[0].trim().parse::<usize>(), parts[2].trim().parse::<f64>())
+        {
+            let entry = superbatch_losses.entry(sb).or_insert((0.0, 0));
+            entry.0 += loss;
+            entry.1 += 1;
         }
     }
     superbatch_losses

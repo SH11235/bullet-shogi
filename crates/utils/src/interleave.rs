@@ -1,13 +1,16 @@
 use std::{
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Write},
-    path::{Path, PathBuf},
+    fs::File,
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    path::PathBuf,
     str::FromStr,
 };
 
-use crate::Rand;
+use crate::{
+    Rand,
+    output::{AtomicOutput, ensure_distinct_output},
+};
 use anyhow::{Context, ensure};
-use structopt::StructOpt;
+use clap::Args;
 
 const BYTES_PER_MB: usize = 1_048_576;
 const PROGRESS_INTERVAL_RECORDS: usize = 1_048_576;
@@ -32,30 +35,48 @@ impl FromStr for InterleaveMode {
     }
 }
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct InterleaveOptions {
-    #[structopt(required = true, min_values = 2)]
+    /// Input files; at least two are required.
+    // The minimum is enforced after parsing: a per-occurrence minimum would reject
+    // inputs that are split around options.
+    #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
-    #[structopt(required = true, short, long)]
+    #[arg(required = true, short, long)]
     pub output: PathBuf,
-    #[structopt(long, default_value = "block", parse(try_from_str))]
+    #[arg(long, default_value = "block")]
     pub mode: InterleaveMode,
-    #[structopt(long, default_value = "8")]
+    #[arg(long, default_value = "8")]
     pub block_mb: usize,
-    #[structopt(long)]
+    #[arg(long)]
     pub seed: Option<u64>,
     /// Record size in bytes (default: 32)
-    #[structopt(long, default_value = "32")]
+    #[arg(long, default_value = "32")]
     pub record_size: usize,
 }
 
 struct Stream {
     remaining_records: usize,
+    initial_bytes: u64,
+    path: PathBuf,
     reader: BufReader<File>,
+}
+
+impl Stream {
+    fn validate_finished(&mut self) -> anyhow::Result<()> {
+        ensure!(self.reader.fill_buf()?.is_empty(), "input size changed while interleaving: {}", self.path.display());
+        ensure!(
+            self.reader.get_ref().metadata()?.len() == self.initial_bytes,
+            "input size changed while interleaving: {}",
+            self.path.display()
+        );
+        Ok(())
+    }
 }
 
 impl InterleaveOptions {
     pub fn run(&self) -> anyhow::Result<()> {
+        ensure_distinct_output(&self.inputs, &self.output)?;
         match self.mode {
             InterleaveMode::Record => self.run_record(self.seed.unwrap_or_else(Rand::random_seed)),
             InterleaveMode::Block => self.run_block(self.seed.unwrap_or_else(Rand::random_seed)),
@@ -75,47 +96,12 @@ impl InterleaveOptions {
     }
 
     fn run_record(&self, seed: u64) -> anyhow::Result<()> {
-        let size = self.record_size;
-        println!("Writing to {:#?}", self.output);
-        println!("Reading from:\n{:#?}", self.inputs);
-
-        let (mut streams, total_records) = self.collect_streams()?;
-        let expected_bytes = total_records.checked_mul(size).context("interleave size overflow")?;
-        let target = File::create(&self.output).with_context(|| "Failed to create output file")?;
-        let mut writer = BufWriter::new(target);
-        let mut remaining = total_records;
-        let mut rng = Rand::with_seed(seed);
-        let mut prev = remaining / PROGRESS_INTERVAL_RECORDS;
-        let mut value = vec![0u8; size];
-
-        while remaining > 0 {
-            let spot = rng.rand() as usize % remaining;
-            let idx = pick_weighted_index(&streams, spot, |stream| stream.remaining_records);
-            let stream = &mut streams[idx];
-
-            stream.reader.read_exact(&mut value)?;
-            writer.write_all(&value)?;
-
-            remaining -= 1;
-            stream.remaining_records -= 1;
-            if stream.remaining_records == 0 {
-                streams.swap_remove(idx);
-            }
-
-            report_progress(total_records, remaining, &mut prev);
-        }
-
-        writer.flush()?;
-        validate_output_size(&self.output, expected_bytes)?;
-        if total_records > 0 {
-            println!();
-        }
-
-        Ok(())
+        self.run_block_with_records(1, seed)
     }
 
     fn run_block(&self, seed: u64) -> anyhow::Result<()> {
         let size = self.record_size;
+        ensure!(size > 0, "record_size must be at least 1");
         ensure!(self.block_mb > 0, "block size must be at least 1 MB");
         let block_bytes = self.block_mb.checked_mul(BYTES_PER_MB).context("block size overflow")?;
         let block_records = (block_bytes / size).max(1);
@@ -123,16 +109,26 @@ impl InterleaveOptions {
     }
 
     fn run_block_with_records(&self, block_records: usize, seed: u64) -> anyhow::Result<()> {
-        let size = self.record_size;
         ensure!(block_records > 0, "block size must include at least one record");
 
         println!("Writing to {:#?}", self.output);
         println!("Reading from:\n{:#?}", self.inputs);
 
-        let (mut streams, total_records) = self.collect_streams()?;
+        let (streams, total_records) = self.collect_streams()?;
+        self.write_streams(streams, total_records, block_records, seed)
+    }
+
+    fn write_streams(
+        &self,
+        mut streams: Vec<Stream>,
+        total_records: usize,
+        block_records: usize,
+        seed: u64,
+    ) -> anyhow::Result<()> {
+        let size = self.record_size;
         let expected_bytes = total_records.checked_mul(size).context("interleave size overflow")?;
-        let target = File::create(&self.output).with_context(|| "Failed to create output file")?;
-        let mut writer = BufWriter::new(target);
+        let mut output = AtomicOutput::new(&self.output)?;
+        let mut writer = BufWriter::new(output.file());
         let mut buffer = vec![0u8; block_records.checked_mul(size).context("block buffer overflow")?];
         let mut remaining = total_records;
         let mut rng = Rand::with_seed(seed);
@@ -151,6 +147,7 @@ impl InterleaveOptions {
             remaining -= records_to_copy;
             stream.remaining_records -= records_to_copy;
             if stream.remaining_records == 0 {
+                stream.validate_finished()?;
                 streams.swap_remove(idx);
             }
 
@@ -158,7 +155,9 @@ impl InterleaveOptions {
         }
 
         writer.flush()?;
-        validate_output_size(&self.output, expected_bytes)?;
+        drop(writer);
+        validate_output_size(output.file(), expected_bytes)?;
+        output.commit()?;
         if total_records > 0 {
             println!();
         }
@@ -170,40 +169,54 @@ impl InterleaveOptions {
         println!("Writing to {:#?}", self.output);
         println!("Reading from:\n{:#?}", self.inputs);
 
-        let target = File::create(&self.output).with_context(|| "Failed to create output file")?;
-        let mut writer = BufWriter::new(target);
+        let mut output = AtomicOutput::new(&self.output)?;
+        let mut writer = BufWriter::new(output.file());
         let mut expected_bytes = 0usize;
 
         for path in &self.inputs {
             let file =
                 File::open(path).with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
-            let bytes = file.metadata()?.len() as usize;
+            let bytes = usize::try_from(file.metadata()?.len()).context("input size exceeds addressable memory")?;
             expected_bytes = expected_bytes.checked_add(bytes).context("concat size overflow")?;
             let mut reader = BufReader::new(file);
-            io::copy(&mut reader, &mut writer)?;
+            ensure!(
+                io::copy(&mut reader, &mut writer)? == bytes as u64
+                    && reader.get_ref().metadata()?.len() == bytes as u64,
+                "input size changed while concatenating: {}",
+                path.display()
+            );
         }
 
         writer.flush()?;
-        validate_output_size(&self.output, expected_bytes)?;
+        drop(writer);
+        validate_output_size(output.file(), expected_bytes)?;
+        output.commit()?;
 
         Ok(())
     }
 
     fn collect_streams(&self) -> anyhow::Result<(Vec<Stream>, usize)> {
         let size = self.record_size;
+        ensure!(size > 0, "record_size must be at least 1");
         let mut streams = Vec::new();
         let mut total_records = 0usize;
 
         for path in &self.inputs {
             let file =
                 File::open(path).with_context(|| format!("Failed to open {path}", path = path.to_string_lossy()))?;
-            let bytes = file.metadata()?.len() as usize;
+            let initial_bytes = file.metadata()?.len();
+            let bytes = usize::try_from(initial_bytes).context("input size exceeds addressable memory")?;
             ensure!(bytes.is_multiple_of(size), "input file size is not a multiple of {size}: {}", path.display());
 
             let records = bytes / size;
             if records > 0 {
                 total_records = total_records.checked_add(records).context("interleave record count overflow")?;
-                streams.push(Stream { remaining_records: records, reader: BufReader::new(file) });
+                streams.push(Stream {
+                    remaining_records: records,
+                    initial_bytes,
+                    path: path.clone(),
+                    reader: BufReader::new(file),
+                });
             }
         }
 
@@ -235,10 +248,10 @@ fn report_progress(total_records: usize, remaining_records: usize, prev: &mut us
     }
 }
 
-fn validate_output_size(path: &Path, expected_bytes: usize) -> anyhow::Result<()> {
-    let actual_bytes = fs::metadata(path)?.len() as usize;
+fn validate_output_size(file: &File, expected_bytes: usize) -> anyhow::Result<()> {
+    let actual_bytes = file.metadata()?.len();
     ensure!(
-        actual_bytes == expected_bytes,
+        actual_bytes == expected_bytes as u64,
         "Output file size {actual_bytes} does not match expected size {expected_bytes}"
     );
     Ok(())
@@ -249,6 +262,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -280,7 +294,9 @@ mod tests {
         let bytes = fs::read(path).unwrap();
         assert_eq!(0, bytes.len() % SIZE);
         bytes
-            .chunks_exact(SIZE)
+            .as_chunks::<SIZE>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut record = [0u8; SIZE];
                 record.copy_from_slice(chunk);
@@ -388,5 +404,27 @@ mod tests {
         assert_eq!(fs::read(&output).unwrap(), expected);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn buffered_truncation_cannot_publish_record_or_block_output() {
+        for block_records in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let input = directory.path().join("input.bin");
+            let output = directory.path().join("output.bin");
+            write_records(&input, &[1, 2, 3]);
+            fs::write(&output, b"existing").unwrap();
+            let options =
+                InterleaveOptions::new(vec![input.clone()], output.clone(), InterleaveMode::Record, 8, Some(123), SIZE);
+            let (mut streams, total_records) = options.collect_streams().unwrap();
+            assert_eq!(streams[0].reader.fill_buf().unwrap().len(), 3 * SIZE);
+            fs::OpenOptions::new().write(true).open(&input).unwrap().set_len(0).unwrap();
+            let error = options.write_streams(streams, total_records, block_records, 123).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("input size changed"), "{message}");
+            assert!(message.contains(input.to_str().unwrap()), "{message}");
+            assert_eq!(fs::read(output).unwrap(), b"existing");
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        }
     }
 }

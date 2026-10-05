@@ -1,11 +1,11 @@
 use std::{fs::File, io::BufReader, path::PathBuf};
 
+use clap::Args;
 use montyformat::MontyValueFormat;
-use structopt::StructOpt;
 
-#[derive(StructOpt)]
+#[derive(Args)]
 pub struct CountOptions {
-    #[structopt(required = true)]
+    #[arg(required = true)]
     pub input: PathBuf,
 }
 

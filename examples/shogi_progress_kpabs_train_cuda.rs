@@ -326,7 +326,7 @@ fn read_progress_bin(path: &Path) -> io::Result<Vec<f32>> {
             format!("progress.bin size mismatch: got {}, expected {}", bytes.len(), expected),
         ));
     }
-    Ok(bytes.chunks_exact(size_of::<f64>()).map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32).collect())
+    Ok(bytes.as_chunks::<{ size_of::<f64>() }>().0.iter().map(|c| f64::from_le_bytes(*c) as f32).collect())
 }
 
 fn epoch_checkpoint_path(output: &Path, epoch: usize) -> PathBuf {

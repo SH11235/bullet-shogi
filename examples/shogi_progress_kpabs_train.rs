@@ -393,10 +393,10 @@ impl MultiFileGameIterator {
 
     fn next_game(&mut self) -> io::Result<Option<Vec<PackedSfenValue>>> {
         loop {
-            if let Some(ref mut gi) = self.current {
-                if let Some(game) = gi.next_game()? {
-                    return Ok(Some(game));
-                }
+            if let Some(ref mut gi) = self.current
+                && let Some(game) = gi.next_game()?
+            {
+                return Ok(Some(game));
             }
             // 次のファイルへ
             if self.file_index >= self.packs.len() {
